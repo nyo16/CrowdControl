@@ -1,0 +1,22 @@
+services:
+  crowd_control:
+    build: .
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      # Mount your project directory into /workspace
+      - ${PROJECT_DIR:-.}:/workspace
+    stdin_open: true
+    tty: true
+
+  # Run multiple isolated instances
+  worker:
+    build: .
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - ${PROJECT_DIR:-.}:/workspace
+    stdin_open: true
+    tty: true
+    deploy:
+      replicas: ${WORKER_COUNT:-3}

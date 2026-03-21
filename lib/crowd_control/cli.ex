@@ -33,12 +33,16 @@ defmodule CrowdControl.CLI do
     * `:include_partial_messages` - `true` to include streaming deltas
     * `:no_session_persistence` - `true` to skip saving to disk
     * `:extra_args` - list of additional string arguments
+    * `:env` - map of environment variables to set (e.g. `%{"ANTHROPIC_API_KEY" => "sk-..."}`)
+    * `:api_key` - shorthand for setting `ANTHROPIC_API_KEY`
+    * `:api_url` - shorthand for setting `ANTHROPIC_BASE_URL`
   """
   def build_command(opts \\ []) do
     executable = Keyword.get(opts, :executable, "claude")
     args = @base_args ++ build_optional_args(opts)
+    env = build_env(opts)
 
-    {executable, args}
+    {executable, args, env}
   end
 
   defp build_optional_args(opts) do
@@ -69,4 +73,31 @@ defmodule CrowdControl.CLI do
 
   defp maybe_add_extra(args, nil), do: args
   defp maybe_add_extra(args, extra), do: args ++ extra
+
+  @doc """
+  Builds environment variable map from options.
+
+  Merges `:api_key`, `:api_url` shorthands with the `:env` map.
+  Explicit `:env` entries take precedence.
+  """
+  def build_env(opts) do
+    base = %{}
+
+    base =
+      case opts[:api_key] do
+        nil -> base
+        key -> Map.put(base, "ANTHROPIC_API_KEY", key)
+      end
+
+    base =
+      case opts[:api_url] do
+        nil -> base
+        url -> Map.put(base, "ANTHROPIC_BASE_URL", url)
+      end
+
+    case opts[:env] do
+      nil -> base
+      env when is_map(env) -> Map.merge(base, env)
+    end
+  end
 end

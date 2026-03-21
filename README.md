@@ -1,10 +1,41 @@
 # CrowdControl
 
-Orchestrate many Claude Code / Open Code CLI instances in parallel from Elixir.
+Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Open Code](https://github.com/anthropics/open-code) CLI instances in parallel from Elixir.
 
 Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subprocess management with NIF-based backpressure.
 
+```mermaid
+graph LR
+    CC[CrowdControl] --> S1[claude #1]
+    CC --> S2[claude #2]
+    CC --> S3[open-code #3]
+    CC --> SN[... #N]
+    S1 --> R[Collect Results]
+    S2 --> R
+    S3 --> R
+    SN --> R
+
+    style CC fill:#4a9eff,color:#fff
+    style S1 fill:#51cf66,color:#fff
+    style S2 fill:#51cf66,color:#fff
+    style S3 fill:#ff922b,color:#fff
+    style SN fill:#868e96,color:#fff
+    style R fill:#ffd43b,color:#333
+```
+
+## Features
+
+- Run N Claude Code / Open Code sessions in parallel
+- Fan-out the same prompt across different models
+- Multi-turn conversations with subscriber-based message delivery
+- Fault-isolated sessions via OTP DynamicSupervisor
+- Zero zombie OS processes guaranteed by net_runner's Shepherd
+- Docker support with project directory mounting
+- Works with both `claude` and `open-code` CLIs
+
 ## Installation
+
+### As a dependency
 
 ```elixir
 def deps do
@@ -14,12 +45,20 @@ def deps do
 end
 ```
 
+### From source
+
+```bash
+git clone git@github.com:nyo16/CrowdControl.git
+cd CrowdControl
+mix deps.get
+mix compile
+```
+
 ## Quick Start
 
 ### Single session
 
 ```elixir
-# Fire-and-forget single prompt
 result = CrowdControl.run("Explain GenServer in one sentence",
   permission_mode: "bypassPermissions"
 )
@@ -116,7 +155,220 @@ Listener.loop()
 ### Using Open Code
 
 ```elixir
+# Single session with open-code
 CrowdControl.run("Hello", executable: "open-code", permission_mode: "bypassPermissions")
+
+# Mix claude and open-code in the same parallel run
+CrowdControl.run_many("Explain recursion", [
+  [executable: "claude", model: "sonnet", permission_mode: "bypassPermissions"],
+  [executable: "open-code", permission_mode: "bypassPermissions"]
+])
+```
+
+### Working with project directories
+
+```elixir
+# Point sessions at a specific project
+CrowdControl.run("Find and fix the failing test",
+  add_dir: "/path/to/my/project",
+  permission_mode: "bypassPermissions",
+  allowed_tools: ["Read", "Edit", "Bash"]
+)
+
+# Fan out across multiple repos
+repos = [
+  "/home/user/api-service",
+  "/home/user/web-frontend",
+  "/home/user/mobile-app"
+]
+
+opts_list = Enum.map(repos, fn repo ->
+  [
+    prompt: "List all TODO comments in the codebase",
+    add_dir: repo,
+    permission_mode: "bypassPermissions"
+  ]
+end)
+
+{:ok, sessions} = CrowdControl.start_sessions(opts_list)
+results = CrowdControl.collect(sessions)
+```
+
+### Custom API URL and token
+
+```elixir
+# Use a custom API key per session
+CrowdControl.run("Hello",
+  api_key: "sk-ant-your-key-here",
+  permission_mode: "bypassPermissions"
+)
+
+# Point to a custom API endpoint (proxy, gateway, self-hosted)
+CrowdControl.run("Hello",
+  api_url: "https://your-proxy.example.com/v1",
+  api_key: "sk-ant-your-key-here",
+  permission_mode: "bypassPermissions"
+)
+
+# Different keys per session (e.g. separate billing)
+CrowdControl.run_many("Summarize this repo", [
+  [api_key: "sk-team-alpha", model: "sonnet"],
+  [api_key: "sk-team-beta", model: "opus"]
+])
+
+# Arbitrary environment variables
+CrowdControl.run("Debug this",
+  env: %{
+    "ANTHROPIC_API_KEY" => "sk-custom",
+    "ANTHROPIC_BASE_URL" => "https://gateway.internal/v1",
+    "HTTP_PROXY" => "http://proxy:8080",
+    "NODE_OPTIONS" => "--max-old-space-size=4096"
+  },
+  permission_mode: "bypassPermissions"
+)
+```
+
+### Budget control
+
+```elixir
+# Cap spending per session
+CrowdControl.run_many("Refactor this module for clarity", [
+  [add_dir: "/path/to/project", model: "sonnet", max_budget_usd: 0.50],
+  [add_dir: "/path/to/project", model: "opus", max_budget_usd: 2.00]
+])
+```
+
+## Docker
+
+Run CrowdControl in a Linux container with your project directory mounted in.
+
+### Build the image
+
+```bash
+docker build -t crowd_control .
+```
+
+### Run with current directory mounted
+
+```bash
+docker run -it \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  -v "$(pwd)":/workspace \
+  crowd_control
+```
+
+This drops you into an IEx shell. Your project is available at `/workspace`:
+
+```elixir
+CrowdControl.run("Analyze the code in /workspace",
+  add_dir: "/workspace",
+  permission_mode: "bypassPermissions"
+)
+```
+
+### Custom API endpoint
+
+```bash
+docker run -it \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  -e ANTHROPIC_BASE_URL=https://your-proxy.example.com/v1 \
+  -v "$(pwd)":/workspace \
+  crowd_control
+```
+
+Or set per-session inside IEx:
+
+```elixir
+# Each session can target a different API endpoint
+CrowdControl.run_many("Hello", [
+  [api_url: "https://gateway-us.internal/v1", api_key: "sk-us-key"],
+  [api_url: "https://gateway-eu.internal/v1", api_key: "sk-eu-key"]
+])
+```
+
+### Mount a different directory
+
+```bash
+docker run -it \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  -v /path/to/your/project:/workspace \
+  crowd_control
+```
+
+### Mount multiple project directories
+
+```bash
+docker run -it \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  -v /home/user/api:/projects/api \
+  -v /home/user/web:/projects/web \
+  -v /home/user/docs:/projects/docs \
+  crowd_control
+```
+
+Then inside IEx:
+
+```elixir
+# Scan all three repos in parallel
+opts_list = [
+  [prompt: "Find security issues", add_dir: "/projects/api"],
+  [prompt: "Find security issues", add_dir: "/projects/web"],
+  [prompt: "Check for outdated links", add_dir: "/projects/docs"]
+]
+|> Enum.map(&Keyword.merge(&1, permission_mode: "bypassPermissions"))
+
+{:ok, sessions} = CrowdControl.start_sessions(opts_list)
+results = CrowdControl.collect(sessions, 300_000)
+```
+
+### Docker Compose
+
+```bash
+# Mount current directory
+ANTHROPIC_API_KEY=sk-... docker compose run crowd_control
+
+# Mount a specific project
+ANTHROPIC_API_KEY=sk-... PROJECT_DIR=/path/to/project docker compose run crowd_control
+
+# Run multiple isolated workers
+ANTHROPIC_API_KEY=sk-... WORKER_COUNT=5 docker compose up worker
+```
+
+### Docker architecture
+
+```mermaid
+graph TD
+    subgraph Host
+        PD1[Project Dir A]
+        PD2[Project Dir B]
+        KEY[ANTHROPIC_API_KEY]
+    end
+
+    subgraph Docker Container
+        IEX[IEx Shell]
+        CC[CrowdControl]
+        CC --> S1[Session 1<br/>claude CLI]
+        CC --> S2[Session 2<br/>claude CLI]
+        CC --> S3[Session 3<br/>open-code CLI]
+
+        WS1[/workspace]
+        WS2[/projects/api]
+        WS3[/projects/web]
+    end
+
+    PD1 -->|"-v mount"| WS1
+    PD1 -->|"-v mount"| WS2
+    PD2 -->|"-v mount"| WS3
+    KEY -->|"-e env"| CC
+
+    S1 --> WS2
+    S2 --> WS3
+    S3 --> WS1
+
+    style CC fill:#4a9eff,color:#fff
+    style S1 fill:#51cf66,color:#fff
+    style S2 fill:#51cf66,color:#fff
+    style S3 fill:#ff922b,color:#fff
 ```
 
 ## CLI Options
@@ -139,6 +391,47 @@ All options from `CrowdControl.CLI.build_command/1` can be passed to `start_sess
 | `:include_partial_messages` | `true` for streaming deltas |
 | `:no_session_persistence` | `true` to skip saving to disk |
 | `:extra_args` | List of additional CLI arguments |
+| `:api_key` | Anthropic API key (sets `ANTHROPIC_API_KEY` for the subprocess) |
+| `:api_url` | Custom API base URL (sets `ANTHROPIC_BASE_URL` for the subprocess) |
+| `:env` | Map of arbitrary environment variables for the subprocess |
+
+## API Reference
+
+### CrowdControl (orchestration)
+
+| Function | Description |
+|----------|-------------|
+| `run(prompt, opts)` | Single-shot: start session, send prompt, collect result, stop |
+| `run_many(prompt, opts_list)` | Same prompt across N sessions with different options |
+| `start_session(opts)` | Start one supervised session |
+| `start_sessions(opts_list)` | Start N sessions in parallel |
+| `broadcast(sessions, prompt)` | Send the same prompt to all sessions |
+| `collect(sessions, timeout)` | Wait for result messages from all sessions |
+| `stop_all(sessions)` | Gracefully stop all sessions |
+
+### CrowdControl.Session (per-instance)
+
+| Function | Description |
+|----------|-------------|
+| `send_prompt(session, prompt)` | Send a user prompt |
+| `subscribe(session)` | Receive messages as `{:crowd_control, pid, msg}` |
+| `get_status(session)` | Returns `:starting`, `:running`, `:completed`, or `:error` |
+| `get_session_id(session)` | CLI-assigned session ID |
+| `get_messages(session)` | All accumulated messages |
+| `stop(session)` | Graceful shutdown |
+
+### Message types
+
+Subscribers receive `{:crowd_control, session_pid, message}` where message is:
+
+| Message | When |
+|---------|------|
+| `{:system_init, map}` | CLI initialized, contains `session_id`, `tools`, `model` |
+| `{:assistant, map}` | Assistant response with `content` blocks |
+| `{:user, map}` | Tool execution results |
+| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` |
+| `{:stream_event, map}` | Partial message delta (requires `:include_partial_messages`) |
+| `{:exit, status}` | CLI process exited with OS status code |
 
 ## Architecture
 
@@ -202,17 +495,17 @@ sequenceDiagram
     NR->>CLI: stdin: {"type":"user",...}\n
 
     CLI->>NR: stdout: {"type":"system","subtype":"init",...}\n
-    NR->>Reader: read() → {:ok, data}
+    NR->>Reader: read() -> {:ok, data}
     Reader->>Session: cast {:stdout_data, data}
     Session->>Caller: send {:crowd_control, pid, {:system_init, ...}}
 
     CLI->>NR: stdout: {"type":"assistant",...}\n
-    NR->>Reader: read() → {:ok, data}
+    NR->>Reader: read() -> {:ok, data}
     Reader->>Session: cast {:stdout_data, data}
     Session->>Caller: send {:crowd_control, pid, {:assistant, ...}}
 
     CLI->>NR: stdout: {"type":"result","subtype":"success",...}\n
-    NR->>Reader: read() → {:ok, data}
+    NR->>Reader: read() -> {:ok, data}
     Reader->>Session: cast {:stdout_data, data}
     Session->>Caller: send {:crowd_control, pid, {:result, ...}}
 ```
@@ -307,3 +600,15 @@ graph TD
     style S2R fill:#51cf66,color:#fff
     style Z fill:#ffd43b,color:#333
 ```
+
+## Requirements
+
+- Elixir >= 1.18
+- Erlang/OTP >= 27
+- C compiler (gcc or clang) for net_runner NIF
+- `claude` CLI ([install](https://docs.anthropic.com/en/docs/claude-code)) and/or `open-code` CLI
+- `ANTHROPIC_API_KEY` environment variable set
+
+## License
+
+MIT

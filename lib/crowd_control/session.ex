@@ -62,9 +62,10 @@ defmodule CrowdControl.Session do
 
   @impl true
   def init(opts) do
-    {executable, args} = CLI.build_command(opts)
+    {executable, args, env} = CLI.build_command(opts)
+    {cmd, cmd_args} = wrap_with_env(executable, args, env)
 
-    case NetRunner.Process.start_link(executable, args) do
+    case NetRunner.Process.start_link(cmd, cmd_args) do
       {:ok, proc} ->
         session_pid = self()
         reader = spawn_link(fn -> reader_loop(proc, session_pid) end)
@@ -200,6 +201,15 @@ defmodule CrowdControl.Session do
     Enum.each(state.subscribers, fn pid ->
       send(pid, {:crowd_control, self(), message})
     end)
+  end
+
+  defp wrap_with_env(executable, args, env) when map_size(env) == 0 do
+    {executable, args}
+  end
+
+  defp wrap_with_env(executable, args, env) do
+    env_args = Enum.flat_map(env, fn {k, v} -> ["#{k}=#{v}"] end)
+    {"/usr/bin/env", env_args ++ [executable | args]}
   end
 
   defp shutdown_process(state) do
