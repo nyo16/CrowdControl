@@ -1,0 +1,29 @@
+{
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "providers": {
+    "anthropic": {
+      "apiKey": "${ANTHROPIC_API_KEY}"
+    }
+  },
+  "tools": {
+    "bash": {
+      "enabled": true
+    },
+    "edit": {
+      "enabled": true
+    },
+    "read": {
+      "enabled": true
+    },
+    "write": {
+      "enabled": true
+    },
+    "glob": {
+      "enabled": true
+    },
+    "grep": {
+      "enabled": true
+    }
+  }
+}

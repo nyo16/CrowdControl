@@ -78,6 +78,66 @@ defmodule CrowdControl.CLITest do
     end
   end
 
+  describe "config options" do
+    test "adds settings file path" do
+      {_exec, args, _env} = CLI.build_command(settings: "/config/settings.json")
+      assert args_contain_pair?(args, "--settings", "/config/settings.json")
+    end
+
+    test "adds settings as inline JSON" do
+      json = ~s({"permissions":{"allow":["Read"]}})
+      {_exec, args, _env} = CLI.build_command(settings: json)
+      assert args_contain_pair?(args, "--settings", json)
+    end
+
+    test "adds setting sources" do
+      {_exec, args, _env} = CLI.build_command(setting_sources: ["user", "project"])
+      assert args_contain_pair?(args, "--setting-sources", "user,project")
+    end
+
+    test "adds single mcp config" do
+      {_exec, args, _env} = CLI.build_command(mcp_config: "/config/mcp.json")
+      assert args_contain_pair?(args, "--mcp-config", "/config/mcp.json")
+    end
+
+    test "adds multiple mcp configs" do
+      {_exec, args, _env} = CLI.build_command(mcp_config: ["/config/a.json", "/config/b.json"])
+      idx = Enum.find_index(args, &(&1 == "--mcp-config"))
+      assert idx != nil
+      assert Enum.at(args, idx + 1) == "/config/a.json"
+      assert Enum.at(args, idx + 2) == "/config/b.json"
+    end
+
+    test "adds strict mcp config flag" do
+      {_exec, args, _env} = CLI.build_command(strict_mcp_config: true)
+      assert "--strict-mcp-config" in args
+    end
+
+    test "adds agents as JSON string" do
+      json = ~s({"reviewer":{"description":"Reviews code","prompt":"Review it"}})
+      {_exec, args, _env} = CLI.build_command(agents: json)
+      assert args_contain_pair?(args, "--agents", json)
+    end
+
+    test "adds agents as map (encodes to JSON)" do
+      agents = %{"reviewer" => %{"description" => "Reviews code", "prompt" => "Review it"}}
+      {_exec, args, _env} = CLI.build_command(agents: agents)
+      idx = Enum.find_index(args, &(&1 == "--agents"))
+      decoded = JSON.decode!(Enum.at(args, idx + 1))
+      assert decoded["reviewer"]["description"] == "Reviews code"
+    end
+
+    test "adds plugin dir" do
+      {_exec, args, _env} = CLI.build_command(plugin_dir: "/plugins")
+      assert args_contain_pair?(args, "--plugin-dir", "/plugins")
+    end
+
+    test "adds bare flag" do
+      {_exec, args, _env} = CLI.build_command(bare: true)
+      assert "--bare" in args
+    end
+  end
+
   describe "build_env/1" do
     test "returns empty map with no env options" do
       assert CLI.build_env([]) == %{}

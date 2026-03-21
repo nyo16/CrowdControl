@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/refs/heads/main/.claude/settings.schema.json",
+  "permissions": {
+    "allow": [
+      "Bash(git:*)",
+      "Read",
+      "Edit",
+      "Write"
+    ],
+    "deny": []
+  },
+  "env": {
+    "CLAUDE_CODE_SKIP_UPDATE_CHECK": "1"
+  },
+  "preferences": {
+    "verbose": true
+  }
+}

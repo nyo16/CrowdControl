@@ -228,6 +228,78 @@ CrowdControl.run("Debug this",
 )
 ```
 
+### Settings and config files
+
+```elixir
+# Load a custom settings JSON file
+CrowdControl.run("Fix the tests",
+  settings: "/config/claude_settings.json",
+  add_dir: "/workspace",
+  permission_mode: "bypassPermissions"
+)
+
+# Inline settings as JSON string
+CrowdControl.run("Audit this code",
+  settings: ~s({"permissions":{"allow":["Read","Bash(git:*)"],"deny":["Edit","Write"]}}),
+  add_dir: "/workspace"
+)
+
+# Load MCP server configs
+CrowdControl.run("Search the GitHub repo for issues",
+  mcp_config: "/config/mcp_servers.json",
+  strict_mcp_config: true,
+  permission_mode: "bypassPermissions"
+)
+
+# Load multiple MCP configs
+CrowdControl.run("Analyze the project",
+  mcp_config: ["/config/mcp_filesystem.json", "/config/mcp_github.json"],
+  permission_mode: "bypassPermissions"
+)
+
+# Custom agents per session
+CrowdControl.run_many("Review this PR", [
+  [
+    agents: %{
+      "security" => %{
+        "description" => "Security reviewer",
+        "prompt" => "Focus only on security vulnerabilities and data leaks."
+      }
+    },
+    add_dir: "/workspace"
+  ],
+  [
+    agents: %{
+      "perf" => %{
+        "description" => "Performance reviewer",
+        "prompt" => "Focus only on performance bottlenecks and N+1 queries."
+      }
+    },
+    add_dir: "/workspace"
+  ]
+])
+
+# Bare mode (skip hooks, LSP, plugins, auto-memory)
+CrowdControl.run("Quick analysis",
+  bare: true,
+  settings: "/config/claude_settings_permissive.json",
+  add_dir: "/workspace",
+  permission_mode: "bypassPermissions"
+)
+
+# Control which setting sources are loaded
+CrowdControl.run("Check the code",
+  setting_sources: ["user", "project"],
+  add_dir: "/workspace"
+)
+
+# Load plugins from a directory
+CrowdControl.run("Process this",
+  plugin_dir: "/plugins/my-plugin",
+  permission_mode: "bypassPermissions"
+)
+```
+
 ### Budget control
 
 ```elixir
@@ -238,9 +310,133 @@ CrowdControl.run_many("Refactor this module for clarity", [
 ])
 ```
 
+## Authentication
+
+CrowdControl supports all Claude Code authentication methods:
+
+```mermaid
+graph LR
+    subgraph "Auth Methods"
+        A[API Key<br/>ANTHROPIC_API_KEY]
+        B[Subscription Token<br/>claude setup-token]
+        C[OAuth Session<br/>~/.claude/]
+        D[Console API<br/>claude auth login --console]
+    end
+
+    A --> CC[CrowdControl]
+    B --> CC
+    C --> CC
+    D --> CC
+
+    style A fill:#51cf66,color:#fff
+    style B fill:#4a9eff,color:#fff
+    style C fill:#ff922b,color:#fff
+    style D fill:#cc5de8,color:#fff
+```
+
+### API key (pay-per-use)
+
+The simplest method. Set per-session or via environment:
+
+```elixir
+# Via environment variable (all sessions inherit)
+# export ANTHROPIC_API_KEY=sk-ant-...
+
+# Or per-session
+CrowdControl.run("Hello", api_key: "sk-ant-your-key-here")
+
+# Different keys per session (separate billing)
+CrowdControl.run_many("Summarize this", [
+  [api_key: "sk-team-alpha"],
+  [api_key: "sk-team-beta"]
+])
+```
+
+### Claude subscription (Pro/Max/Team)
+
+For subscription-based billing without an API key. Two options:
+
+**Option 1: Interactive login (local machine)**
+
+```bash
+# Login once — stores OAuth token in ~/.claude/
+claude auth login
+```
+
+Then pass your `~/.claude` directory so sessions pick up the token:
+
+```elixir
+# Sessions inherit the subscription auth from ~/.claude
+CrowdControl.run("Hello",
+  env: %{"CLAUDE_CONFIG_DIR" => "/root/.claude"},
+  permission_mode: "bypassPermissions"
+)
+```
+
+**Option 2: Setup token (headless / Docker / CI)**
+
+```bash
+# Generate a long-lived token (requires Claude subscription)
+claude setup-token
+# Paste the token when prompted — stored in ~/.claude/
+```
+
+For Docker, mount `~/.claude` into the container:
+
+```bash
+docker run -it \
+  -v ~/.claude:/root/.claude \
+  -v "$(pwd)":/workspace \
+  crowd_control
+```
+
+### Console API (Anthropic Console billing)
+
+```bash
+claude auth login --console
+```
+
+Works the same as subscription — mount `~/.claude/` to share the session.
+
+### Auth in Docker
+
+```mermaid
+graph TD
+    subgraph Host
+        KEY["~/.claude/<br/>OAuth tokens"]
+        API["ANTHROPIC_API_KEY"]
+        CFG["/my/config/<br/>settings.json"]
+    end
+
+    subgraph Docker Container
+        ROOT["/root/.claude/"]
+        ENV["$ANTHROPIC_API_KEY"]
+        CONF["/config/"]
+        CC[CrowdControl]
+    end
+
+    KEY -->|"-v mount"| ROOT
+    API -->|"-e env"| ENV
+    CFG -->|"-v mount"| CONF
+    ROOT --> CC
+    ENV --> CC
+    CONF --> CC
+
+    style CC fill:#4a9eff,color:#fff
+    style KEY fill:#ff922b,color:#fff
+    style API fill:#51cf66,color:#fff
+```
+
+| Method | Docker flag | Notes |
+|--------|-------------|-------|
+| API key | `-e ANTHROPIC_API_KEY=sk-...` | Simplest, pay-per-use |
+| Subscription | `-v ~/.claude:/root/.claude` | Mount OAuth tokens |
+| Setup token | `-v ~/.claude:/root/.claude` | For CI/headless |
+| Per-session key | Set via `:api_key` option in IEx | Different keys per session |
+
 ## Docker
 
-Run CrowdControl in a Linux container with your project directory mounted in.
+Run CrowdControl in a Linux container with your project directory and config mounted in.
 
 ### Build the image
 
@@ -248,13 +444,81 @@ Run CrowdControl in a Linux container with your project directory mounted in.
 docker build -t crowd_control .
 ```
 
-### Run with current directory mounted
+### Run with API key
 
 ```bash
 docker run -it \
   -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
   -v "$(pwd)":/workspace \
   crowd_control
+```
+
+### Run with subscription auth
+
+```bash
+docker run -it \
+  -v ~/.claude:/root/.claude \
+  -v "$(pwd)":/workspace \
+  crowd_control
+```
+
+### Mount custom config files
+
+```bash
+docker run -it \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  -v "$(pwd)":/workspace \
+  -v /path/to/my/configs:/config \
+  crowd_control
+```
+
+The container has built-in template configs at `/config/templates/`:
+
+| Template | Description |
+|----------|-------------|
+| `claude_settings.json` | Default settings with common tool permissions |
+| `claude_settings_permissive.json` | Permissive settings (all tools allowed) |
+| `mcp_servers.json` | MCP server config (filesystem + GitHub) |
+| `agents.json` | Pre-built agents (reviewer, refactorer, documenter, tester) |
+| `opencode_settings.json` | Open Code provider/tool configuration |
+
+Use them directly or as a starting point:
+
+```elixir
+# Use built-in template
+CrowdControl.run("Review this",
+  settings: "/config/templates/claude_settings_permissive.json",
+  add_dir: "/workspace"
+)
+
+# Use your own mounted config
+CrowdControl.run("Analyze with MCP tools",
+  settings: "/config/my_settings.json",
+  mcp_config: "/config/my_mcp.json",
+  add_dir: "/workspace"
+)
+```
+
+### Mount everything (full setup)
+
+```bash
+docker run -it \
+  -v ~/.claude:/root/.claude \
+  -v "$(pwd)":/workspace \
+  -v /path/to/configs:/config \
+  -v /path/to/plugins:/plugins \
+  crowd_control
+```
+
+```elixir
+# Full-featured session with subscription auth, config, MCP, and plugins
+CrowdControl.run("Deep code review",
+  settings: "/config/claude_settings.json",
+  mcp_config: "/config/mcp_servers.json",
+  plugin_dir: "/plugins/my-plugin",
+  add_dir: "/workspace",
+  permission_mode: "bypassPermissions"
+)
 ```
 
 This drops you into an IEx shell. Your project is available at `/workspace`:
@@ -390,6 +654,13 @@ All options from `CrowdControl.CLI.build_command/1` can be passed to `start_sess
 | `:add_dir` | Additional project directory |
 | `:include_partial_messages` | `true` for streaming deltas |
 | `:no_session_persistence` | `true` to skip saving to disk |
+| `:settings` | Path to settings JSON file or inline JSON string |
+| `:setting_sources` | List of setting sources to load (`["user", "project", "local"]`) |
+| `:mcp_config` | Path to MCP config JSON file(s) (string or list) |
+| `:strict_mcp_config` | `true` to only use MCP servers from `:mcp_config` |
+| `:agents` | JSON string or map defining custom agents |
+| `:plugin_dir` | Path to a plugin directory |
+| `:bare` | `true` for minimal mode (skip hooks, LSP, plugins, auto-memory) |
 | `:extra_args` | List of additional CLI arguments |
 | `:api_key` | Anthropic API key (sets `ANTHROPIC_API_KEY` for the subprocess) |
 | `:api_url` | Custom API base URL (sets `ANTHROPIC_BASE_URL` for the subprocess) |

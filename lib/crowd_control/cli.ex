@@ -32,6 +32,13 @@ defmodule CrowdControl.CLI do
     * `:add_dir` - additional project directory
     * `:include_partial_messages` - `true` to include streaming deltas
     * `:no_session_persistence` - `true` to skip saving to disk
+    * `:settings` - path to a settings JSON file or inline JSON string
+    * `:setting_sources` - list of setting sources to load (e.g. `["user", "project", "local"]`)
+    * `:mcp_config` - path(s) to MCP config JSON files (string or list of strings)
+    * `:strict_mcp_config` - `true` to only use MCP servers from `:mcp_config`
+    * `:agents` - JSON string or map defining custom agents
+    * `:plugin_dir` - path to a plugin directory
+    * `:bare` - `true` for minimal mode (skip hooks, LSP, plugins, auto-memory)
     * `:extra_args` - list of additional string arguments
     * `:env` - map of environment variables to set (e.g. `%{"ANTHROPIC_API_KEY" => "sk-..."}`)
     * `:api_key` - shorthand for setting `ANTHROPIC_API_KEY`
@@ -55,9 +62,16 @@ defmodule CrowdControl.CLI do
     |> maybe_add("--session-id", opts[:session_id])
     |> maybe_add("--resume", opts[:resume])
     |> maybe_add("--add-dir", opts[:add_dir])
+    |> maybe_add("--settings", opts[:settings])
+    |> maybe_add_list("--setting-sources", opts[:setting_sources])
+    |> maybe_add_mcp_config(opts[:mcp_config])
+    |> maybe_add_agents(opts[:agents])
+    |> maybe_add("--plugin-dir", opts[:plugin_dir])
     |> maybe_add_flag("--continue", opts[:continue])
     |> maybe_add_flag("--include-partial-messages", opts[:include_partial_messages])
     |> maybe_add_flag("--no-session-persistence", opts[:no_session_persistence])
+    |> maybe_add_flag("--strict-mcp-config", opts[:strict_mcp_config])
+    |> maybe_add_flag("--bare", opts[:bare])
     |> maybe_add_extra(opts[:extra_args])
   end
 
@@ -70,6 +84,21 @@ defmodule CrowdControl.CLI do
   defp maybe_add_flag(args, _flag, nil), do: args
   defp maybe_add_flag(args, _flag, false), do: args
   defp maybe_add_flag(args, flag, true), do: args ++ [flag]
+
+  defp maybe_add_mcp_config(args, nil), do: args
+
+  defp maybe_add_mcp_config(args, configs) when is_list(configs),
+    do: args ++ ["--mcp-config" | configs]
+
+  defp maybe_add_mcp_config(args, config), do: args ++ ["--mcp-config", config]
+
+  defp maybe_add_agents(args, nil), do: args
+
+  defp maybe_add_agents(args, agents) when is_map(agents),
+    do: args ++ ["--agents", JSON.encode!(agents)]
+
+  defp maybe_add_agents(args, agents) when is_binary(agents),
+    do: args ++ ["--agents", agents]
 
   defp maybe_add_extra(args, nil), do: args
   defp maybe_add_extra(args, extra), do: args ++ extra

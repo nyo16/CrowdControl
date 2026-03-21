@@ -1,21 +1,37 @@
 services:
+  # API key auth
   crowd_control:
     build: .
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
     volumes:
-      # Mount your project directory into /workspace
       - ${PROJECT_DIR:-.}:/workspace
+      - ${CONFIG_DIR:-./config/templates}:/config
     stdin_open: true
     tty: true
 
-  # Run multiple isolated instances
+  # Subscription auth (mount ~/.claude for OAuth/setup-token)
+  crowd_control_sub:
+    build: .
+    environment:
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+    volumes:
+      - ${PROJECT_DIR:-.}:/workspace
+      - ${CONFIG_DIR:-./config/templates}:/config
+      - ${CLAUDE_HOME:-~/.claude}:/root/.claude
+    stdin_open: true
+    tty: true
+
+  # Multiple isolated workers
   worker:
     build: .
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
     volumes:
       - ${PROJECT_DIR:-.}:/workspace
+      - ${CONFIG_DIR:-./config/templates}:/config
     stdin_open: true
     tty: true
     deploy:

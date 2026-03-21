@@ -41,9 +41,12 @@ COPY --from=build /app/deps deps/
 COPY --from=build /app/mix.exs /app/mix.lock ./
 COPY --from=build /app/lib lib/
 
-# Default project mount point
-RUN mkdir -p /workspace
-VOLUME ["/workspace"]
+# Default mount points
+RUN mkdir -p /workspace /config
+VOLUME ["/workspace", "/config"]
+
+# Copy template config files
+COPY config/templates /config/templates
 
 ENV MIX_ENV=prod
 ENV CLAUDE_CODE_SKIP_UPDATE_CHECK=1
