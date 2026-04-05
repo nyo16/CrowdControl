@@ -5,3 +5,16 @@ deps/
 *.beam
 *.ez
 doc/
+.env
+.env.*
+*.secret
+.github/
+.claude/
+test/
+cover/
+tmp/
+erl_crash.dump
+crowd_control-*.tar
+README.md
+CHANGELOG.md
+LICENSE

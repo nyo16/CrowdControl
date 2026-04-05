@@ -10,6 +10,23 @@ services:
       - ${CONFIG_DIR:-./config/templates}:/config
     stdin_open: true
     tty: true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/crowdctl/.claude
+      - /home/crowdctl/.npm
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
 
   # Subscription auth (mount ~/.claude for OAuth/setup-token)
   crowd_control_sub:
@@ -19,9 +36,25 @@ services:
     volumes:
       - ${PROJECT_DIR:-.}:/workspace
       - ${CONFIG_DIR:-./config/templates}:/config
-      - ${CLAUDE_HOME:-~/.claude}:/root/.claude
+      - ${CLAUDE_HOME:-~/.claude}:/home/crowdctl/.claude
     stdin_open: true
     tty: true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/crowdctl/.npm
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
 
   # Multiple isolated workers
   worker:
@@ -34,5 +67,21 @@ services:
       - ${CONFIG_DIR:-./config/templates}:/config
     stdin_open: true
     tty: true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/crowdctl/.claude
+      - /home/crowdctl/.npm
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       replicas: ${WORKER_COUNT:-3}
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"

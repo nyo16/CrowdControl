@@ -15,7 +15,20 @@ defmodule CrowdControl do
     * `:prompt` - initial prompt to send after the CLI starts
   """
   def start_session(opts \\ []) do
-    DynamicSupervisor.start_child(CrowdControl.SessionSupervisor, {Session, opts})
+    case DynamicSupervisor.start_child(CrowdControl.SessionSupervisor, {Session, opts}) do
+      {:error, :max_children} -> {:error, :max_sessions_reached}
+      other -> other
+    end
+  end
+
+  @doc """
+  Returns `true` if the session supervisor is alive and healthy.
+  """
+  def healthy? do
+    case Process.whereis(CrowdControl.SessionSupervisor) do
+      nil -> false
+      pid -> Process.alive?(pid)
+    end
   end
 
   @doc """

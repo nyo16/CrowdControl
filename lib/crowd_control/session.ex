@@ -9,6 +9,8 @@ defmodule CrowdControl.Session do
 
   use GenServer
 
+  require Logger
+
   alias CrowdControl.{CLI, Protocol}
 
   defstruct [
@@ -16,6 +18,10 @@ defmodule CrowdControl.Session do
     :reader,
     :session_id,
     :opts,
+    :timeout,
+    :timeout_ref,
+    :env_file,
+    :max_prompt_size,
     status: :starting,
     subscribers: [],
     buffer: "",
@@ -63,18 +69,27 @@ defmodule CrowdControl.Session do
   @impl true
   def init(opts) do
     {executable, args, env} = CLI.build_command(opts)
-    {cmd, cmd_args} = wrap_with_env(executable, args, env)
+    {cmd, cmd_args, env_file} = wrap_with_env(executable, args, env)
+
+    Logger.info("Starting session: executable=#{executable}, model=#{opts[:model] || "default"}")
 
     case NetRunner.Process.start_link(cmd, cmd_args) do
       {:ok, proc} ->
         session_pid = self()
         reader = spawn_link(fn -> reader_loop(proc, session_pid) end)
+        timeout = Keyword.get(opts, :timeout)
+        max_prompt_size = Keyword.get(opts, :max_prompt_size)
 
         state = %__MODULE__{
           proc: proc,
           reader: reader,
-          opts: opts
+          opts: opts,
+          timeout: timeout,
+          env_file: env_file,
+          max_prompt_size: max_prompt_size
         }
+
+        state = schedule_timeout(state)
 
         state =
           case Keyword.get(opts, :prompt) do
@@ -85,14 +100,25 @@ defmodule CrowdControl.Session do
         {:ok, state}
 
       {:error, reason} ->
+        cleanup_env_file(env_file)
         {:stop, reason}
     end
   end
 
   @impl true
+  def handle_call({:send_prompt, prompt}, _from, state) when not is_binary(prompt) do
+    {:reply, {:error, :invalid_prompt}, state}
+  end
+
+  def handle_call({:send_prompt, prompt}, _from, %{max_prompt_size: max} = state)
+      when is_integer(max) and byte_size(prompt) > max do
+    {:reply, {:error, :prompt_too_large}, state}
+  end
+
   def handle_call({:send_prompt, prompt}, _from, %{status: status} = state)
       when status in [:starting, :running] do
-    {:reply, :ok, do_send_prompt(state, prompt)}
+    state = state |> do_send_prompt(prompt) |> schedule_timeout()
+    {:reply, :ok, state}
   end
 
   def handle_call({:send_prompt, _prompt}, _from, state) do
@@ -147,12 +173,29 @@ defmodule CrowdControl.Session do
 
     status = if exit_status == 0 or state.status == :completed, do: :completed, else: :error
     state = %{state | status: status}
+
+    if status == :error do
+      Logger.warning("Session exited with error, exit_status=#{inspect(exit_status)}")
+    else
+      Logger.info("Session completed, exit_status=#{inspect(exit_status)}")
+    end
+
+    cleanup_env_file(state.env_file)
     broadcast(state, {:exit, exit_status})
     {:noreply, state}
   end
 
   @impl true
+  def handle_info(:session_timeout, state) do
+    Logger.warning("Session timed out after #{state.timeout}ms")
+    state = shutdown_process(state)
+    broadcast(state, {:timeout, :session_expired})
+    {:stop, :normal, %{state | status: :error}}
+  end
+
+  @impl true
   def terminate(_reason, state) do
+    cleanup_env_file(state.env_file)
     shutdown_process(state)
     :ok
   end
@@ -204,12 +247,47 @@ defmodule CrowdControl.Session do
   end
 
   defp wrap_with_env(executable, args, env) when map_size(env) == 0 do
-    {executable, args}
+    {executable, args, nil}
   end
 
   defp wrap_with_env(executable, args, env) do
-    env_args = Enum.flat_map(env, fn {k, v} -> ["#{k}=#{v}"] end)
-    {"/usr/bin/env", env_args ++ [executable | args]}
+    env_file = write_env_file(env)
+    escaped_args = Enum.map_join([executable | args], " ", &shell_escape/1)
+    shell_cmd = ". #{env_file} && rm -f #{env_file} && exec #{escaped_args}"
+    {"/bin/sh", ["-c", shell_cmd], env_file}
+  end
+
+  defp write_env_file(env) do
+    random = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+    path = Path.join(System.tmp_dir!(), "cc_env_#{random}.sh")
+
+    content =
+      Enum.map_join(env, "\n", fn {k, v} ->
+        "export #{k}=#{shell_escape(v)}"
+      end)
+
+    File.write!(path, content <> "\n")
+    File.chmod!(path, 0o600)
+    path
+  end
+
+  defp shell_escape(value) do
+    "'" <> String.replace(to_string(value), "'", "'\\''") <> "'"
+  end
+
+  defp cleanup_env_file(nil), do: :ok
+
+  defp cleanup_env_file(path) do
+    File.rm(path)
+    :ok
+  end
+
+  defp schedule_timeout(%{timeout: nil} = state), do: state
+
+  defp schedule_timeout(%{timeout: timeout} = state) when is_integer(timeout) do
+    if state.timeout_ref, do: Process.cancel_timer(state.timeout_ref)
+    ref = Process.send_after(self(), :session_timeout, timeout)
+    %{state | timeout_ref: ref}
   end
 
   defp shutdown_process(state) do
