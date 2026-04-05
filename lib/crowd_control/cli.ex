@@ -29,7 +29,7 @@ defmodule CrowdControl.CLI do
     * `:session_id` - session ID for new sessions
     * `:resume` - session ID to resume
     * `:continue` - `true` to continue the most recent session
-    * `:add_dir` - additional project directory
+    * `:add_dir` - additional project directory (string or list of strings)
     * `:include_partial_messages` - `true` to include streaming deltas
     * `:no_session_persistence` - `true` to skip saving to disk
     * `:settings` - path to a settings JSON file or inline JSON string
@@ -61,7 +61,7 @@ defmodule CrowdControl.CLI do
     |> maybe_add("--max-budget-usd", opts[:max_budget_usd])
     |> maybe_add("--session-id", opts[:session_id])
     |> maybe_add("--resume", opts[:resume])
-    |> maybe_add("--add-dir", opts[:add_dir])
+    |> maybe_add_multi("--add-dir", opts[:add_dir])
     |> maybe_add("--settings", opts[:settings])
     |> maybe_add_list("--setting-sources", opts[:setting_sources])
     |> maybe_add_mcp_config(opts[:mcp_config])
@@ -80,6 +80,10 @@ defmodule CrowdControl.CLI do
 
   defp maybe_add_list(args, _flag, nil), do: args
   defp maybe_add_list(args, flag, values), do: args ++ [flag, Enum.join(values, ",")]
+
+  defp maybe_add_multi(args, _flag, nil), do: args
+  defp maybe_add_multi(args, flag, values) when is_list(values), do: args ++ [flag | values]
+  defp maybe_add_multi(args, flag, value), do: args ++ [flag, to_string(value)]
 
   defp maybe_add_flag(args, _flag, nil), do: args
   defp maybe_add_flag(args, _flag, false), do: args

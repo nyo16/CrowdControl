@@ -55,6 +55,20 @@ defmodule CrowdControl.CLITest do
       refute "--continue" in args
     end
 
+    test "adds single add_dir as string" do
+      {_exec, args, _env} = CLI.build_command(add_dir: "/path/to/project")
+      assert args_contain_pair?(args, "--add-dir", "/path/to/project")
+    end
+
+    test "adds multiple add_dirs as list" do
+      {_exec, args, _env} = CLI.build_command(add_dir: ["/project/a", "/project/b", "/project/c"])
+      idx = Enum.find_index(args, &(&1 == "--add-dir"))
+      assert idx != nil
+      assert Enum.at(args, idx + 1) == "/project/a"
+      assert Enum.at(args, idx + 2) == "/project/b"
+      assert Enum.at(args, idx + 3) == "/project/c"
+    end
+
     test "adds extra args" do
       {_exec, args, _env} = CLI.build_command(extra_args: ["--dangerously-skip-permissions"])
       assert "--dangerously-skip-permissions" in args
