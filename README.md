@@ -32,6 +32,9 @@ graph LR
 - Zero zombie OS processes guaranteed by net_runner's Shepherd
 - Docker support with project directory mounting
 - Works with both `claude` and `open-code` CLIs
+- **Security hardened**: non-root Docker container, API key protection, capability dropping, resource limits
+- Configurable session concurrency limits and timeouts
+- Input validation and structured logging
 
 ## Installation
 
@@ -368,7 +371,7 @@ Then pass your `~/.claude` directory so sessions pick up the token:
 ```elixir
 # Sessions inherit the subscription auth from ~/.claude
 CrowdControl.run("Hello",
-  env: %{"CLAUDE_CONFIG_DIR" => "/root/.claude"},
+  env: %{"CLAUDE_CONFIG_DIR" => "/home/crowdctl/.claude"},
   permission_mode: "bypassPermissions"
 )
 ```
@@ -385,7 +388,7 @@ For Docker, mount `~/.claude` into the container:
 
 ```bash
 docker run -it \
-  -v ~/.claude:/root/.claude \
+  -v ~/.claude:/home/crowdctl/.claude \
   -v "$(pwd)":/workspace \
   crowd_control
 ```
@@ -409,7 +412,7 @@ graph TD
     end
 
     subgraph Docker Container
-        ROOT["/root/.claude/"]
+        ROOT["/home/crowdctl/.claude/"]
         ENV["$ANTHROPIC_API_KEY"]
         CONF["/config/"]
         CC[CrowdControl]
@@ -430,18 +433,32 @@ graph TD
 | Method | Docker flag | Notes |
 |--------|-------------|-------|
 | API key | `-e ANTHROPIC_API_KEY=sk-...` | Simplest, pay-per-use |
-| Subscription | `-v ~/.claude:/root/.claude` | Mount OAuth tokens |
-| Setup token | `-v ~/.claude:/root/.claude` | For CI/headless |
+| Subscription | `-v ~/.claude:/home/crowdctl/.claude` | Mount OAuth tokens |
+| Setup token | `-v ~/.claude:/home/crowdctl/.claude` | For CI/headless |
 | Per-session key | Set via `:api_key` option in IEx | Different keys per session |
 
 ## Docker
 
-Run CrowdControl in a Linux container with your project directory and config mounted in.
+Run CrowdControl in a hardened Linux container with your project directory and config mounted in.
+
+The container is security-hardened out of the box:
+
+- **Non-root user**: runs as `crowdctl` (not root)
+- **Capabilities dropped**: all Linux capabilities removed (`cap_drop: ALL`)
+- **No privilege escalation**: `no-new-privileges` security option
+- **Read-only filesystem**: root FS is read-only with tmpfs for `/tmp`, `~/.claude`, `~/.npm`
+- **Resource limits**: memory and CPU limits configured in docker-compose
+- **Health check**: built-in `HEALTHCHECK` via `CrowdControl.healthy?/0`
+- **Pinnable CLI version**: `CLAUDE_CODE_VERSION` build arg for reproducible builds
 
 ### Build the image
 
 ```bash
+# Build with latest Claude Code CLI
 docker build -t crowd_control .
+
+# Pin a specific Claude Code version
+docker build --build-arg CLAUDE_CODE_VERSION=1.0.16 -t crowd_control .
 ```
 
 ### Run with API key
@@ -457,7 +474,7 @@ docker run -it \
 
 ```bash
 docker run -it \
-  -v ~/.claude:/root/.claude \
+  -v ~/.claude:/home/crowdctl/.claude \
   -v "$(pwd)":/workspace \
   crowd_control
 ```
@@ -503,7 +520,7 @@ CrowdControl.run("Analyze with MCP tools",
 
 ```bash
 docker run -it \
-  -v ~/.claude:/root/.claude \
+  -v ~/.claude:/home/crowdctl/.claude \
   -v "$(pwd)":/workspace \
   -v /path/to/configs:/config \
   -v /path/to/plugins:/plugins \
@@ -665,6 +682,8 @@ All options from `CrowdControl.CLI.build_command/1` can be passed to `start_sess
 | `:api_key` | Anthropic API key (sets `ANTHROPIC_API_KEY` for the subprocess) |
 | `:api_url` | Custom API base URL (sets `ANTHROPIC_BASE_URL` for the subprocess) |
 | `:env` | Map of arbitrary environment variables for the subprocess |
+| `:timeout` | Session timeout in milliseconds (default: `nil` / no timeout) |
+| `:max_prompt_size` | Maximum prompt size in bytes (default: `nil` / no limit) |
 
 ## API Reference
 
@@ -674,11 +693,12 @@ All options from `CrowdControl.CLI.build_command/1` can be passed to `start_sess
 |----------|-------------|
 | `run(prompt, opts)` | Single-shot: start session, send prompt, collect result, stop |
 | `run_many(prompt, opts_list)` | Same prompt across N sessions with different options |
-| `start_session(opts)` | Start one supervised session |
+| `start_session(opts)` | Start one supervised session (returns `{:error, :max_sessions_reached}` at limit) |
 | `start_sessions(opts_list)` | Start N sessions in parallel |
 | `broadcast(sessions, prompt)` | Send the same prompt to all sessions |
 | `collect(sessions, timeout)` | Wait for result messages from all sessions |
 | `stop_all(sessions)` | Gracefully stop all sessions |
+| `healthy?()` | Returns `true` if the session supervisor is alive |
 
 ### CrowdControl.Session (per-instance)
 
@@ -702,6 +722,7 @@ Subscribers receive `{:crowd_control, session_pid, message}` where message is:
 | `{:user, map}` | Tool execution results |
 | `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` |
 | `{:stream_event, map}` | Partial message delta (requires `:include_partial_messages`) |
+| `{:timeout, :session_expired}` | Session timed out (requires `:timeout` option) |
 | `{:exit, status}` | CLI process exited with OS status code |
 
 ## Architecture
@@ -871,6 +892,46 @@ graph TD
     style S2R fill:#51cf66,color:#fff
     style Z fill:#ffd43b,color:#333
 ```
+
+## Security
+
+### API key protection
+
+Per-session API keys (passed via `:api_key` or `:env`) are written to a temporary file with `0600` permissions, sourced by the shell, and deleted before the CLI process starts. Keys never appear in process arguments or `ps` output.
+
+### Session limits
+
+The `DynamicSupervisor` enforces a maximum number of concurrent sessions (default: 50). Configure via application environment:
+
+```elixir
+# config/runtime.exs
+config :crowd_control, max_sessions: 100
+```
+
+When the limit is reached, `start_session/1` returns `{:error, :max_sessions_reached}`.
+
+### Session timeouts
+
+Sessions can be configured with an automatic timeout to prevent runaway processes:
+
+```elixir
+# Session expires after 5 minutes of inactivity
+CrowdControl.run("Analyze this code",
+  timeout: 300_000,
+  add_dir: "/workspace"
+)
+```
+
+The timer resets on each `send_prompt` call. On expiry, subscribers receive `{:timeout, :session_expired}` and the session shuts down.
+
+### Input validation
+
+- `send_prompt/2` rejects non-string prompts with `{:error, :invalid_prompt}`
+- Optional `:max_prompt_size` (bytes) returns `{:error, :prompt_too_large}` when exceeded
+
+### Docker security
+
+See the [Docker](#docker) section for container hardening details (non-root user, capability dropping, read-only filesystem, resource limits).
 
 ## Requirements
 
