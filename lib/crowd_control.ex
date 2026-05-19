@@ -19,7 +19,7 @@ defmodule CrowdControl do
   Additional option:
     * `:prompt` - initial prompt to send after the CLI starts
   """
-  @spec start_session(opts()) :: {:ok, session()} | {:error, term()}
+  @spec start_session(opts()) :: DynamicSupervisor.on_start_child()
   def start_session(opts \\ []) do
     case DynamicSupervisor.start_child(CrowdControl.SessionSupervisor, {Session, opts}) do
       {:error, :max_children} -> {:error, :max_sessions_reached}

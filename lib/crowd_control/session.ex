@@ -189,7 +189,7 @@ defmodule CrowdControl.Session do
 
   def handle_cast(:eof, state) do
     exit_status =
-      case NetRunner.Process.await_exit(state.proc, 1_000) do
+      case safe_await_exit(state.proc, 1_000) do
         {:ok, status} -> status
         _ -> nil
       end
@@ -340,20 +340,41 @@ defmodule CrowdControl.Session do
   end
 
   defp shutdown_process(state) do
-    if state.proc && NetRunner.Process.alive?(state.proc) do
-      NetRunner.Process.kill(state.proc, :sigterm)
+    if state.proc && safe_alive?(state.proc) do
+      _ = safe_kill(state.proc, :sigterm)
 
-      case NetRunner.Process.await_exit(state.proc, 1_000) do
+      case safe_await_exit(state.proc, 1_000) do
         {:ok, _} ->
           :ok
 
         _ ->
-          NetRunner.Process.kill(state.proc, :sigkill)
-          _ = NetRunner.Process.await_exit(state.proc, 1_000)
+          _ = safe_kill(state.proc, :sigkill)
+          _ = safe_await_exit(state.proc, 1_000)
           :ok
       end
     end
 
     state
+  end
+
+  defp safe_await_exit(proc, timeout) do
+    NetRunner.Process.await_exit(proc, timeout)
+  catch
+    :exit, _ -> :timeout
+    :error, _ -> :timeout
+  end
+
+  defp safe_alive?(proc) do
+    NetRunner.Process.alive?(proc)
+  catch
+    :exit, _ -> false
+    :error, _ -> false
+  end
+
+  defp safe_kill(proc, signal) do
+    NetRunner.Process.kill(proc, signal)
+  catch
+    :exit, _ -> :ok
+    :error, _ -> :ok
   end
 end
