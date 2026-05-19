@@ -45,32 +45,32 @@ defmodule CrowdControl.SessionTest do
     test "rejects non-binary prompt" do
       {:ok, pid} = start_fake_session()
       assert {:error, :invalid_prompt} = Session.send_prompt(pid, :not_a_string)
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
 
     test "rejects prompt with null byte" do
       {:ok, pid} = start_fake_session()
       assert {:error, :invalid_prompt} = Session.send_prompt(pid, "hi\0there")
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
 
     test "rejects prompt with invalid UTF-8" do
       {:ok, pid} = start_fake_session()
       assert {:error, :invalid_prompt} = Session.send_prompt(pid, <<0xFF, 0xFE>>)
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
 
     test "rejects prompt exceeding max_prompt_size" do
       {:ok, pid} = start_fake_session(max_prompt_size: 5)
       assert {:error, :prompt_too_large} = Session.send_prompt(pid, "abcdef")
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
 
     test "accepts prompt exactly at max_prompt_size" do
       {:ok, pid} = start_fake_session(max_prompt_size: 5)
       Session.subscribe(pid)
       assert :ok = Session.send_prompt(pid, "abcde")
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
   end
 
@@ -85,7 +85,7 @@ defmodule CrowdControl.SessionTest do
       assert_receive {:crowd_control, ^pid, {:assistant, _}}, 3_000
       assert_receive {:crowd_control, ^pid, {:result, "success", _}}, 3_000
 
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
 
     test "get_session_id returns the id from system/init" do
@@ -93,7 +93,7 @@ defmodule CrowdControl.SessionTest do
       Session.subscribe(pid)
       assert_receive {:crowd_control, ^pid, {:system_init, _}}, 3_000
       assert Session.get_session_id(pid) == "custom-sid"
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
 
     test "get_messages returns accumulated messages in chronological order" do
@@ -105,7 +105,7 @@ defmodule CrowdControl.SessionTest do
       messages = Session.get_messages(pid)
       assert [{:system_init, _} | _] = messages
       assert match?({:result, _, _}, List.last(messages))
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
   end
 
@@ -129,7 +129,7 @@ defmodule CrowdControl.SessionTest do
       assert_receive {:crowd_control, ^pid, {:system_init, _}}, 3_000
       assert_receive {:crowd_control, ^pid, {:result, _, _}}, 3_000
       assert Process.alive?(pid)
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
   end
 
@@ -149,7 +149,7 @@ defmodule CrowdControl.SessionTest do
 
       :ok = Session.send_prompt(pid, "hi")
       assert_receive {:crowd_control, ^pid, {:result, _, %{"result" => "MY_TEST_KEY=ok"}}}, 3_000
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
       Process.sleep(100)
 
       after_ = MapSet.new(list_cc_env_dirs())

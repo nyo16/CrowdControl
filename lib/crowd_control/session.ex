@@ -189,7 +189,7 @@ defmodule CrowdControl.Session do
 
   def handle_cast(:eof, state) do
     exit_status =
-      case NetRunner.Process.await_exit(state.proc, 5_000) do
+      case NetRunner.Process.await_exit(state.proc, 1_000) do
         {:ok, status} -> status
         _ -> nil
       end
@@ -343,9 +343,14 @@ defmodule CrowdControl.Session do
     if state.proc && NetRunner.Process.alive?(state.proc) do
       NetRunner.Process.kill(state.proc, :sigterm)
 
-      case NetRunner.Process.await_exit(state.proc, 5_000) do
-        {:ok, _} -> :ok
-        _ -> NetRunner.Process.kill(state.proc, :sigkill)
+      case NetRunner.Process.await_exit(state.proc, 1_000) do
+        {:ok, _} ->
+          :ok
+
+        _ ->
+          NetRunner.Process.kill(state.proc, :sigkill)
+          _ = NetRunner.Process.await_exit(state.proc, 1_000)
+          :ok
       end
     end
 

@@ -7,7 +7,7 @@ defmodule CrowdControlTest do
     test "returns {:ok, pid} for a valid session" do
       assert {:ok, pid} = CrowdControl.start_session(executable: TestHelpers.fake_cli_path())
       assert Process.alive?(pid)
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
   end
 
@@ -107,7 +107,7 @@ defmodule CrowdControlTest do
   describe "stop_all/1" do
     test "swallows :exit from already-dead sessions" do
       {:ok, pid} = CrowdControl.start_session(executable: TestHelpers.fake_cli_path())
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
       Process.sleep(50)
 
       assert :ok = CrowdControl.stop_all([pid])

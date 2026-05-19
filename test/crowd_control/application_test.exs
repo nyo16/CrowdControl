@@ -34,8 +34,8 @@ defmodule CrowdControl.ApplicationTest do
                {Session, executable: TestHelpers.fake_cli_path(), timeout: 5_000}
              )
 
-    Session.stop(p1)
-    Session.stop(p2)
+    TestHelpers.stop_session(p1)
+    TestHelpers.stop_session(p2)
     DynamicSupervisor.stop(sup)
   end
 end

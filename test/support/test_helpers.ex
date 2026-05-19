@@ -1,9 +1,23 @@
 defmodule CrowdControl.TestHelpers do
   @moduledoc false
 
+  alias CrowdControl.Session
+
   @doc "Absolute path to the fake CLI shell script used by integration tests."
   def fake_cli_path do
     Path.expand("../support/fake_cli.sh", __DIR__)
+  end
+
+  @doc """
+  Stop a session, tolerating mailbox congestion. Falls back to a hard
+  `Process.exit(pid, :kill)` if the GenServer.call times out.
+  """
+  def stop_session(pid) when is_pid(pid) do
+    Session.stop(pid)
+  catch
+    :exit, _ ->
+      Process.exit(pid, :kill)
+      :ok
   end
 
   @doc """

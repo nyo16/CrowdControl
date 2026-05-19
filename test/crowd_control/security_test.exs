@@ -79,7 +79,7 @@ defmodule CrowdControl.SecurityTest do
         :ok = Session.send_prompt(pid, "x")
 
         assert_receive {:crowd_control, ^pid, {:result, "success", %{"result" => result}}}, 5_000
-        Session.stop(pid)
+        TestHelpers.stop_session(pid)
 
         assert result == "#{marker}=#{@raw}",
                "shell escape regressed for #{@name}: got #{inspect(result)}"
@@ -98,7 +98,7 @@ defmodule CrowdControl.SecurityTest do
 
       Session.subscribe(pid)
       assert :ok = Session.send_prompt(pid, "abc")
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
 
     test "one byte over limit rejected" do
@@ -110,7 +110,7 @@ defmodule CrowdControl.SecurityTest do
         )
 
       assert {:error, :prompt_too_large} = Session.send_prompt(pid, "abcd")
-      Session.stop(pid)
+      TestHelpers.stop_session(pid)
     end
   end
 end
