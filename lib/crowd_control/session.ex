@@ -5,13 +5,19 @@ defmodule CrowdControl.Session do
   Each session wraps a `NetRunner.Process` and a linked reader process
   that drains stdout, buffers partial lines, decodes JSON messages,
   and broadcasts them to subscribers.
+
+  Subscribers receive messages of the form `{:crowd_control, session_pid, payload}`
+  where `payload` is one of `t:CrowdControl.Protocol.message/0`,
+  `{:exit, exit_status}`, or `{:timeout, :session_expired}`.
   """
 
-  use GenServer
+  use GenServer, restart: :temporary
 
   require Logger
 
   alias CrowdControl.{CLI, Protocol}
+
+  @default_timeout 300_000
 
   defstruct [
     :proc,
@@ -20,6 +26,7 @@ defmodule CrowdControl.Session do
     :opts,
     :timeout,
     :timeout_ref,
+    :env_dir,
     :env_file,
     :max_prompt_size,
     status: :starting,
@@ -28,38 +35,55 @@ defmodule CrowdControl.Session do
     messages: []
   ]
 
+  @type t :: %__MODULE__{}
+  @type session :: pid()
+  @type status :: :starting | :running | :completed | :error
+
   # --- Public API ---
 
+  @doc "Start a session linked to the caller."
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
 
-  @doc "Send a user prompt to the CLI subprocess."
+  @doc """
+  Send a user prompt to the CLI subprocess.
+
+  Returns `:ok` on success or `{:error, reason}` where reason is one of
+  `:invalid_prompt`, `:prompt_too_large`, `:completed`, `:error`.
+  """
+  @spec send_prompt(session(), binary()) :: :ok | {:error, atom()}
   def send_prompt(session, prompt) do
     GenServer.call(session, {:send_prompt, prompt})
   end
 
   @doc "Get the current session status."
+  @spec get_status(session()) :: status()
   def get_status(session) do
     GenServer.call(session, :get_status)
   end
 
   @doc "Get the session ID (assigned by the CLI on init)."
+  @spec get_session_id(session()) :: String.t() | nil
   def get_session_id(session) do
     GenServer.call(session, :get_session_id)
   end
 
   @doc "Subscribe the calling process to receive session messages."
+  @spec subscribe(session()) :: :ok
   def subscribe(session) do
     GenServer.call(session, {:subscribe, self()})
   end
 
-  @doc "Get all accumulated messages."
+  @doc "Get all accumulated messages in chronological order."
+  @spec get_messages(session()) :: [Protocol.message()]
   def get_messages(session) do
     GenServer.call(session, :get_messages)
   end
 
   @doc "Gracefully stop the session."
+  @spec stop(session()) :: :ok
   def stop(session) do
     GenServer.call(session, :stop, 10_000)
   end
@@ -69,7 +93,7 @@ defmodule CrowdControl.Session do
   @impl true
   def init(opts) do
     {executable, args, env} = CLI.build_command(opts)
-    {cmd, cmd_args, env_file} = wrap_with_env(executable, args, env)
+    {cmd, cmd_args, env_dir, env_file} = wrap_with_env(executable, args, env)
 
     Logger.info("Starting session: executable=#{executable}, model=#{opts[:model] || "default"}")
 
@@ -77,7 +101,7 @@ defmodule CrowdControl.Session do
       {:ok, proc} ->
         session_pid = self()
         reader = spawn_link(fn -> reader_loop(proc, session_pid) end)
-        timeout = Keyword.get(opts, :timeout)
+        timeout = Keyword.get(opts, :timeout, @default_timeout)
         max_prompt_size = Keyword.get(opts, :max_prompt_size)
 
         state = %__MODULE__{
@@ -85,6 +109,7 @@ defmodule CrowdControl.Session do
           reader: reader,
           opts: opts,
           timeout: timeout,
+          env_dir: env_dir,
           env_file: env_file,
           max_prompt_size: max_prompt_size
         }
@@ -100,29 +125,27 @@ defmodule CrowdControl.Session do
         {:ok, state}
 
       {:error, reason} ->
-        cleanup_env_file(env_file)
+        cleanup_env_dir(env_dir)
         {:stop, reason}
     end
   end
 
   @impl true
-  def handle_call({:send_prompt, prompt}, _from, state) when not is_binary(prompt) do
-    {:reply, {:error, :invalid_prompt}, state}
-  end
+  def handle_call({:send_prompt, prompt}, _from, state) do
+    case validate_prompt(prompt, state.max_prompt_size) do
+      :ok ->
+        case state.status do
+          status when status in [:starting, :running] ->
+            state = state |> do_send_prompt(prompt) |> schedule_timeout()
+            {:reply, :ok, state}
 
-  def handle_call({:send_prompt, prompt}, _from, %{max_prompt_size: max} = state)
-      when is_integer(max) and byte_size(prompt) > max do
-    {:reply, {:error, :prompt_too_large}, state}
-  end
+          status ->
+            {:reply, {:error, status}, state}
+        end
 
-  def handle_call({:send_prompt, prompt}, _from, %{status: status} = state)
-      when status in [:starting, :running] do
-    state = state |> do_send_prompt(prompt) |> schedule_timeout()
-    {:reply, :ok, state}
-  end
-
-  def handle_call({:send_prompt, _prompt}, _from, state) do
-    {:reply, {:error, state.status}, state}
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:get_status, _from, state) do
@@ -180,9 +203,9 @@ defmodule CrowdControl.Session do
       Logger.info("Session completed, exit_status=#{inspect(exit_status)}")
     end
 
-    cleanup_env_file(state.env_file)
+    cleanup_env_dir(state.env_dir)
     broadcast(state, {:exit, exit_status})
-    {:noreply, state}
+    {:noreply, %{state | env_dir: nil, env_file: nil}}
   end
 
   @impl true
@@ -195,12 +218,23 @@ defmodule CrowdControl.Session do
 
   @impl true
   def terminate(_reason, state) do
-    cleanup_env_file(state.env_file)
+    cleanup_env_dir(state.env_dir)
     shutdown_process(state)
     :ok
   end
 
   # --- Private ---
+
+  defp validate_prompt(prompt, _max) when not is_binary(prompt), do: {:error, :invalid_prompt}
+
+  defp validate_prompt(prompt, max) do
+    cond do
+      not String.valid?(prompt) -> {:error, :invalid_prompt}
+      String.contains?(prompt, <<0>>) -> {:error, :invalid_prompt}
+      is_integer(max) and byte_size(prompt) > max -> {:error, :prompt_too_large}
+      true -> :ok
+    end
+  end
 
   defp reader_loop(proc, session_pid) do
     case NetRunner.Process.read(proc) do
@@ -219,6 +253,11 @@ defmodule CrowdControl.Session do
   defp do_send_prompt(state, prompt) do
     encoded = Protocol.encode_user_message(prompt)
     NetRunner.Process.write(state.proc, encoded)
+    state
+  end
+
+  defp handle_message(state, {:invalid_json, raw}) do
+    Logger.debug("Session received non-JSON line: #{inspect(String.slice(raw, 0, 200))}")
     state
   end
 
@@ -247,19 +286,27 @@ defmodule CrowdControl.Session do
   end
 
   defp wrap_with_env(executable, args, env) when map_size(env) == 0 do
-    {executable, args, nil}
+    {executable, args, nil, nil}
   end
 
   defp wrap_with_env(executable, args, env) do
-    env_file = write_env_file(env)
+    {env_dir, env_file} = write_env_file(env)
     escaped_args = Enum.map_join([executable | args], " ", &shell_escape/1)
-    shell_cmd = ". #{env_file} && rm -f #{env_file} && exec #{escaped_args}"
-    {"/bin/sh", ["-c", shell_cmd], env_file}
+
+    shell_cmd =
+      ". #{shell_escape(env_file)} && rm -f #{shell_escape(env_file)} && exec #{escaped_args}"
+
+    {"/bin/sh", ["-c", shell_cmd], env_dir, env_file}
   end
 
+  # sobelow_skip ["Traversal.FileModule"]
   defp write_env_file(env) do
-    random = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
-    path = Path.join(System.tmp_dir!(), "cc_env_#{random}.sh")
+    random = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
+    dir = Path.join(System.tmp_dir!(), "cc_env_#{random}")
+    File.mkdir_p!(dir)
+    File.chmod!(dir, 0o700)
+
+    path = Path.join(dir, "env.sh")
 
     content =
       Enum.map_join(env, "\n", fn {k, v} ->
@@ -268,21 +315,23 @@ defmodule CrowdControl.Session do
 
     File.write!(path, content <> "\n")
     File.chmod!(path, 0o600)
-    path
+    {dir, path}
   end
 
   defp shell_escape(value) do
     "'" <> String.replace(to_string(value), "'", "'\\''") <> "'"
   end
 
-  defp cleanup_env_file(nil), do: :ok
+  defp cleanup_env_dir(nil), do: :ok
 
-  defp cleanup_env_file(path) do
-    File.rm(path)
+  # sobelow_skip ["Traversal.FileModule"]
+  defp cleanup_env_dir(dir) do
+    _ = File.rm_rf(dir)
     :ok
   end
 
   defp schedule_timeout(%{timeout: nil} = state), do: state
+  defp schedule_timeout(%{timeout: :infinity} = state), do: state
 
   defp schedule_timeout(%{timeout: timeout} = state) when is_integer(timeout) do
     if state.timeout_ref, do: Process.cancel_timer(state.timeout_ref)

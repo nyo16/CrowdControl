@@ -55,9 +55,15 @@ defmodule CrowdControl.CLITest do
       refute "--continue" in args
     end
 
-    test "adds single add_dir as string" do
+    test "expands and adds single add_dir" do
       {_exec, args, _env} = CLI.build_command(add_dir: "/path/to/project")
       assert args_contain_pair?(args, "--add-dir", "/path/to/project")
+    end
+
+    test "expands relative add_dir to absolute path" do
+      {_exec, args, _env} = CLI.build_command(add_dir: "./relative")
+      idx = Enum.find_index(args, &(&1 == "--add-dir"))
+      assert Path.type(Enum.at(args, idx + 1)) == :absolute
     end
 
     test "adds multiple add_dirs as list" do
@@ -69,9 +75,27 @@ defmodule CrowdControl.CLITest do
       assert Enum.at(args, idx + 3) == "/project/c"
     end
 
+    test "rejects add_dir with null bytes" do
+      assert_raise ArgumentError, ~r/null byte/, fn ->
+        CLI.build_command(add_dir: "/etc\0/passwd")
+      end
+    end
+
+    test "rejects add_dir with control characters" do
+      assert_raise ArgumentError, ~r/control/, fn ->
+        CLI.build_command(add_dir: "/path\nwith-newline")
+      end
+    end
+
     test "adds extra args" do
       {_exec, args, _env} = CLI.build_command(extra_args: ["--dangerously-skip-permissions"])
       assert "--dangerously-skip-permissions" in args
+    end
+
+    test "rejects extra_args with control characters" do
+      assert_raise ArgumentError, ~r/control/, fn ->
+        CLI.build_command(extra_args: ["--ok", "--bad\n--injected"])
+      end
     end
 
     test "combines multiple options" do
@@ -92,18 +116,49 @@ defmodule CrowdControl.CLITest do
     end
   end
 
-  describe "config options" do
-    test "adds settings file path" do
-      {_exec, args, _env} = CLI.build_command(settings: "/config/settings.json")
+  describe "settings options" do
+    test "settings_file expands path" do
+      {_exec, args, _env} = CLI.build_command(settings_file: "/config/settings.json")
       assert args_contain_pair?(args, "--settings", "/config/settings.json")
     end
 
-    test "adds settings as inline JSON" do
+    test "settings_file rejects null bytes" do
+      assert_raise ArgumentError, fn ->
+        CLI.build_command(settings_file: "/etc\0/passwd")
+      end
+    end
+
+    test "settings_json passes inline JSON through" do
+      json = ~s({"permissions":{"allow":["Read"]}})
+      {_exec, args, _env} = CLI.build_command(settings_json: json)
+      assert args_contain_pair?(args, "--settings", json)
+    end
+
+    test "settings_json encodes a map" do
+      {_exec, args, _env} = CLI.build_command(settings_json: %{"foo" => "bar"})
+      idx = Enum.find_index(args, &(&1 == "--settings"))
+      assert JSON.decode!(Enum.at(args, idx + 1)) == %{"foo" => "bar"}
+    end
+
+    test "settings_json rejects invalid JSON" do
+      assert_raise ArgumentError, ~r/invalid :settings_json/, fn ->
+        CLI.build_command(settings_json: "{not json")
+      end
+    end
+
+    test "deprecated :settings string starting with { is treated as JSON" do
       json = ~s({"permissions":{"allow":["Read"]}})
       {_exec, args, _env} = CLI.build_command(settings: json)
       assert args_contain_pair?(args, "--settings", json)
     end
 
+    test "deprecated :settings non-brace string is treated as path" do
+      {_exec, args, _env} = CLI.build_command(settings: "/config/settings.json")
+      assert args_contain_pair?(args, "--settings", "/config/settings.json")
+    end
+  end
+
+  describe "mcp/agents/plugin options" do
     test "adds setting sources" do
       {_exec, args, _env} = CLI.build_command(setting_sources: ["user", "project"])
       assert args_contain_pair?(args, "--setting-sources", "user,project")
@@ -114,10 +169,15 @@ defmodule CrowdControl.CLITest do
       assert args_contain_pair?(args, "--mcp-config", "/config/mcp.json")
     end
 
+    test "rejects mcp_config with null bytes" do
+      assert_raise ArgumentError, fn ->
+        CLI.build_command(mcp_config: "/etc\0/passwd")
+      end
+    end
+
     test "adds multiple mcp configs" do
       {_exec, args, _env} = CLI.build_command(mcp_config: ["/config/a.json", "/config/b.json"])
       idx = Enum.find_index(args, &(&1 == "--mcp-config"))
-      assert idx != nil
       assert Enum.at(args, idx + 1) == "/config/a.json"
       assert Enum.at(args, idx + 2) == "/config/b.json"
     end
@@ -141,9 +201,15 @@ defmodule CrowdControl.CLITest do
       assert decoded["reviewer"]["description"] == "Reviews code"
     end
 
-    test "adds plugin dir" do
+    test "expands plugin dir" do
       {_exec, args, _env} = CLI.build_command(plugin_dir: "/plugins")
       assert args_contain_pair?(args, "--plugin-dir", "/plugins")
+    end
+
+    test "rejects plugin_dir control characters" do
+      assert_raise ArgumentError, fn ->
+        CLI.build_command(plugin_dir: "/etc\n/foo")
+      end
     end
 
     test "adds bare flag" do
@@ -200,6 +266,70 @@ defmodule CrowdControl.CLITest do
       assert env["ANTHROPIC_API_KEY"] == "sk-test"
       assert env["ANTHROPIC_BASE_URL"] == "https://custom.api.com"
       assert env["EXTRA"] == "val"
+    end
+
+    test "rejects env key with newline (shell injection attempt)" do
+      assert_raise ArgumentError, ~r/env key must match/, fn ->
+        CLI.build_env(env: %{"FOO\nexport PATH=/evil" => "x"})
+      end
+    end
+
+    test "rejects env key with equals sign" do
+      assert_raise ArgumentError, ~r/env key must match/, fn ->
+        CLI.build_env(env: %{"FOO=BAR" => "x"})
+      end
+    end
+
+    test "rejects env key starting with digit" do
+      assert_raise ArgumentError, ~r/env key must match/, fn ->
+        CLI.build_env(env: %{"1FOO" => "x"})
+      end
+    end
+
+    test "rejects env value with null byte" do
+      assert_raise ArgumentError, ~r/null byte/, fn ->
+        CLI.build_env(env: %{"K" => "v\0"})
+      end
+    end
+
+    test "rejects env value with newline" do
+      assert_raise ArgumentError, ~r/newline/, fn ->
+        CLI.build_env(env: %{"K" => "v\nbad"})
+      end
+    end
+
+    test "rejects non-binary env value" do
+      assert_raise ArgumentError, ~r/must be a binary/, fn ->
+        CLI.build_env(env: %{"K" => 123})
+      end
+    end
+
+    test "rejects non-binary api_key" do
+      assert_raise ArgumentError, ~r/api_key must be a binary/, fn ->
+        CLI.build_env(api_key: :secret)
+      end
+    end
+  end
+
+  describe "sanitize_path!/1" do
+    test "expands relative paths" do
+      assert Path.type(CLI.sanitize_path!("./foo")) == :absolute
+    end
+
+    test "preserves absolute paths" do
+      assert CLI.sanitize_path!("/usr/local/bin") == "/usr/local/bin"
+    end
+
+    test "raises on null bytes" do
+      assert_raise ArgumentError, fn -> CLI.sanitize_path!("/foo\0bar") end
+    end
+
+    test "raises on control characters" do
+      assert_raise ArgumentError, fn -> CLI.sanitize_path!("/foo\tbar") end
+    end
+
+    test "raises on non-binary" do
+      assert_raise ArgumentError, fn -> CLI.sanitize_path!(:atom) end
     end
   end
 

@@ -5,6 +5,15 @@ defmodule CrowdControl.Protocol do
   Messages are newline-delimited JSON objects on stdin/stdout.
   """
 
+  @type message ::
+          {:system_init, map()}
+          | {:assistant, map()}
+          | {:user, map()}
+          | {:result, String.t(), map()}
+          | {:stream_event, map()}
+          | {:unknown, map()}
+          | {:invalid_json, String.t()}
+
   @doc """
   Splits a binary buffer into complete lines and a remainder.
 
@@ -12,6 +21,7 @@ defmodule CrowdControl.Protocol do
   of binaries (without the trailing newline) and `remainder` is the
   incomplete trailing fragment (possibly empty).
   """
+  @spec split_lines(binary()) :: {[binary()], binary()}
   def split_lines(buffer) do
     case :binary.split(buffer, "\n", [:global]) do
       [only] -> {[], only}
@@ -29,10 +39,17 @@ defmodule CrowdControl.Protocol do
     - `{:result, subtype, map}`
     - `{:stream_event, map}`
     - `{:unknown, map}`
+    - `{:invalid_json, raw_line}` when the input is not valid JSON
+
+  Does not raise; callers can safely pass arbitrary subprocess output.
   """
-  def decode_line(json_string) do
-    map = JSON.decode!(json_string)
-    classify(map)
+  @spec decode_line(binary()) :: message()
+  def decode_line(json_string) when is_binary(json_string) do
+    case JSON.decode(json_string) do
+      {:ok, map} when is_map(map) -> classify(map)
+      {:ok, _other} -> {:invalid_json, json_string}
+      {:error, _reason} -> {:invalid_json, json_string}
+    end
   end
 
   defp classify(%{"type" => "system", "subtype" => "init"} = map), do: {:system_init, map}
@@ -50,6 +67,7 @@ defmodule CrowdControl.Protocol do
 
   Returns a newline-terminated JSON string.
   """
+  @spec encode_user_message(binary()) :: binary()
   def encode_user_message(prompt) when is_binary(prompt) do
     message = %{
       "type" => "user",
