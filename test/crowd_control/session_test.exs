@@ -16,28 +16,35 @@ defmodule CrowdControl.SessionTest do
       end
     end
 
-    test "cleans up env dir when subprocess exits with EOF" do
+    test "cleans up env dir when subprocess exits via EOF (not via Session.stop)" do
       Process.flag(:trap_exit, true)
+
+      # Pin THIS test's env dir by snapshotting before/during start so we are
+      # immune to other async tests creating their own cc_env_* dirs.
       before = MapSet.new(list_cc_env_dirs())
 
       {:ok, pid} =
         Session.start_link(
-          executable: "/nonexistent/binary",
+          executable: TestHelpers.fake_cli_path(),
           env: %{"FOO" => "bar"},
-          timeout: 5_000
+          timeout: 10_000
         )
 
       Session.subscribe(pid)
 
-      # The subprocess fails fast; wait for the :exit broadcast which fires
-      # after env-dir cleanup in handle_cast(:eof, ...).
-      assert_receive {:crowd_control, ^pid, {:exit, _}}, 2_000
+      Process.sleep(50)
+      during = MapSet.new(list_cc_env_dirs())
+      ours = MapSet.difference(during, before)
+
+      # Drive a single prompt so fake_cli emits result and exits 0 → EOF path.
+      :ok = Session.send_prompt(pid, "x")
+      assert_receive {:crowd_control, ^pid, {:exit, _}}, 5_000
 
       after_ = MapSet.new(list_cc_env_dirs())
-      new_dirs = MapSet.difference(after_, before)
+      leftover = MapSet.intersection(ours, after_)
 
-      assert MapSet.size(new_dirs) == 0,
-             "expected our env dir cleaned, leftover: #{inspect(MapSet.to_list(new_dirs))}"
+      assert MapSet.size(leftover) == 0,
+             "expected our env dir cleaned via EOF path, leftover: #{inspect(MapSet.to_list(leftover))}"
     end
   end
 
