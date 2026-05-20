@@ -19,11 +19,14 @@ defmodule CrowdControl do
   Additional option:
     * `:prompt` - initial prompt to send after the CLI starts
   """
-  @spec start_session(opts()) :: DynamicSupervisor.on_start_child()
+  @spec start_session(opts()) :: {:ok, session()} | {:error, term()}
   def start_session(opts \\ []) do
     case DynamicSupervisor.start_child(CrowdControl.SessionSupervisor, {Session, opts}) do
+      {:ok, pid} -> {:ok, pid}
+      {:ok, pid, _info} -> {:ok, pid}
+      :ignore -> {:error, :ignore}
       {:error, :max_children} -> {:error, :max_sessions_reached}
-      other -> other
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -96,14 +99,14 @@ defmodule CrowdControl do
           [{session(), result_message()}] | {:timeout, [{session(), result_message()}]}
   def collect(sessions, timeout \\ 60_000) do
     Enum.each(sessions, &Session.subscribe/1)
-    remaining = MapSet.new(sessions)
+    remaining = Map.new(sessions, &{&1, true})
     deadline = System.monotonic_time(:millisecond) + timeout
     do_collect(remaining, %{}, deadline)
   end
 
   defp do_collect(remaining, results, deadline) do
-    if MapSet.size(remaining) == 0 do
-      Enum.map(results, fn {pid, msg} -> {pid, msg} end)
+    if map_size(remaining) == 0 do
+      Map.to_list(results)
     else
       do_collect_wait(remaining, results, deadline)
     end
@@ -115,8 +118,8 @@ defmodule CrowdControl do
 
     receive do
       {:crowd_control, pid, {:result, _, _} = msg} ->
-        if MapSet.member?(remaining, pid) do
-          do_collect(MapSet.delete(remaining, pid), Map.put(results, pid, msg), deadline)
+        if Map.has_key?(remaining, pid) do
+          do_collect(Map.delete(remaining, pid), Map.put(results, pid, msg), deadline)
         else
           do_collect(remaining, results, deadline)
         end
@@ -124,7 +127,7 @@ defmodule CrowdControl do
       {:crowd_control, _pid, _other} ->
         do_collect(remaining, results, deadline)
     after
-      wait -> {:timeout, Enum.map(results, fn {pid, msg} -> {pid, msg} end)}
+      wait -> {:timeout, Map.to_list(results)}
     end
   end
 
