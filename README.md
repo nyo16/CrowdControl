@@ -1,8 +1,13 @@
 # CrowdControl
 
+[![CI](https://github.com/nikoma/crowd_control/actions/workflows/ci.yml/badge.svg)](https://github.com/nikoma/crowd_control/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/crowd_control.svg)](https://hex.pm/packages/crowd_control)
+[![HexDocs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/crowd_control)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Open Code](https://github.com/anthropics/open-code) CLI instances in parallel from Elixir.
 
-Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subprocess management with NIF-based backpressure.
+Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subprocess management with NIF-based backpressure. Security disclosures: see [`SECURITY.md`](SECURITY.md). Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). Runnable examples: [`examples/`](examples/).
 
 ```mermaid
 graph LR

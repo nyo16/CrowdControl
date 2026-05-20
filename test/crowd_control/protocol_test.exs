@@ -70,6 +70,18 @@ defmodule CrowdControl.ProtocolTest do
       json = ~s({"type":"something_else","data":"value"})
       assert {:unknown, %{"type" => "something_else"}} = Protocol.decode_line(json)
     end
+
+    test "returns invalid_json on malformed input instead of raising" do
+      assert {:invalid_json, "{not json"} = Protocol.decode_line("{not json")
+    end
+
+    test "returns invalid_json on non-object JSON" do
+      assert {:invalid_json, "[1,2,3]"} = Protocol.decode_line("[1,2,3]")
+    end
+
+    test "returns invalid_json on empty string" do
+      assert {:invalid_json, ""} = Protocol.decode_line("")
+    end
   end
 
   describe "encode_user_message/1" do
@@ -87,6 +99,14 @@ defmodule CrowdControl.ProtocolTest do
       result = Protocol.encode_user_message(~s(Say "hello" & 'goodbye'))
       decoded = JSON.decode!(String.trim_trailing(result, "\n"))
       assert decoded["message"]["content"] == ~s(Say "hello" & 'goodbye')
+    end
+
+    test "round-trips through decode_line/1" do
+      encoded = Protocol.encode_user_message("round-trip test ✓")
+      [line] = String.split(encoded, "\n", trim: true)
+
+      assert {:user, %{"message" => %{"content" => "round-trip test ✓"}}} =
+               Protocol.decode_line(line)
     end
   end
 end
