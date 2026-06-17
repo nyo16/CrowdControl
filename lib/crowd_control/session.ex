@@ -8,7 +8,27 @@ defmodule CrowdControl.Session do
 
   Subscribers receive messages of the form `{:crowd_control, session_pid, payload}`
   where `payload` is one of `t:CrowdControl.Protocol.message/0`,
-  `{:exit, exit_status}`, or `{:timeout, :session_expired}`.
+  `{:exit, exit_status}`, `{:timeout, :session_expired}`, or `{:error, reason}`
+  (e.g. `{:error, :line_too_large}` when a single newline-free output line
+  exceeds `:max_line_bytes`).
+
+  ## Options
+
+  Session-lifecycle options (CLI/argv options are forwarded to
+  `CrowdControl.CLI.build_command/1`):
+
+    * `:prompt` - initial prompt sent once the CLI starts (optional)
+    * `:timeout` - inactivity ceiling in ms before the session self-expires and
+      broadcasts `{:timeout, :session_expired}`; reset on each `send_prompt/2`.
+      Use `:infinity` or `nil` to disable. Defaults to `300_000`.
+    * `:max_prompt_size` - reject prompts whose byte size exceeds this with
+      `{:error, :prompt_too_large}` (optional; unbounded when unset)
+    * `:max_line_bytes` - cap for a single newline-free output line. Exceeding it
+      kills the subprocess and broadcasts `{:error, :line_too_large}` rather than
+      buffering an unbounded remainder. Defaults to `1_000_000`.
+    * `:max_messages` - cap on messages retained for `get_messages/1`; oldest are
+      dropped past the cap. Live subscribers are unaffected. Clamped to `>= 0`.
+      Defaults to `10_000`.
   """
 
   use GenServer, restart: :temporary
@@ -18,6 +38,8 @@ defmodule CrowdControl.Session do
   alias CrowdControl.{CLI, Protocol}
 
   @default_timeout 300_000
+  @default_max_line_bytes 1_000_000
+  @default_max_messages 10_000
 
   defstruct [
     :proc,
@@ -29,10 +51,13 @@ defmodule CrowdControl.Session do
     :env_dir,
     :env_file,
     :max_prompt_size,
+    :max_line_bytes,
+    :max_messages,
     status: :starting,
     subscribers: [],
     buffer: "",
-    messages: []
+    messages: [],
+    message_count: 0
   ]
 
   @type t :: %__MODULE__{}
@@ -76,7 +101,14 @@ defmodule CrowdControl.Session do
     GenServer.call(session, {:subscribe, self()})
   end
 
-  @doc "Get all accumulated messages in chronological order."
+  @doc """
+  Get accumulated messages in chronological order.
+
+  Retention is capped at `:max_messages` (default #{@default_max_messages}); once
+  the cap is reached the oldest messages are dropped so the returned list is a
+  bounded, newest-biased window. Live subscribers (see `subscribe/1`) receive
+  every message regardless of this cap.
+  """
   @spec get_messages(session()) :: [Protocol.message()]
   def get_messages(session) do
     GenServer.call(session, :get_messages)
@@ -103,6 +135,8 @@ defmodule CrowdControl.Session do
         reader = spawn_link(fn -> reader_loop(proc, session_pid) end)
         timeout = Keyword.get(opts, :timeout, @default_timeout)
         max_prompt_size = Keyword.get(opts, :max_prompt_size)
+        max_line_bytes = Keyword.get(opts, :max_line_bytes, @default_max_line_bytes)
+        max_messages = max(Keyword.get(opts, :max_messages, @default_max_messages), 0)
 
         state = %__MODULE__{
           proc: proc,
@@ -111,7 +145,9 @@ defmodule CrowdControl.Session do
           timeout: timeout,
           env_dir: env_dir,
           env_file: env_file,
-          max_prompt_size: max_prompt_size
+          max_prompt_size: max_prompt_size,
+          max_line_bytes: max_line_bytes,
+          max_messages: max_messages
         }
 
         state = schedule_timeout(state)
@@ -174,17 +210,28 @@ defmodule CrowdControl.Session do
     buffer = state.buffer <> data
     {lines, remainder} = Protocol.split_lines(buffer)
 
-    state =
-      Enum.reduce(lines, %{state | buffer: remainder}, fn line, acc ->
-        if line == "" do
-          acc
-        else
-          message = Protocol.decode_line(line)
-          handle_message(acc, message)
-        end
-      end)
+    if byte_size(remainder) > state.max_line_bytes do
+      Logger.error(
+        "Session line exceeded max_line_bytes=#{state.max_line_bytes}; killing subprocess"
+      )
 
-    {:noreply, state}
+      state = shutdown_process(%{state | buffer: ""})
+      cleanup_env_dir(state.env_dir)
+      broadcast(state, {:error, :line_too_large})
+      {:stop, :normal, %{state | status: :error, env_dir: nil, env_file: nil}}
+    else
+      state =
+        Enum.reduce(lines, %{state | buffer: remainder}, fn line, acc ->
+          if line == "" do
+            acc
+          else
+            message = Protocol.decode_line(line)
+            handle_message(acc, message)
+          end
+        end)
+
+      {:noreply, state}
+    end
   end
 
   def handle_cast(:eof, state) do
@@ -262,22 +309,45 @@ defmodule CrowdControl.Session do
   end
 
   defp handle_message(state, {:system_init, %{"session_id" => sid}} = msg) do
-    state = %{state | session_id: sid, status: :running, messages: [msg | state.messages]}
+    state = accumulate(%{state | session_id: sid, status: :running}, msg)
     broadcast(state, msg)
     state
   end
 
   defp handle_message(state, {:result, _subtype, _map} = msg) do
-    state = %{state | status: :completed, messages: [msg | state.messages]}
+    state = accumulate(%{state | status: :completed}, msg)
     broadcast(state, msg)
     state
   end
 
   defp handle_message(state, msg) do
-    state = %{state | messages: [msg | state.messages]}
+    state = accumulate(state, msg)
     broadcast(state, msg)
     state
   end
+
+  # Append `msg` to the newest-first `messages` list, capping retention at
+  # `max_messages`. Subscribers still receive every message live; this bounds
+  # only the in-memory history returned by `get_messages/1`.
+  defp accumulate(state, msg) do
+    count = state.message_count + 1
+    messages = [msg | state.messages]
+
+    if count > state.max_messages do
+      # Prepend then drop the oldest (tail) so retention stays a bounded,
+      # newest-first window. Correct even for max_messages == 0 (trims to []).
+      %{
+        state
+        | messages: trim_oldest(messages, state.max_messages),
+          message_count: state.max_messages
+      }
+    else
+      %{state | messages: messages, message_count: count}
+    end
+  end
+
+  # `messages` is newest-first, so the newest `n` entries are simply the head.
+  defp trim_oldest(messages, n), do: Enum.take(messages, n)
 
   defp broadcast(state, message) do
     Enum.each(state.subscribers, fn pid ->
@@ -357,24 +427,25 @@ defmodule CrowdControl.Session do
     state
   end
 
+  # `NetRunner.Process.{await_exit,alive?,kill}` are all `GenServer.call`s; a
+  # dead or stale daemon makes the call raise an `:exit`, never an `:error`.
+  # Catch only `:exit` so genuine bugs (UndefinedFunctionError, etc.) surface
+  # instead of being silently swallowed.
   defp safe_await_exit(proc, timeout) do
     NetRunner.Process.await_exit(proc, timeout)
   catch
     :exit, _ -> :timeout
-    :error, _ -> :timeout
   end
 
   defp safe_alive?(proc) do
     NetRunner.Process.alive?(proc)
   catch
     :exit, _ -> false
-    :error, _ -> false
   end
 
   defp safe_kill(proc, signal) do
     NetRunner.Process.kill(proc, signal)
   catch
     :exit, _ -> :ok
-    :error, _ -> :ok
   end
 end

@@ -27,6 +27,28 @@ defmodule CrowdControl.SecurityTest do
         CLI.build_env(env: %{"K" => "v\nbad"})
       end
     end
+
+    test "carriage-return env value is rejected" do
+      assert_raise ArgumentError, ~r/control char/, fn ->
+        CLI.build_env(env: %{"K" => "v\rbad"})
+      end
+    end
+
+    test "tab env value is rejected" do
+      assert_raise ArgumentError, ~r/control char/, fn ->
+        CLI.build_env(env: %{"K" => "v\tbad"})
+      end
+    end
+
+    test "other ASCII control char (0x01) in env value is rejected" do
+      assert_raise ArgumentError, ~r/control char/, fn ->
+        CLI.build_env(env: %{"K" => <<"v", 0x01, "bad">>})
+      end
+    end
+
+    test "ordinary printable env value is accepted" do
+      assert %{"K" => "value-123_/.:"} = CLI.build_env(env: %{"K" => "value-123_/.:"})
+    end
   end
 
   describe "path traversal attempts on argv-bound options" do
@@ -60,6 +82,8 @@ defmodule CrowdControl.SecurityTest do
           {"semicolon chain", "value; echo pwned"},
           {"ampersand chain", "value && echo pwned"},
           {"dollar var", "value $HOME"},
+          {"backslash", "back\\slash"},
+          {"mixed metacharacters", ~s/'; $(id) `whoami` "q"/},
           {"unicode", "café-✓"}
         ] do
       @raw raw
