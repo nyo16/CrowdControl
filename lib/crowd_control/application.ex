@@ -5,10 +5,16 @@ defmodule CrowdControl.Application do
   @impl true
   def start(_type, _args) do
     max_sessions = fetch_max_sessions!()
+    {store, store_opts} = CrowdControl.Store.resolve()
 
+    # Order matters. The store must be up before any session can persist to it,
+    # and the reaper comes last because its boot reconciliation starts sessions
+    # under the session supervisor.
     children = [
+      {store, store_opts},
       {DynamicSupervisor,
-       name: CrowdControl.SessionSupervisor, strategy: :one_for_one, max_children: max_sessions}
+       name: CrowdControl.SessionSupervisor, strategy: :one_for_one, max_children: max_sessions},
+      CrowdControl.Reaper
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: CrowdControl.Supervisor)

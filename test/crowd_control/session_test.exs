@@ -47,6 +47,11 @@ defmodule CrowdControl.SessionTest do
       TestHelpers.stop_session(pid)
     end
 
+    # The env-file mechanism is Backend.Local's alone -- remote backends inject
+    # env through their own API and must never touch it. These three tests reach
+    # into backend_state.env_dir directly, so they are tagged local-only rather
+    # than deleted: they are the oracle proving secrets never reach argv.
+    @tag backend: :local
     test "cleans up env dir when subprocess exits via EOF (not via Session.stop)" do
       Process.flag(:trap_exit, true)
 
@@ -62,7 +67,7 @@ defmodule CrowdControl.SessionTest do
       # Pin THIS session's own env dir straight from its state. Diffing the
       # shared tmp dir before/after was racy: a concurrent async test creating
       # its own cc_env_* dir in the window landed in the "ours" set.
-      our_dir = :sys.get_state(pid).env_dir
+      our_dir = :sys.get_state(pid).backend_state.env_dir
       assert is_binary(our_dir) and File.dir?(our_dir)
 
       # Drive a single prompt so fake_cli emits result and exits 0 → EOF path.
@@ -199,6 +204,7 @@ defmodule CrowdControl.SessionTest do
   end
 
   describe "env file cleanup" do
+    @tag backend: :local
     test "removes its own env dir after session stops" do
       {:ok, pid} =
         start_fake_session(env: %{"FAKE_CLI_ECHO_ENV" => "MY_TEST_KEY", "MY_TEST_KEY" => "ok"})
@@ -207,7 +213,7 @@ defmodule CrowdControl.SessionTest do
 
       # Pin THIS session's own env dir from its state instead of diffing the
       # shared tmp dir (which races with concurrent async tests).
-      our_dir = :sys.get_state(pid).env_dir
+      our_dir = :sys.get_state(pid).backend_state.env_dir
       assert is_binary(our_dir) and File.dir?(our_dir)
 
       :ok = Session.send_prompt(pid, "hi")
@@ -224,6 +230,7 @@ defmodule CrowdControl.SessionTest do
   end
 
   describe "max_line_bytes guard" do
+    @tag backend: :local
     test "oversized newline-free output kills the session and cleans its env dir" do
       Process.flag(:trap_exit, true)
 
@@ -236,7 +243,7 @@ defmodule CrowdControl.SessionTest do
         )
 
       Session.subscribe(pid)
-      our_dir = :sys.get_state(pid).env_dir
+      our_dir = :sys.get_state(pid).backend_state.env_dir
       assert is_binary(our_dir) and File.dir?(our_dir)
 
       ref = Process.monitor(pid)
@@ -289,6 +296,97 @@ defmodule CrowdControl.SessionTest do
       assert {:assistant, %{"n" => 20}} = List.last(messages)
 
       TestHelpers.stop_session(pid)
+    end
+  end
+
+  describe "reattach mode" do
+    alias CrowdControl.Backend.Mock
+    alias CrowdControl.Store
+
+    test "seeds the cursor before the reader delivers, so a split line rejoins exactly" do
+      # The session died holding the partial line `{"n"`; the sandbox kept
+      # running and its output continues `:2}\n`. Reattaching must rejoin them
+      # into one valid message, with no duplicated or lost bytes.
+      ctl =
+        start_supervised!(
+          {Mock, events: [{:stdout_data, ~s|:2}\n|}, {:stdout_data, ~s|{"n":3}\n|}]}
+        )
+
+      record =
+        Store.build(
+          key: "resume-key",
+          session_id: "cli-abc",
+          backend: Mock,
+          handle: Mock.handle(ctl, "resume-key"),
+          byte_offset: 12,
+          buffer: ~s|{"n"|,
+          opts: [timeout: 5_000]
+        )
+
+      {:ok, pid} = Session.start_reattached(record)
+      Session.subscribe(pid)
+
+      state = :sys.get_state(pid)
+      assert state.session_id == "cli-abc"
+      assert state.status == :running
+      assert state.subscribers == [self()]
+
+      TestHelpers.wait_until(fn -> :sys.get_state(pid).byte_offset > 12 end)
+
+      after_state = :sys.get_state(pid)
+
+      # 12 seeded + 4 (`:2}\n`) + 8 (`{"n":3}\n`) = 24
+      assert after_state.byte_offset == 24
+      assert after_state.buffer == ""
+
+      # The reattach was asked for exactly the persisted cursor.
+      assert Mock.reattach_cursor(ctl) == %{byte_offset: 12, buffer: ~s|{"n"|}
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "restores opts-derived settings from the record" do
+      ctl = start_supervised!({Mock, events: []})
+
+      record =
+        Store.build(
+          key: "opts-key",
+          session_id: nil,
+          backend: Mock,
+          handle: Mock.handle(ctl, "opts-key"),
+          byte_offset: 0,
+          buffer: "",
+          opts: [timeout: 9_999, max_messages: 7, max_line_bytes: 512, max_prompt_size: 64]
+        )
+
+      {:ok, pid} = Session.start_reattached(record)
+      state = :sys.get_state(pid)
+
+      assert state.timeout == 9_999
+      assert state.max_messages == 7
+      assert state.max_line_bytes == 512
+      assert state.max_prompt_size == 64
+      assert state.store_key == "opts-key"
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "stops when the backend cannot reattach" do
+      Process.flag(:trap_exit, true)
+      ctl = start_supervised!({Mock, events: [], fail: %{reattach: :container_gone}})
+
+      record =
+        Store.build(
+          key: "gone-key",
+          session_id: nil,
+          backend: Mock,
+          handle: Mock.handle(ctl, "gone-key"),
+          byte_offset: 0,
+          buffer: "",
+          opts: []
+        )
+
+      assert {:error, :container_gone} = Session.start_reattached(record)
     end
   end
 
