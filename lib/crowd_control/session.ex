@@ -220,26 +220,9 @@ defmodule CrowdControl.Session do
     {lines, remainder} = Protocol.split_lines(buffer)
 
     if byte_size(remainder) > state.max_line_bytes do
-      Logger.error(
-        "Session line exceeded max_line_bytes=#{state.max_line_bytes}; killing subprocess"
-      )
-
-      state = shutdown_process(%{state | buffer: ""})
-      cleanup_env_dir(state.env_dir)
-      broadcast(state, {:error, :line_too_large})
-      {:stop, :normal, %{state | status: :error, env_dir: nil, env_file: nil}}
+      stop_line_too_large(state)
     else
-      state =
-        Enum.reduce(lines, %{state | buffer: remainder}, fn line, acc ->
-          if line == "" do
-            acc
-          else
-            message = Protocol.decode_line(line)
-            handle_message(acc, message)
-          end
-        end)
-
-      {:noreply, state}
+      {:noreply, consume_lines(%{state | buffer: remainder}, lines)}
     end
   end
 
@@ -310,6 +293,24 @@ defmodule CrowdControl.Session do
     encoded = Protocol.encode_user_message(prompt)
     NetRunner.Process.write(state.proc, encoded)
     state
+  end
+
+  defp stop_line_too_large(state) do
+    Logger.error(
+      "Session line exceeded max_line_bytes=#{state.max_line_bytes}; killing subprocess"
+    )
+
+    state = shutdown_process(%{state | buffer: ""})
+    cleanup_env_dir(state.env_dir)
+    broadcast(state, {:error, :line_too_large})
+    {:stop, :normal, %{state | status: :error, env_dir: nil, env_file: nil}}
+  end
+
+  defp consume_lines(state, lines) do
+    Enum.reduce(lines, state, fn
+      "", acc -> acc
+      line, acc -> handle_message(acc, Protocol.decode_line(line))
+    end)
   end
 
   defp handle_message(state, {:invalid_json, raw}) do
