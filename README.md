@@ -3,11 +3,11 @@
 [![CI](https://github.com/nikoma/crowd_control/actions/workflows/ci.yml/badge.svg)](https://github.com/nikoma/crowd_control/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/crowd_control.svg)](https://hex.pm/packages/crowd_control)
 [![HexDocs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/crowd_control)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/nyo16/CrowdControl/blob/master/LICENSE)
 
 Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Open Code](https://github.com/anthropics/open-code) CLI instances in parallel from Elixir.
 
-Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subprocess management with NIF-based backpressure. Security disclosures: see [`SECURITY.md`](SECURITY.md). Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). Runnable examples: [`examples/`](examples/).
+Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subprocess management with NIF-based backpressure. Security disclosures: see [`SECURITY.md`](SECURITY.md). Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). Runnable examples: [`examples/`](https://github.com/nyo16/CrowdControl/tree/master/examples).
 
 ```mermaid
 graph LR
@@ -678,6 +678,153 @@ graph TD
     style S3 fill:#ff922b,color:#fff
 ```
 
+## Sandbox Backends
+
+> **Not the same as the "Docker" section above.** That section is about running
+> *CrowdControl itself* inside a container. This section is about CrowdControl
+> putting *each CLI session* inside its own container. They are independent —
+> you can use either, both, or neither.
+
+By default a session runs the CLI as a local subprocess. A `backend` option
+swaps that for something else:
+
+```elixir
+# Default — a local subprocess, exactly as before.
+CrowdControl.start_session(prompt: "hi")
+
+# Each session gets its own container.
+CrowdControl.start_session(
+  backend: {CrowdControl.Backend.Docker, image: "my-cli:latest"},
+  prompt: "hi"
+)
+```
+
+Implement `CrowdControl.Backend` (nine callbacks) for anything else.
+
+| Backend | Sandbox | Survives a VM restart? |
+|---------|---------|------------------------|
+| `Backend.Local` (default) | local subprocess | no — dies with the VM |
+| `Backend.Docker` | container | yes — reattachable |
+
+### Docker backend
+
+Requires the optional `:req` dependency:
+
+```elixir
+{:req, "~> 0.5"}
+```
+
+```elixir
+CrowdControl.start_session(
+  backend: {CrowdControl.Backend.Docker,
+    image: "my-cli:latest",
+    network_mode: "none",
+    cpus: 1.5,
+    memory: 512 * 1024 * 1024,
+    max_stream_bytes: 100 * 1024 * 1024
+  },
+  prompt: "Refactor lib/foo.ex"
+)
+```
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `:image` | — | **Required.** Needs the CLI and `sh` on `PATH` |
+| `:docker_host` | `unix:///var/run/docker.sock` | `tcp://host:port` also works |
+| `:network_mode` | `"none"` | **Required** when `:proxy_url`/`:api_url` is set — see below |
+| `:cpus` | unset | Fractional, e.g. `1.5` |
+| `:memory` | unset | Bytes |
+| `:tee_path` | `/var/log/cc/out.jsonl` | Where output is recorded |
+| `:fifo_path` | `/var/run/cc.fifo` | Where prompts are written |
+| `:max_stream_bytes` | `nil` (unbounded) | Destroys the sandbox past this much total output |
+| `:max_inflight_bytes` | 4 MiB | Reader backpressure watermark |
+| `:proxy_url`, `:session_token` | unset | Egress proxy — see [SECURITY.md](SECURITY.md#egress-proxy-contract) |
+
+Hardening:
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `:cap_drop` | `["ALL"]` | On by default; a CLI needs no capabilities |
+| `:security_opt` | `["no-new-privileges:true"]` | On by default |
+| `:pids_limit` | `512` | On by default — `:memory`/`:cpus` do **not** bound PIDs |
+| `:user` | image default | Opt-in, e.g. `"1000:1000"`; recommended |
+| `:readonly_rootfs` | `false` | Opt-in; `:tmpfs` keeps the fifo and tee writable |
+
+The three capability settings default on because the sandbox runs untrusted
+model-driven code and none of them breaks an ordinary CLI. `:user` and
+`:readonly_rootfs` are opt-in because both genuinely break images that expect
+root or write outside the tmpfs mounts — enable them where your image allows.
+
+No custom image is required beyond having the CLI and `sh` available —
+CrowdControl injects everything else it needs at provision time.
+
+**Networking is never inferred.** Setting `:proxy_url` or `:api_url` without an
+explicit `:network_mode` returns `{:error, {:docker, :network_mode_required}}`
+rather than silently picking `bridge`, which would give the sandbox general
+outbound access and make an egress proxy advisory rather than enforcing.
+
+### Durability and reattach
+
+A container outlives the session that created it, which is the whole reason
+the rest of this machinery exists.
+
+```elixir
+config :crowd_control,
+  # Where session records live. ETS (default) survives a session crash;
+  # DETS also survives a node restart.
+  store: {CrowdControl.Store.DETS, path: "/var/lib/crowd_control/sessions.dets"},
+
+  # Scopes ownership. Defaults to the node name.
+  owner_id: "worker-1",
+
+  reaper: [
+    backends: [{CrowdControl.Backend.Docker, image: "my-cli:latest"}],
+    sweep_interval: :timer.minutes(5),
+    reap_grace_ms: 60_000
+  ]
+```
+
+`CrowdControl.Reaper` reconciles live containers against stored records at
+boot and on a timer:
+
+| live? | stored? | action |
+|-------|---------|--------|
+| yes | yes | reattach a session to it |
+| yes | no | orphan — destroy it |
+| no | yes | stale record — delete it |
+
+Only `Backend.Local` writes nothing to the store: a local subprocess dies with
+the VM, so there is nothing to reattach and the per-chunk write would be pure
+overhead.
+
+Two safety properties are worth knowing about, because both are load-bearing:
+
+- A backend whose container listing **fails** is skipped, never read as
+  "nothing is live". The latter would destroy every running sandbox.
+- Containers are labelled with `:owner_id` and the reaper only destroys its
+  own. Two nodes cannot reap each other's work.
+
+### The tee-file contract
+
+This is the part to understand before changing anything in the Docker backend.
+
+Each session's output is appended to a single file inside the container
+(`:tee_path`), and the session persists a **byte offset** into that file plus
+whatever partial line it was holding. Resuming means reading the file from that
+offset and re-joining the partial line — so a session interrupted in the middle
+of a JSON line resumes byte-exactly, with nothing lost and nothing duplicated.
+
+That only holds while offsets stay valid, which is why:
+
+- **Containers are created with `RestartPolicy: no`.** A restart truncates the
+  tee file and invalidates every persisted offset.
+- **The tee file is capped, never rotated.** `:max_stream_bytes` destroys the
+  sandbox when output grows too large. Rotation would silently invalidate every
+  offset — corrupting resume in exactly the way the offset cursor exists to
+  prevent. A hard cap is the correct answer for a bounded resource.
+
+If you are tempted to add log rotation here, this is the reason not to.
+
 ## CLI Options
 
 All options from `CrowdControl.CLI.build_command/1` can be passed to `start_session`, `run`, and `run_many`:
@@ -969,4 +1116,4 @@ See the [Docker](#docker) section for container hardening details (non-root user
 
 ## License
 
-MIT
+Apache License 2.0. See [LICENSE](https://github.com/nyo16/CrowdControl/blob/master/LICENSE).

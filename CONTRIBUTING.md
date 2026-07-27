@@ -43,9 +43,15 @@ exercises the adversarial input:
 
 - `CrowdControl.CLI.sanitize_path!/1`
 - `CrowdControl.CLI.build_env/1` / `validate_env!/1`
-- `CrowdControl.Session.shell_escape/1`
-- `CrowdControl.Session.write_env_file/1`
+- `CrowdControl.Backend.Shell.escape/1` — the single shell escaper, used by
+  both the local env-file mechanism and the Docker backend's prompt writes.
+  There must never be a second one.
+- `CrowdControl.Backend.Local`'s env-file generation (`write_env_file/1`)
+- `CrowdControl.Backend.Docker`'s exec construction — secrets go in the exec
+  API's `Env` array and must never be interpolated into the command string
 - `CrowdControl.Protocol.decode_line/1`
+- `CrowdControl.Reaper`'s fail-open reconciliation — a failed container listing
+  must never be treated as "nothing is live"
 
 See `test/crowd_control/security_test.exs` for the existing adversarial
 test surface and extend it for any new attack vector you touch.

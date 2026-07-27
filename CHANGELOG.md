@@ -2,7 +2,88 @@
 
 ## Unreleased
 
+### Breaking
+
+- **Licensed under Apache-2.0**, replacing MIT. Apache-2.0 adds an express
+  patent grant and an attribution/NOTICE requirement. Nothing was ever
+  published under MIT — the package has not been released to Hex — so no
+  existing user's terms change.
+
+- **`CrowdControl.Session` state no longer exposes `:proc`, `:env_dir`, or
+  `:env_file`.** Everything transport-specific moved behind the new
+  `CrowdControl.Backend` behaviour. The public API (`start_link/1`,
+  `send_prompt/2`, `subscribe/1`, `get_messages/1`, `get_status/1`, `stop/1`)
+  and every broadcast message shape are unchanged, but code reaching into
+  session state via `:sys.get_state/1` breaks:
+
+  ```elixir
+  # before
+  :sys.get_state(pid).env_dir
+
+  # after — env_dir belongs to the local backend's handle
+  :sys.get_state(pid).backend_state.env_dir
+  ```
+
+  The struct gains `:backend`, `:backend_state`, `:store_key`, `:byte_offset`,
+  and `:persist?`.
+
+- **`CrowdControl.Session` is now `restart: :transient`, was `:temporary`.**
+  `:temporary` is correct when the OS process dies with the GenServer and
+  backwards when a *billed* remote sandbox outlives it. Sessions that exit
+  normally are still not restarted and still release their `:max_children`
+  slot; only abnormal exits are now restarted.
+
+### Added
+
+- **Pluggable sandbox backends.** `CrowdControl.Backend` behaviour, with
+  `CrowdControl.Backend.Local` (the default; a local subprocess, behaviourally
+  identical to previous releases) and `CrowdControl.Backend.Docker` (one
+  container per session). Select with
+  `backend: {CrowdControl.Backend.Docker, image: "..."}`.
+- **Session durability and reattach.** `CrowdControl.Store` behaviour with
+  `Store.ETS` (default, in-memory) and `Store.DETS` (disk-backed, survives a
+  node restart). Neither adds a dependency.
+- **`CrowdControl.Reaper`.** Reconciles live sandboxes against stored records at
+  boot and on a timer: reattaches recorded ones, destroys orphans, prunes stale
+  records. This is the only real guarantee that a billed sandbox is cleaned up,
+  since `terminate/2` never runs on `SIGKILL`. Fail-open by design — a failed
+  listing is skipped, never read as "nothing is live".
+- **Byte-exact resume.** A session interrupted mid-line reattaches and resumes
+  without losing or duplicating a byte, via a persisted byte offset into the
+  sandbox's output file plus the in-flight partial line.
+- `:max_stream_bytes` session option — caps a session's *total* output and
+  broadcasts `{:error, :stream_too_large}`, complementing `:max_line_bytes`.
+- `:owner_id` config, stamped onto every sandbox as a label, so multiple nodes
+  cannot reap each other's sandboxes.
+- Optional `:req` dependency, needed only for `CrowdControl.Backend.Docker`.
+- Sandbox hardening options on `CrowdControl.Backend.Docker`: `:cap_drop`,
+  `:security_opt`, `:pids_limit` (all applied by default), plus opt-in `:user`,
+  `:readonly_rootfs`, and `:tmpfs`.
+- `c:CrowdControl.Backend.scrub/1` optional callback, so a backend can strip
+  credentials from its handle before persistence.
+
 ### Security
+
+- **Sandbox containers are hardened by default.** `CapDrop: ALL`,
+  `no-new-privileges`, and `PidsLimit: 512`. The PID ceiling is independent of
+  `:memory`/`:cpus`, neither of which bounds process count, so without it a fork
+  bomb in model output could exhaust the host.
+- **Networking is never inferred.** Setting `:proxy_url` or `:api_url` without
+  an explicit `:network_mode` now returns
+  `{:error, {:docker, :network_mode_required}}` instead of silently selecting
+  `bridge` — which grants general outbound access and makes an egress proxy
+  advisory rather than enforcing.
+- **Credentials are no longer persisted.** `:api_key`, `:session_token`, and
+  `:env` are stripped from both session opts and the backend handle before any
+  store write. `Store.DETS` restricts its file to `0600` in a `0700` directory.
+- **The reaper re-checks ownership locally** before destroying a sandbox rather
+  than trusting the daemon-side label filter alone, and a session now records
+  the same owner its sandbox is labelled with. Previously a `:owner` set in
+  backend config produced records the reaper could not match, causing it to
+  classify every live sandbox as an orphan.
+- **A reader transport error no longer kills its session.** A mid-stream failure
+  now casts `:eof` as the backend contract requires, instead of raising in a
+  linked process.
 
 - **Strict env-var validation.** `CrowdControl.CLI.build_env/1` now rejects env
   keys that don't match `^[A-Za-z_][A-Za-z0-9_]*$` and values containing null
@@ -35,7 +116,7 @@
   `error_handling.exs`, `bounded_pool.exs`).
 - `SECURITY.md` with private disclosure address and supported-version policy.
 - `CONTRIBUTING.md` with local dev workflow and security-sensitive checklist.
-- `LICENSE` (MIT).
+- `LICENSE` (Apache-2.0).
 - New tests: full `CrowdControl.Session` GenServer coverage, end-to-end
   orchestrator tests against a `test/support/fake_cli.sh` stand-in, security
   tests for shell escaping and env/path validation, and StreamData property
@@ -61,8 +142,8 @@
 - `CrowdControl.broadcast/2` catches `:exit` from dead session pids.
 - `CrowdControl.Session` is marked `restart: :temporary` so a failing CLI
   subprocess does not trigger `DynamicSupervisor` restart-intensity shutdown.
-- `CrowdControl.Application` validates `:max_sessions` is a positive integer
-  at boot, raising a clear `ArgumentError` otherwise.
+- `:max_sessions` is validated at application boot as a positive integer,
+  raising a clear `ArgumentError` otherwise.
 - `net_runner` bumped to `~> 1.2` (was `~> 1.0`).
 
 ### Fixed

@@ -1,10 +1,12 @@
 defmodule CrowdControl.Session do
   @moduledoc """
-  GenServer managing a single Claude Code / Open Code CLI subprocess.
+  GenServer managing a single Claude Code / Open Code CLI instance.
 
-  Each session wraps a `NetRunner.Process` and a linked reader process
-  that drains stdout, buffers partial lines, decodes JSON messages,
-  and broadcasts them to subscribers.
+  Each session drives a `CrowdControl.Backend` — a local subprocess by default,
+  or a container — plus a linked reader process that delivers stdout. The
+  session buffers partial lines, decodes JSON messages, and broadcasts them to
+  subscribers. Everything from line splitting onward is transport-agnostic: the
+  session never learns which backend it is talking to.
 
   Subscribers receive messages of the form `{:crowd_control, session_pid, payload}`
   where `payload` is one of `t:CrowdControl.Protocol.message/0`,
@@ -17,6 +19,9 @@ defmodule CrowdControl.Session do
   Session-lifecycle options (CLI/argv options are forwarded to
   `CrowdControl.CLI.build_command/1`):
 
+    * `:backend` - `CrowdControl.Backend` implementation, either a module or a
+      `{module, config}` tuple whose config is merged into these opts. Defaults
+      to `CrowdControl.Backend.Local`.
     * `:prompt` - initial prompt sent once the CLI starts (optional)
     * `:timeout` - inactivity ceiling in ms before the session self-expires and
       broadcasts `{:timeout, :session_expired}`; reset on each `send_prompt/2`.
@@ -26,44 +31,52 @@ defmodule CrowdControl.Session do
     * `:max_line_bytes` - cap for a single newline-free output line. Exceeding it
       kills the subprocess and broadcasts `{:error, :line_too_large}` rather than
       buffering an unbounded remainder. Defaults to `1_000_000`.
+    * `:max_stream_bytes` - cap on a session's **total** output. Exceeding it
+      destroys the sandbox and broadcasts `{:error, :stream_too_large}`. Mainly
+      for remote backends, whose output file grows without bound; unbounded when
+      unset.
     * `:max_messages` - cap on messages retained for `get_messages/1`; oldest are
       dropped past the cap. Live subscribers are unaffected. Clamped to `>= 0`.
       Defaults to `10_000`.
   """
 
-  use GenServer, restart: :temporary
+  # :transient, not :temporary. `:temporary` is right when the OS process dies
+  # with the GenServer -- and exactly backwards when a *billed* remote sandbox
+  # outlives it. A transient child is restarted on abnormal exit, which is what
+  # gives CrowdControl.Reaper a session to reattach the surviving sandbox to.
+  # Normal exits (`:normal`, `:shutdown`) are still not restarted, so an ordinary
+  # completed session does not respawn and does not hold a `:max_children` slot.
+  use GenServer, restart: :transient
 
   require Logger
 
-  alias CrowdControl.{CLI, Protocol}
+  alias CrowdControl.{Backend, CLI, Protocol, Store}
 
   @default_timeout 300_000
   @default_max_line_bytes 1_000_000
   @default_max_messages 10_000
 
-  # Short, non-destructive probe used to reap a subprocess that has already
-  # exited. NetRunner answers immediately in that case; killing first would
-  # leave it waiting on an exit it has already delivered.
-  @reap_probe_timeout 50
-  @kill_wait_timeout 1_000
-
   defstruct [
-    :proc,
+    :backend,
+    :backend_state,
     :reader,
     :session_id,
+    :store_key,
+    :owner,
     :opts,
     :timeout,
     :timeout_ref,
-    :env_dir,
-    :env_file,
     :max_prompt_size,
     :exit_status,
     :max_line_bytes,
+    :max_stream_bytes,
     :max_messages,
     status: :starting,
     exited: false,
+    persist?: false,
     subscribers: [],
     buffer: "",
+    byte_offset: 0,
     messages: [],
     message_count: 0
   ]
@@ -130,31 +143,103 @@ defmodule CrowdControl.Session do
 
   # --- GenServer Callbacks ---
 
+  @doc """
+  Start a session that takes over a sandbox which outlived its previous session.
+
+  `record` comes from `CrowdControl.Store`. Used by `CrowdControl.Reaper`; you
+  rarely call this directly.
+  """
+  @spec start_reattached(Store.t()) :: GenServer.on_start()
+  def start_reattached(record) do
+    GenServer.start_link(__MODULE__, {:reattach, record})
+  end
+
   @impl true
+  def init({:reattach, record}) do
+    backend = record.backend
+    cursor = %{byte_offset: record.byte_offset, buffer: record.buffer}
+
+    Logger.info(
+      "Reattaching session #{record.key}: backend=#{inspect(backend)}, " <>
+        "offset=#{record.byte_offset}, buffer=#{byte_size(record.buffer)}B"
+    )
+
+    with {:ok, handle} <- backend.reattach(record.handle, cursor),
+         {:ok, reader} <- reader_or_destroy(backend, handle, cursor) do
+      state = %__MODULE__{
+        backend: backend,
+        backend_state: handle,
+        reader: reader,
+        store_key: record.key,
+        owner: record.owner,
+        session_id: record.session_id,
+        persist?: Backend.reattachable?(backend),
+        opts: record.opts,
+        timeout: Keyword.get(record.opts, :timeout, @default_timeout),
+        max_prompt_size: Keyword.get(record.opts, :max_prompt_size),
+        max_line_bytes: bound_opt!(record.opts, :max_line_bytes, @default_max_line_bytes),
+        max_stream_bytes: Keyword.get(record.opts, :max_stream_bytes),
+        max_messages: bound_opt!(record.opts, :max_messages, @default_max_messages),
+        # The cursor is seeded here, in the state init/1 returns, which is
+        # necessarily before any {:stdout_data, _} cast is processed -- the
+        # GenServer does not touch its mailbox until init/1 has returned. So the
+        # partial line is in place before the first resumed byte arrives, and
+        # the two rejoin exactly.
+        buffer: record.buffer,
+        byte_offset: record.byte_offset,
+        # Subscribers are pids from a previous VM state and are meaningless now.
+        # Callers re-subscribe/1; this is expected, not a gap.
+        subscribers: [],
+        status: :running
+      }
+
+      {:ok, schedule_timeout(state)}
+    else
+      {:error, reason} -> {:stop, reason}
+    end
+  end
+
   def init(opts) do
-    {executable, args, env} = CLI.build_command(opts)
-    {cmd, cmd_args, env_dir, env_file} = wrap_with_env(executable, args, env)
+    {backend, backend_opts} = Backend.resolve(opts)
 
-    Logger.info("Starting session: executable=#{executable}, model=#{opts[:model] || "default"}")
+    # Minted before provisioning so the sandbox can be labelled with it. See
+    # CrowdControl.Store's "Two different ids" -- this is not the CLI's id.
+    store_key = Store.new_key()
+    backend_opts = Keyword.put(backend_opts, :session_key, store_key)
 
-    case NetRunner.Process.start_link(cmd, cmd_args) do
-      {:ok, proc} ->
-        session_pid = self()
-        reader = spawn_link(fn -> reader_loop(proc, session_pid) end)
-        timeout = Keyword.get(opts, :timeout, @default_timeout)
-        max_prompt_size = Keyword.get(opts, :max_prompt_size)
-        max_line_bytes = bound_opt!(opts, :max_line_bytes, @default_max_line_bytes)
-        max_messages = bound_opt!(opts, :max_messages, @default_max_messages)
+    # This MUST be resolved the same way the backend resolves the owner it stamps
+    # onto the sandbox. If the record's owner and the sandbox's label can differ,
+    # the reaper sees live sandboxes with no matching record and destroys every
+    # one of them as an orphan.
+    owner = backend_opts[:owner] || Store.owner_id()
+    backend_opts = Keyword.put(backend_opts, :owner, owner)
 
+    {executable, args, env} = CLI.build_command(backend_opts)
+
+    Logger.info(
+      "Starting session: backend=#{inspect(backend)}, executable=#{executable}, " <>
+        "model=#{backend_opts[:model] || "default"}"
+    )
+
+    # Bounds are validated before provisioning so that a bad :max_messages
+    # raises without having created (and leaked) a sandbox first.
+    max_line_bytes = bound_opt!(opts, :max_line_bytes, @default_max_line_bytes)
+    max_messages = bound_opt!(opts, :max_messages, @default_max_messages)
+
+    case start_backend(backend, backend_opts, executable, args, env) do
+      {:ok, handle, reader} ->
         state = %__MODULE__{
-          proc: proc,
+          backend: backend,
+          backend_state: handle,
           reader: reader,
+          store_key: store_key,
+          owner: owner,
+          persist?: Backend.reattachable?(backend),
           opts: opts,
-          timeout: timeout,
-          env_dir: env_dir,
-          env_file: env_file,
-          max_prompt_size: max_prompt_size,
+          timeout: Keyword.get(opts, :timeout, @default_timeout),
+          max_prompt_size: Keyword.get(opts, :max_prompt_size),
           max_line_bytes: max_line_bytes,
+          max_stream_bytes: Keyword.get(opts, :max_stream_bytes),
           max_messages: max_messages
         }
 
@@ -169,9 +254,38 @@ defmodule CrowdControl.Session do
         {:ok, state}
 
       {:error, reason} ->
-        cleanup_env_dir(env_dir)
         {:stop, reason}
     end
+  end
+
+  # provision -> exec -> start_reader, tearing down whatever was created if a
+  # later step fails. Without the destroy/1 on the error paths, a backend that
+  # provisions a billed sandbox and then fails to exec would leak it silently.
+  defp start_backend(backend, opts, executable, args, env) do
+    with {:ok, handle} <- backend.provision(opts),
+         {:ok, handle} <- exec_or_destroy(backend, handle, executable, args, env),
+         {:ok, reader} <- reader_or_destroy(backend, handle, Backend.new_cursor()) do
+      {:ok, handle, reader}
+    end
+  end
+
+  defp exec_or_destroy(backend, handle, executable, args, env) do
+    case backend.exec(handle, executable, args, env) do
+      {:ok, handle} -> {:ok, handle}
+      {:error, reason} -> destroy_and_return(backend, handle, reason)
+    end
+  end
+
+  defp reader_or_destroy(backend, handle, cursor) do
+    case backend.start_reader(handle, self(), cursor) do
+      {:ok, reader} -> {:ok, reader}
+      {:error, reason} -> destroy_and_return(backend, handle, reason)
+    end
+  end
+
+  defp destroy_and_return(backend, handle, reason) do
+    backend.destroy(handle)
+    {:error, reason}
   end
 
   @impl true
@@ -210,7 +324,7 @@ defmodule CrowdControl.Session do
   end
 
   def handle_call(:stop, _from, state) do
-    state = shutdown_process(state)
+    state = destroy_backend(state)
     {:stop, :normal, :ok, state}
   end
 
@@ -219,16 +333,40 @@ defmodule CrowdControl.Session do
     buffer = state.buffer <> data
     {lines, remainder} = Protocol.split_lines(buffer)
 
-    if byte_size(remainder) > state.max_line_bytes do
-      stop_line_too_large(state)
-    else
-      {:noreply, consume_lines(%{state | buffer: remainder}, lines)}
+    cond do
+      byte_size(remainder) > state.max_line_bytes ->
+        stop_line_too_large(state)
+
+      exceeds_stream_cap?(state, byte_size(data)) ->
+        stop_stream_too_large(state)
+
+      true ->
+        # Both halves of the cursor advance here, in one clause. `byte_offset`
+        # counts every byte the reader has delivered; `buffer` is the partial line
+        # among them that has not been consumed yet. Reattach reads from the
+        # offset and prepends the buffer, so a line split across a crash rejoins
+        # exactly -- which only holds if these two can never disagree.
+        state = %{
+          state
+          | buffer: remainder,
+            byte_offset: state.byte_offset + byte_size(data)
+        }
+
+        state = consume_lines(state, lines)
+        persist(state)
+
+        # Tell the reader these bytes are through, so it can lift any
+        # backpressure pause it applied. Backends whose reader never pauses
+        # (Local) simply ignore it.
+        if is_pid(state.reader), do: send(state.reader, {:cc_ack, byte_size(data)})
+
+        {:noreply, state}
     end
   end
 
   def handle_cast(:eof, state) do
     exit_status =
-      case safe_await_exit(state.proc, 1_000) do
+      case await_exit(state, 1_000) do
         {:ok, status} -> status
         _ -> nil
       end
@@ -242,23 +380,24 @@ defmodule CrowdControl.Session do
       Logger.info("Session completed, exit_status=#{inspect(exit_status)}")
     end
 
-    cleanup_env_dir(state.env_dir)
+    # Destroy before broadcasting: a subscriber that receives {:exit, _} is
+    # entitled to assume the sandbox and its env file are already gone.
+    state = destroy_backend(state)
     broadcast(state, {:exit, exit_status})
-    {:noreply, %{state | env_dir: nil, env_file: nil}}
+    {:noreply, state}
   end
 
   @impl true
   def handle_info(:session_timeout, state) do
     Logger.warning("Session timed out after #{state.timeout}ms")
-    state = shutdown_process(state)
+    state = destroy_backend(state)
     broadcast(state, {:timeout, :session_expired})
     {:stop, :normal, %{state | status: :error}}
   end
 
   @impl true
   def terminate(_reason, state) do
-    cleanup_env_dir(state.env_dir)
-    shutdown_process(state)
+    destroy_backend(state)
     :ok
   end
 
@@ -295,24 +434,76 @@ defmodule CrowdControl.Session do
     end
   end
 
-  defp reader_loop(proc, session_pid) do
-    case NetRunner.Process.read(proc) do
-      {:ok, data} ->
-        GenServer.cast(session_pid, {:stdout_data, data})
-        reader_loop(proc, session_pid)
-
-      :eof ->
-        GenServer.cast(session_pid, :eof)
-
-      {:error, _} ->
-        GenServer.cast(session_pid, :eof)
-    end
-  end
-
   defp do_send_prompt(state, prompt) do
     encoded = Protocol.encode_user_message(prompt)
-    NetRunner.Process.write(state.proc, encoded)
+    _ = state.backend.write(state.backend_state, encoded)
     state
+  end
+
+  defp await_exit(%{backend_state: nil}, _timeout), do: :timeout
+
+  defp await_exit(state, timeout), do: state.backend.await_exit(state.backend_state, timeout)
+
+  # Clearing :backend_state is what keeps teardown idempotent across the four
+  # paths that can reach it (:eof, :stop, :session_timeout, terminate/2) --
+  # backends are required to tolerate a repeat destroy/1 anyway, but not calling
+  # it twice is cheaper and keeps the "already torn down" state explicit.
+  defp destroy_backend(%{backend_state: nil} = state), do: state
+
+  defp destroy_backend(state) do
+    state.backend.destroy(state.backend_state)
+    # Drop the record in the same breath as the sandbox. A record outliving its
+    # sandbox is worse than no record: the reaper would try to reattach to a
+    # container that no longer exists.
+    forget(state)
+    %{state | backend_state: nil}
+  end
+
+  # Persistence is skipped entirely for backends that cannot reattach -- a store
+  # write per stdout chunk is real overhead, and Backend.Local has nothing to
+  # reattach to.
+  defp persist(%{persist?: false}), do: :ok
+
+  defp persist(state) do
+    Store.put(
+      state.store_key,
+      Store.build(
+        key: state.store_key,
+        session_id: state.session_id,
+        backend: state.backend,
+        # Both the handle and the opts are scrubbed of credentials before they
+        # touch the store -- a record can outlive the VM on disk, and nothing
+        # about reattaching needs an API key.
+        handle: Backend.scrub(state.backend, state.backend_state),
+        byte_offset: state.byte_offset,
+        buffer: state.buffer,
+        opts: Store.scrub_opts(state.opts),
+        owner: state.owner
+      )
+    )
+  end
+
+  defp forget(%{persist?: false}), do: :ok
+  defp forget(state), do: Store.delete(state.store_key)
+
+  # A remote sandbox writes its output to a file that grows without bound. The
+  # cap destroys the sandbox rather than rotating the file: rotation would
+  # invalidate every persisted byte offset and silently corrupt resume, which is
+  # the precise failure the offset cursor exists to prevent. `nil` = unbounded.
+  defp exceeds_stream_cap?(%{max_stream_bytes: nil}, _added), do: false
+
+  defp exceeds_stream_cap?(state, added) do
+    state.byte_offset + added > state.max_stream_bytes
+  end
+
+  defp stop_stream_too_large(state) do
+    Logger.error(
+      "Session stream exceeded max_stream_bytes=#{state.max_stream_bytes}; destroying sandbox"
+    )
+
+    state = destroy_backend(%{state | buffer: ""})
+    broadcast(state, {:error, :stream_too_large})
+    {:stop, :normal, %{state | status: :error}}
   end
 
   defp stop_line_too_large(state) do
@@ -320,10 +511,9 @@ defmodule CrowdControl.Session do
       "Session line exceeded max_line_bytes=#{state.max_line_bytes}; killing subprocess"
     )
 
-    state = shutdown_process(%{state | buffer: ""})
-    cleanup_env_dir(state.env_dir)
+    state = destroy_backend(%{state | buffer: ""})
     broadcast(state, {:error, :line_too_large})
-    {:stop, :normal, %{state | status: :error, env_dir: nil, env_file: nil}}
+    {:stop, :normal, %{state | status: :error}}
   end
 
   defp consume_lines(state, lines) do
@@ -403,51 +593,6 @@ defmodule CrowdControl.Session do
     :ok
   end
 
-  defp wrap_with_env(executable, args, env) when map_size(env) == 0 do
-    {executable, args, nil, nil}
-  end
-
-  defp wrap_with_env(executable, args, env) do
-    {env_dir, env_file} = write_env_file(env)
-    escaped_args = Enum.map_join([executable | args], " ", &shell_escape/1)
-
-    shell_cmd =
-      ". #{shell_escape(env_file)} && rm -f #{shell_escape(env_file)} && exec #{escaped_args}"
-
-    {"/bin/sh", ["-c", shell_cmd], env_dir, env_file}
-  end
-
-  # sobelow_skip ["Traversal.FileModule"]
-  defp write_env_file(env) do
-    random = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
-    dir = Path.join(System.tmp_dir!(), "cc_env_#{random}")
-    File.mkdir_p!(dir)
-    File.chmod!(dir, 0o700)
-
-    path = Path.join(dir, "env.sh")
-
-    content =
-      Enum.map_join(env, "\n", fn {k, v} ->
-        "export #{k}=#{shell_escape(v)}"
-      end)
-
-    File.write!(path, content <> "\n")
-    File.chmod!(path, 0o600)
-    {dir, path}
-  end
-
-  defp shell_escape(value) do
-    "'" <> String.replace(to_string(value), "'", "'\\''") <> "'"
-  end
-
-  defp cleanup_env_dir(nil), do: :ok
-
-  # sobelow_skip ["Traversal.FileModule"]
-  defp cleanup_env_dir(dir) do
-    _ = File.rm_rf(dir)
-    :ok
-  end
-
   defp schedule_timeout(%{timeout: nil} = state), do: state
   defp schedule_timeout(%{timeout: :infinity} = state), do: state
 
@@ -455,63 +600,5 @@ defmodule CrowdControl.Session do
     if state.timeout_ref, do: Process.cancel_timer(state.timeout_ref)
     ref = Process.send_after(self(), :session_timeout, timeout)
     %{state | timeout_ref: ref}
-  end
-
-  # Idempotent: clearing :proc means terminate/2 does not repeat the escalation
-  # after handle_info(:session_timeout) or handle_call(:stop) already ran it.
-  defp shutdown_process(%{proc: nil} = state), do: state
-
-  defp shutdown_process(state) do
-    # Reap before killing. If the subprocess is already gone this returns
-    # immediately; going straight to kill/2 would leave NetRunner blocked on an
-    # exit it has already reported, costing the full timeout twice over.
-    case safe_await_exit(state.proc, @reap_probe_timeout) do
-      {:ok, _} -> :ok
-      _ -> escalate_kill(state.proc)
-    end
-
-    %{state | proc: nil}
-  end
-
-  defp escalate_kill(proc) do
-    if safe_alive?(proc) do
-      _ = safe_kill(proc, :sigterm)
-
-      case safe_await_exit(proc, @kill_wait_timeout) do
-        {:ok, _} ->
-          :ok
-
-        _ ->
-          _ = safe_kill(proc, :sigkill)
-          _ = safe_await_exit(proc, @kill_wait_timeout)
-          :ok
-      end
-    end
-
-    :ok
-  end
-
-  # `NetRunner.Process.{await_exit,alive?,kill}` are all `GenServer.call`s; a
-  # dead or stale daemon makes the call raise an `:exit`, never an `:error`.
-  # Catch only `:exit` so genuine bugs (UndefinedFunctionError, etc.) surface
-  # instead of being silently swallowed.
-  defp safe_await_exit(nil, _timeout), do: :timeout
-
-  defp safe_await_exit(proc, timeout) do
-    NetRunner.Process.await_exit(proc, timeout)
-  catch
-    :exit, _ -> :timeout
-  end
-
-  defp safe_alive?(proc) do
-    NetRunner.Process.alive?(proc)
-  catch
-    :exit, _ -> false
-  end
-
-  defp safe_kill(proc, signal) do
-    NetRunner.Process.kill(proc, signal)
-  catch
-    :exit, _ -> :ok
   end
 end

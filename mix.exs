@@ -2,7 +2,7 @@ defmodule CrowdControl.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/nikoma/crowd_control"
+  @source_url "https://github.com/nyo16/CrowdControl"
 
   def project do
     [
@@ -55,7 +55,7 @@ defmodule CrowdControl.MixProject do
 
   defp package do
     [
-      licenses: ["MIT"],
+      licenses: ["Apache-2.0"],
       maintainers: ["Niko Maroulis"],
       links: %{
         "GitHub" => @source_url,
@@ -79,7 +79,26 @@ defmodule CrowdControl.MixProject do
       ],
       groups_for_modules: [
         Core: [CrowdControl, CrowdControl.Session],
-        Internal: [CrowdControl.CLI, CrowdControl.Protocol, CrowdControl.Application]
+        Backends: [
+          CrowdControl.Backend,
+          CrowdControl.Backend.Local,
+          CrowdControl.Backend.Docker
+        ],
+        Persistence: [
+          CrowdControl.Store,
+          CrowdControl.Store.ETS,
+          CrowdControl.Store.DETS,
+          CrowdControl.Reaper
+        ],
+        # CrowdControl.Application is deliberately absent: it is @moduledoc false,
+        # so listing it here groups a module that never renders.
+        Internal: [
+          CrowdControl.CLI,
+          CrowdControl.Protocol,
+          CrowdControl.Backend.Shell,
+          CrowdControl.Backend.Docker.API,
+          CrowdControl.Backend.Docker.Demux
+        ]
       ]
     ]
   end
@@ -87,6 +106,10 @@ defmodule CrowdControl.MixProject do
   defp deps do
     [
       {:net_runner, "~> 1.2"},
+      # Optional: only CrowdControl.Backend.Docker needs it, and the library's
+      # one-runtime-dep footprint is worth protecting. Unconditional in :test so
+      # CI always exercises the Docker backend's pure paths.
+      {:req, "~> 0.5", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:stream_data, "~> 1.1", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
