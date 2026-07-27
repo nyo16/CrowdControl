@@ -76,6 +76,50 @@ defmodule CrowdControlTest do
       assert {:timeout, _partial} = CrowdControl.collect(pids, 500)
       CrowdControl.stop_all(pids)
     end
+
+    test "returns results for sessions that finished before collect subscribed" do
+      # run_many/2 sends the prompt from init/1 and only subscribes afterwards,
+      # so a fast CLI can emit its result before collect/2 attaches. The result
+      # must still be delivered rather than lost.
+      {:ok, pid} =
+        CrowdControl.start_session(
+          executable: TestHelpers.fake_cli_path(),
+          timeout: 5_000,
+          prompt: "hi"
+        )
+
+      TestHelpers.wait_until(fn ->
+        CrowdControl.Session.get_status(pid) == :completed
+      end)
+
+      assert [{^pid, {:result, _, _}}] = CrowdControl.collect([pid], 2_000)
+
+      CrowdControl.stop_all([pid])
+    end
+
+    test "stops waiting on a session that expires instead of producing a result" do
+      # The session can never produce a result once it has expired, so collect/2
+      # must drop it rather than burn its own deadline -- the bug that left
+      # run_many/2 blocked for a full 60s.
+      {:ok, pid} =
+        CrowdControl.start_session(
+          executable: TestHelpers.fake_cli_path(),
+          env: %{"FAKE_CLI_SLEEP" => "5"},
+          timeout: 1_000,
+          prompt: "slow"
+        )
+
+      started = System.monotonic_time(:millisecond)
+      result = CrowdControl.collect([pid], 10_000)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert result == []
+
+      assert elapsed < 5_000,
+             "collect/2 waited #{elapsed}ms; it should stop when the session expires (~1000ms)"
+
+      CrowdControl.stop_all([pid])
+    end
   end
 
   describe "run/2" do
@@ -91,6 +135,30 @@ defmodule CrowdControlTest do
                  env: %{"FAKE_CLI_SLEEP" => "5"},
                  timeout: 300
                )
+    end
+
+    test "times out on an absolute deadline under a steady non-result stream" do
+      # A continuous stream of assistant (non-result) messages must not keep
+      # pushing the deadline out. Discrimination window:
+      #   * fixed (absolute) deadline  -> returns at ~1000ms (1x the timeout)
+      #   * regressed resetting window -> the session self-expires at 1000ms and
+      #     stops the stream; the last timer reset is that expiry message, so the
+      #     stale window fires ~1000ms later, i.e. ~2000ms (2x).
+      # Both are real monotonic timers (no large drift), so the 1500ms midpoint
+      # cleanly separates correct (<1500ms) from regressed (~2000ms).
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          CrowdControl.run("go",
+            executable: TestHelpers.fake_cli_path(),
+            env: %{"FAKE_CLI_STREAM_NORESULT" => "100"},
+            timeout: 1_000
+          )
+        end)
+
+      assert result == {:error, :timeout}
+
+      assert div(elapsed_us, 1_000) < 1_500,
+             "expected timeout near the 1000ms deadline, took #{div(elapsed_us, 1_000)}ms"
     end
   end
 

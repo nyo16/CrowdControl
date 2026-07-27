@@ -11,17 +11,44 @@ defmodule CrowdControl.SessionTest do
         Session.start_link(executable: "/nonexistent/binary/that/does/not/exist", timeout: 1_000)
 
       case result do
-        {:error, _reason} -> :ok
-        {:ok, pid} -> assert_receive {:EXIT, ^pid, _}, 2_000
+        {:error, _reason} ->
+          :ok
+
+        {:ok, pid} ->
+          # NetRunner forked successfully and the exec failed in the child, so
+          # the failure surfaces as the subprocess exiting non-zero. Assert on
+          # that directly: waiting for the session process itself to die would
+          # be waiting on the unrelated :timeout, whose shutdown path can take
+          # seconds when NetRunner is slow to report the exit.
+          Session.subscribe(pid)
+          assert_receive {:crowd_control, ^pid, {:exit, status}}, 5_000
+          refute status == 0
+
+          TestHelpers.stop_session(pid)
       end
+    end
+
+    test "a subscriber that attaches after the subprocess finished still gets its messages" do
+      {:ok, pid} =
+        Session.start_link(
+          executable: TestHelpers.fake_cli_path(),
+          timeout: 5_000,
+          prompt: "hi"
+        )
+
+      # Subscribe strictly after the session has already broadcast everything.
+      TestHelpers.wait_until(fn -> Session.get_status(pid) == :completed end)
+
+      Session.subscribe(pid)
+
+      assert_receive {:crowd_control, ^pid, {:system_init, _}}, 2_000
+      assert_receive {:crowd_control, ^pid, {:result, "success", _}}, 2_000
+
+      TestHelpers.stop_session(pid)
     end
 
     test "cleans up env dir when subprocess exits via EOF (not via Session.stop)" do
       Process.flag(:trap_exit, true)
-
-      # Pin THIS test's env dir by snapshotting before/during start so we are
-      # immune to other async tests creating their own cc_env_* dirs.
-      before = MapSet.new(list_cc_env_dirs())
 
       {:ok, pid} =
         Session.start_link(
@@ -32,19 +59,50 @@ defmodule CrowdControl.SessionTest do
 
       Session.subscribe(pid)
 
-      Process.sleep(50)
-      during = MapSet.new(list_cc_env_dirs())
-      ours = MapSet.difference(during, before)
+      # Pin THIS session's own env dir straight from its state. Diffing the
+      # shared tmp dir before/after was racy: a concurrent async test creating
+      # its own cc_env_* dir in the window landed in the "ours" set.
+      our_dir = :sys.get_state(pid).env_dir
+      assert is_binary(our_dir) and File.dir?(our_dir)
 
       # Drive a single prompt so fake_cli emits result and exits 0 → EOF path.
       :ok = Session.send_prompt(pid, "x")
       assert_receive {:crowd_control, ^pid, {:exit, _}}, 5_000
 
-      after_ = MapSet.new(list_cc_env_dirs())
-      leftover = MapSet.intersection(ours, after_)
+      # cleanup_env_dir/1 runs in handle_cast(:eof) *before* the {:exit, _}
+      # broadcast, so the dir must be gone by the time we receive it.
+      refute File.dir?(our_dir), "expected our env dir cleaned via EOF path: #{our_dir}"
+    end
+  end
 
-      assert MapSet.size(leftover) == 0,
-             "expected our env dir cleaned via EOF path, leftover: #{inspect(MapSet.to_list(leftover))}"
+  describe "resource bounds" do
+    test "nil bounds fall back to defaults rather than disabling the guard" do
+      # Term ordering puts numbers below atoms, so a nil that reached the guard
+      # would make `byte_size(x) > nil` always false -- silently unbounded.
+      {:ok, pid} =
+        Session.start_link(
+          executable: TestHelpers.fake_cli_path(),
+          max_line_bytes: nil,
+          max_messages: nil,
+          timeout: 5_000
+        )
+
+      state = :sys.get_state(pid)
+      assert is_integer(state.max_line_bytes) and state.max_line_bytes > 0
+      assert is_integer(state.max_messages) and state.max_messages > 0
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a non-integer bound is rejected loudly" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{}, _}} =
+               Session.start_link(
+                 executable: TestHelpers.fake_cli_path(),
+                 max_messages: :unlimited,
+                 timeout: 5_000
+               )
     end
   end
 
@@ -142,28 +200,95 @@ defmodule CrowdControl.SessionTest do
 
   describe "env file cleanup" do
     test "removes its own env dir after session stops" do
-      before = MapSet.new(list_cc_env_dirs())
-
       {:ok, pid} =
         start_fake_session(env: %{"FAKE_CLI_ECHO_ENV" => "MY_TEST_KEY", "MY_TEST_KEY" => "ok"})
 
       Session.subscribe(pid)
 
-      # Catch the dir that was created for THIS session while it is still running.
-      Process.sleep(50)
-      during = MapSet.new(list_cc_env_dirs())
-      ours = MapSet.difference(during, before)
+      # Pin THIS session's own env dir from its state instead of diffing the
+      # shared tmp dir (which races with concurrent async tests).
+      our_dir = :sys.get_state(pid).env_dir
+      assert is_binary(our_dir) and File.dir?(our_dir)
 
       :ok = Session.send_prompt(pid, "hi")
       assert_receive {:crowd_control, ^pid, {:result, _, %{"result" => "MY_TEST_KEY=ok"}}}, 3_000
+
+      # Cleanup runs in terminate/2; wait for the process to actually go DOWN so
+      # terminate has completed before asserting the dir is gone.
+      ref = Process.monitor(pid)
       TestHelpers.stop_session(pid)
-      Process.sleep(100)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
 
-      after_ = MapSet.new(list_cc_env_dirs())
-      leftover = MapSet.intersection(ours, after_)
+      refute File.dir?(our_dir), "expected our env dir to be removed: #{our_dir}"
+    end
+  end
 
-      assert MapSet.size(leftover) == 0,
-             "expected our env dir to be removed, leftover: #{inspect(MapSet.to_list(leftover))}"
+  describe "max_line_bytes guard" do
+    test "oversized newline-free output kills the session and cleans its env dir" do
+      Process.flag(:trap_exit, true)
+
+      {:ok, pid} =
+        Session.start_link(
+          executable: TestHelpers.fake_cli_path(),
+          env: %{"FOO" => "bar"},
+          max_line_bytes: 32,
+          timeout: 10_000
+        )
+
+      Session.subscribe(pid)
+      our_dir = :sys.get_state(pid).env_dir
+      assert is_binary(our_dir) and File.dir?(our_dir)
+
+      ref = Process.monitor(pid)
+
+      # Casts directly to exercise the GenServer-level buffer guard (bypasses
+      # the real Port -> reader-loop -> cast path). A newline-free chunk larger
+      # than max_line_bytes can never complete a line, so the buffered remainder
+      # must be capped instead of growing unbounded — the session stops
+      # gracefully and broadcasts the error.
+      GenServer.cast(pid, {:stdout_data, String.duplicate("x", 64)})
+
+      assert_receive {:crowd_control, ^pid, {:error, :line_too_large}}, 2_000
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+      refute File.dir?(our_dir), "expected env dir cleaned on line_too_large: #{our_dir}"
+    end
+  end
+
+  describe "max_messages retention cap" do
+    test "get_messages is bounded at max_messages and retains the newest" do
+      {:ok, pid} =
+        Session.start_link(
+          executable: TestHelpers.fake_cli_path(),
+          max_messages: 5,
+          timeout: 10_000
+        )
+
+      # Wait for the init message so it is accumulated before we feed our own
+      # lines; this makes the cap-eviction order deterministic.
+      Session.subscribe(pid)
+      assert_receive {:crowd_control, ^pid, {:system_init, _}}, 3_000
+
+      for i <- 1..20 do
+        line =
+          JSON.encode!(%{
+            "type" => "assistant",
+            "message" => %{"role" => "assistant", "content" => []},
+            "n" => i
+          })
+
+        GenServer.cast(pid, {:stdout_data, line <> "\n"})
+      end
+
+      # Eviction math: 1 init + 20 assistant = 21 accumulated, cap 5 -> the init
+      # and a1..a15 are evicted, leaving a16..a20. get_messages/1 returns
+      # chronological order, so the window is exactly [a16, .., a20].
+      messages = Session.get_messages(pid)
+      assert length(messages) == 5
+      assert Enum.all?(messages, &match?({:assistant, _}, &1))
+      assert {:assistant, %{"n" => 16}} = List.first(messages)
+      assert {:assistant, %{"n" => 20}} = List.last(messages)
+
+      TestHelpers.stop_session(pid)
     end
   end
 
@@ -175,11 +300,5 @@ defmodule CrowdControl.SessionTest do
       )
 
     Session.start_link(opts)
-  end
-
-  defp list_cc_env_dirs do
-    System.tmp_dir!()
-    |> File.ls!()
-    |> Enum.filter(&String.starts_with?(&1, "cc_env_"))
   end
 end

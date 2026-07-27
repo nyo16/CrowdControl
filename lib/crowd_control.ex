@@ -7,6 +7,11 @@ defmodule CrowdControl do
 
   alias CrowdControl.Session
 
+  # Per-session start ceiling for `start_sessions/1`. Without a finite timeout,
+  # `on_timeout: :kill_task` is dead code and a wedged start blocks the stream
+  # forever. A killed start normalizes to `{:error, {:task_exit, _}}`.
+  @start_timeout 30_000
+
   @type opts :: keyword()
   @type session :: pid()
   @type result_message :: {:result, String.t(), map()}
@@ -59,7 +64,7 @@ defmodule CrowdControl do
       |> Task.async_stream(&start_session/1,
         max_concurrency: concurrency,
         on_timeout: :kill_task,
-        timeout: :infinity
+        timeout: @start_timeout
       )
       |> Enum.map(&normalize_task_result/1)
 
@@ -94,6 +99,12 @@ defmodule CrowdControl do
   Subscribes to each session and collects `{:result, _, _}` messages.
   Returns a list of `{session_pid, result_message}` tuples, or
   `{:timeout, partial_results}` if the deadline is reached first.
+
+  A session that broadcasts a terminal message instead of a result -- it
+  exited, expired, or hit `:line_too_large` -- is dropped from the wait set
+  rather than waited out, since it can never produce one. Such a session is
+  simply absent from the returned list, so the list can be shorter than
+  `sessions`.
   """
   @spec collect([session()], pos_integer()) ::
           [{session(), result_message()}] | {:timeout, [{session(), result_message()}]}
@@ -123,6 +134,13 @@ defmodule CrowdControl do
         else
           do_collect(remaining, results, deadline)
         end
+
+      # Terminal for this session: it can never produce a result now, so stop
+      # waiting on it instead of burning the whole deadline. wait_for_result/2
+      # already short-circuits on these; collect/2 did not, which left
+      # run_many/2 blocked for the full 60s on any session that errored.
+      {:crowd_control, pid, {terminal, _}} when terminal in [:exit, :error, :timeout] ->
+        do_collect(Map.delete(remaining, pid), results, deadline)
 
       {:crowd_control, _pid, _other} ->
         do_collect(remaining, results, deadline)
@@ -160,7 +178,8 @@ defmodule CrowdControl do
 
     with {:ok, session} <- start_session(opts) do
       Session.subscribe(session)
-      result = wait_for_result(session, Keyword.get(opts, :timeout, 60_000))
+      deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, 60_000)
+      result = wait_for_result(session, deadline)
 
       try do
         Session.stop(session)
@@ -187,7 +206,13 @@ defmodule CrowdControl do
     end
   end
 
-  defp wait_for_result(session, timeout) do
+  # `deadline` is an absolute `System.monotonic_time(:millisecond)` value. Each
+  # non-result message recomputes the remaining wait against it instead of
+  # restarting the full timeout window (which made the deadline unbounded under
+  # a steady stream of intermediate messages).
+  defp wait_for_result(session, deadline) do
+    wait = max(deadline - System.monotonic_time(:millisecond), 0)
+
     receive do
       {:crowd_control, ^session, {:result, _, _} = msg} ->
         msg
@@ -195,10 +220,18 @@ defmodule CrowdControl do
       {:crowd_control, ^session, {:exit, _status}} ->
         {:error, :session_exited}
 
+      {:crowd_control, ^session, {:error, _reason} = err} ->
+        err
+
+      # The session hit its own expiry; from the caller's perspective that is a
+      # timeout (in `run/2` the session and wait deadlines share `:timeout`).
+      {:crowd_control, ^session, {:timeout, _}} ->
+        {:error, :timeout}
+
       {:crowd_control, ^session, _other} ->
-        wait_for_result(session, timeout)
+        wait_for_result(session, deadline)
     after
-      timeout -> {:error, :timeout}
+      wait -> {:error, :timeout}
     end
   end
 end

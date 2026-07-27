@@ -17,9 +17,20 @@ env:
   OTP_VERSION: "27.2"
 
 jobs:
-  compile:
-    name: Compile & Warnings
+  # Fetches and compiles dependencies exactly once. Every Linux job below
+  # restores this cache with fail-on-cache-miss instead of repeating
+  # `mix deps.get` + `mix deps.compile`.
+  #
+  # Note this compiles dependencies only, never the project itself: the
+  # cache key is keyed on mix.lock, so a source-only change would still be
+  # a cache hit. Compiling the project here would let `--warnings-as-errors`
+  # be skipped for exactly the changes most likely to introduce a warning.
+  setup:
+    name: Setup
     runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.key.outputs.value }}
+      plt-key: ${{ steps.key.outputs.plt }}
     steps:
       - uses: actions/checkout@v6
 
@@ -28,18 +39,49 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
+      - name: Compute cache keys
+        id: key
+        env:
+          LOCK_HASH: ${{ hashFiles('mix.lock') }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          echo "value=${RUNNER_OS}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-test-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+          echo "plt=${RUNNER_OS}-plt-${ELIXIR_VERSION}-${OTP_VERSION}-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+
       - name: Cache deps & build
+        id: cache
         uses: actions/cache@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/test
+          key: ${{ steps.key.outputs.value }}
 
       - run: mix deps.get
+        if: steps.cache.outputs.cache-hit != 'true'
+
       - run: mix deps.compile
+        if: steps.cache.outputs.cache-hit != 'true'
+
+  compile:
+    name: Compile & Warnings
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
       - name: Compile with warnings as errors
         run: mix compile --warnings-as-errors
@@ -47,6 +89,7 @@ jobs:
   format:
     name: Formatting
     runs-on: ubuntu-latest
+    needs: [setup]
     steps:
       - uses: actions/checkout@v6
 
@@ -55,20 +98,20 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
-          path: deps
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
       - run: mix format --check-formatted
 
   credo:
     name: Credo
     runs-on: ubuntu-latest
+    needs: [setup]
     steps:
       - uses: actions/checkout@v6
 
@@ -77,22 +120,20 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps & build
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
       - run: mix credo --strict
 
   test:
     name: Tests (${{ matrix.os }} / OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
     runs-on: ${{ matrix.os }}
+    needs: [setup]
     strategy:
       fail-fast: false
       matrix:
@@ -100,9 +141,11 @@ jobs:
           - os: ubuntu-latest
             elixir: "1.18.3"
             otp: "27.2"
+            shared-cache: true
           - os: macos-latest
             elixir: "1.18.3"
             otp: "27.2"
+            shared-cache: false
     steps:
       - uses: actions/checkout@v6
 
@@ -111,24 +154,40 @@ jobs:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
 
-      - name: Cache deps & build
-        uses: actions/cache@v5
+      # The setup job runs on Linux, so its cache key does not apply to the
+      # macOS leg; that leg keeps its own cache and builds deps itself.
+      - uses: actions/cache/restore@v5
+        if: matrix.shared-cache
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
-      - run: mix deps.compile
+      - uses: actions/cache@v5
+        if: ${{ !matrix.shared-cache }}
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-test-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-test-
+
+      - name: Build deps (macOS)
+        if: ${{ !matrix.shared-cache }}
+        run: |
+          mix deps.get
+          mix deps.compile
+
       - run: mix compile
       - run: mix test
 
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    needs: [setup]
     steps:
       - uses: actions/checkout@v6
 
@@ -137,17 +196,14 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps & build
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
       - run: mix coveralls.json
 
       - name: Upload coverage artifact
@@ -159,6 +215,7 @@ jobs:
   sobelow:
     name: Sobelow
     runs-on: ubuntu-latest
+    needs: [setup]
     steps:
       - uses: actions/checkout@v6
 
@@ -167,22 +224,20 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps & build
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
       - run: mix sobelow --exit --skip
 
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
+    needs: [setup]
     steps:
       - uses: actions/checkout@v6
 
@@ -191,21 +246,21 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
-          path: deps
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
       - run: mix hex.audit
       - run: mix deps.audit
 
   docs:
     name: Docs
     runs-on: ubuntu-latest
+    needs: [setup]
     steps:
       - uses: actions/checkout@v6
 
@@ -214,17 +269,16 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps & build
-        uses: actions/cache@v5
+      # Restores the `deps` sources; `mix docs` runs in :dev, so _build/dev
+      # is compiled fresh here regardless.
+      - uses: actions/cache/restore@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
-      - run: mix deps.get
       - run: MIX_ENV=dev mix docs
 
       - name: Upload docs artifact
@@ -236,6 +290,7 @@ jobs:
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
+    needs: [setup]
     steps:
       - uses: actions/checkout@v6
 
@@ -244,26 +299,22 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Cache deps & build
-        uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
           path: |
             deps
-            _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
 
       - name: Cache PLTs
         uses: actions/cache@v5
         with:
           path: priv/plts
-          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ needs.setup.outputs.plt-key }}
           restore-keys: |
             ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
-      - run: mix deps.compile
       - run: mix compile
       - run: mix dialyzer
 

@@ -10,6 +10,9 @@ defmodule CrowdControl.CLI do
 
   @env_key_re ~r/\A[A-Za-z_][A-Za-z0-9_]*\z/
 
+  # C0 control bytes, as single-byte patterns for :binary.match/2.
+  @control_bytes for b <- 0..31, do: <<b>>
+
   @base_args [
     "--print",
     "--output-format",
@@ -84,7 +87,7 @@ defmodule CrowdControl.CLI do
     * `:bare` - `true` for minimal mode
     * `:extra_args` - list of additional string arguments
     * `:env` - map of environment variables (keys must match `~r/\\A[A-Za-z_][A-Za-z0-9_]*\\z/`,
-      values must be binaries without null bytes or newlines)
+      values must be binaries with no C0 control characters, i.e. `[\\x00-\\x1f]`)
     * `:api_key` - shorthand for setting `ANTHROPIC_API_KEY`
     * `:api_url` - shorthand for setting `ANTHROPIC_BASE_URL`
   """
@@ -220,7 +223,7 @@ defmodule CrowdControl.CLI do
 
   @doc """
   Sanitizes a filesystem path. Rejects non-binaries, null bytes, and
-  ASCII control characters. Returns the expanded absolute path.
+  C0 control characters (`[\\x00-\\x1f]`). Returns the expanded absolute path.
 
   Raises `ArgumentError` on invalid input.
   """
@@ -233,16 +236,23 @@ defmodule CrowdControl.CLI do
   def sanitize_path!(other),
     do: raise(ArgumentError, "path must be a binary, got: #{inspect(other)}")
 
+  # NEVER echo the offending value. This runs on env values -- including
+  # :api_key -- and build_env/1 is called from Session.init/1, so a raise here
+  # becomes a GenServer crash report that carries the secret into Logger,
+  # erl_crash.dump, and any error-reporting handler. Reading a key out of a file
+  # leaves a trailing newline, which is enough to trigger it. Report the
+  # position and size instead; that is sufficient to debug the input.
   defp validate_no_control_chars!(value, label) when is_binary(value) do
-    cond do
-      String.contains?(value, <<0>>) ->
-        raise ArgumentError, "#{label} contains a null byte: #{inspect(value)}"
-
-      Regex.match?(~r/[\x00-\x1f]/, value) ->
-        raise ArgumentError, "#{label} contains control characters: #{inspect(value)}"
-
-      true ->
+    case :binary.match(value, @control_bytes) do
+      :nomatch ->
         :ok
+
+      {pos, _} ->
+        kind = if :binary.at(value, pos) == 0, do: "a null byte", else: "a control character"
+
+        raise ArgumentError,
+              "#{label} contains #{kind} at byte #{pos} " <>
+                "(#{byte_size(value)} bytes); value redacted"
     end
   end
 
@@ -253,8 +263,10 @@ defmodule CrowdControl.CLI do
   Explicit `:env` entries take precedence over shorthands.
 
   Validates every key against `~r/\\A[A-Za-z_][A-Za-z0-9_]*\\z/` and ensures
-  values are binaries without null bytes or newlines, raising `ArgumentError`
-  on violation to prevent shell injection through the env-file mechanism.
+  values are binaries with no C0 control characters (`[\\x00-\\x1f]`),
+  raising `ArgumentError` on violation to prevent shell injection through the
+  env-file mechanism. (DEL `\\x7f` and Unicode separators are left to
+  `shell_escape/1`, which renders every surviving byte inert.)
   """
   @spec build_env(opts()) :: %{optional(String.t()) => String.t()}
   def build_env(opts) do
@@ -291,13 +303,7 @@ defmodule CrowdControl.CLI do
         raise ArgumentError, "env value for #{key} must be a binary, got: #{inspect(value)}"
       end
 
-      if String.contains?(value, <<0>>) do
-        raise ArgumentError, "env value for #{key} contains a null byte"
-      end
-
-      if String.contains?(value, "\n") do
-        raise ArgumentError, "env value for #{key} contains a newline"
-      end
+      validate_no_control_chars!(value, "env value for #{key}")
     end)
   end
 end

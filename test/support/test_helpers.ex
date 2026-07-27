@@ -21,6 +21,31 @@ defmodule CrowdControl.TestHelpers do
   end
 
   @doc """
+  Poll `fun` until it returns true, or raise after `timeout` ms.
+
+  Used to reach a deterministic point in a session's lifecycle (e.g. "the
+  subprocess has finished") without sleeping for an arbitrary duration.
+  """
+  def wait_until(fun, timeout \\ 5_000, interval \\ 10) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_wait_until(fun, deadline, interval)
+  end
+
+  defp do_wait_until(fun, deadline, interval) do
+    cond do
+      fun.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        raise "wait_until/3 timed out"
+
+      true ->
+        Process.sleep(interval)
+        do_wait_until(fun, deadline, interval)
+    end
+  end
+
+  @doc """
   Receive a `{:crowd_control, session, payload}` matching a guard, or fail
   after the given timeout.
   """
