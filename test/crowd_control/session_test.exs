@@ -11,9 +11,40 @@ defmodule CrowdControl.SessionTest do
         Session.start_link(executable: "/nonexistent/binary/that/does/not/exist", timeout: 1_000)
 
       case result do
-        {:error, _reason} -> :ok
-        {:ok, pid} -> assert_receive {:EXIT, ^pid, _}, 2_000
+        {:error, _reason} ->
+          :ok
+
+        {:ok, pid} ->
+          # NetRunner forked successfully and the exec failed in the child, so
+          # the failure surfaces as the subprocess exiting non-zero. Assert on
+          # that directly: waiting for the session process itself to die would
+          # be waiting on the unrelated :timeout, whose shutdown path can take
+          # seconds when NetRunner is slow to report the exit.
+          Session.subscribe(pid)
+          assert_receive {:crowd_control, ^pid, {:exit, status}}, 5_000
+          refute status == 0
+
+          TestHelpers.stop_session(pid)
       end
+    end
+
+    test "a subscriber that attaches after the subprocess finished still gets its messages" do
+      {:ok, pid} =
+        Session.start_link(
+          executable: TestHelpers.fake_cli_path(),
+          timeout: 5_000,
+          prompt: "hi"
+        )
+
+      # Subscribe strictly after the session has already broadcast everything.
+      TestHelpers.wait_until(fn -> Session.get_status(pid) == :completed end)
+
+      Session.subscribe(pid)
+
+      assert_receive {:crowd_control, ^pid, {:system_init, _}}, 2_000
+      assert_receive {:crowd_control, ^pid, {:result, "success", _}}, 2_000
+
+      TestHelpers.stop_session(pid)
     end
 
     test "cleans up env dir when subprocess exits via EOF (not via Session.stop)" do

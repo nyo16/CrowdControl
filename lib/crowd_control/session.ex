@@ -19,6 +19,12 @@ defmodule CrowdControl.Session do
 
   @default_timeout 300_000
 
+  # Short, non-destructive probe used to reap a subprocess that has already
+  # exited. NetRunner answers immediately in that case; killing first would
+  # leave it waiting on an exit it has already delivered.
+  @reap_probe_timeout 50
+  @kill_wait_timeout 1_000
+
   defstruct [
     :proc,
     :reader,
@@ -29,7 +35,9 @@ defmodule CrowdControl.Session do
     :env_dir,
     :env_file,
     :max_prompt_size,
+    :exit_status,
     status: :starting,
+    exited: false,
     subscribers: [],
     buffer: "",
     messages: []
@@ -157,6 +165,7 @@ defmodule CrowdControl.Session do
   end
 
   def handle_call({:subscribe, pid}, _from, state) do
+    replay_history(state, pid)
     {:reply, :ok, %{state | subscribers: [pid | state.subscribers]}}
   end
 
@@ -195,7 +204,7 @@ defmodule CrowdControl.Session do
       end
 
     status = if exit_status == 0 or state.status == :completed, do: :completed, else: :error
-    state = %{state | status: status}
+    state = %{state | status: status, exited: true, exit_status: exit_status}
 
     if status == :error do
       Logger.warning("Session exited with error, exit_status=#{inspect(exit_status)}")
@@ -285,6 +294,24 @@ defmodule CrowdControl.Session do
     end)
   end
 
+  # Broadcasts are fire-and-forget, so a subscriber that attaches after the CLI
+  # has already produced output would never see it -- and a caller waiting on a
+  # `{:result, _, _}` that was emitted a moment too early would block until its
+  # own deadline. Replaying the accumulated history (and the exit, if it has
+  # already happened) makes subscribe/1 safe to call at any point in the
+  # session's life.
+  defp replay_history(state, pid) do
+    state.messages
+    |> Enum.reverse()
+    |> Enum.each(&send(pid, {:crowd_control, self(), &1}))
+
+    if state.exited do
+      send(pid, {:crowd_control, self(), {:exit, state.exit_status}})
+    end
+
+    :ok
+  end
+
   defp wrap_with_env(executable, args, env) when map_size(env) == 0 do
     {executable, args, nil, nil}
   end
@@ -339,23 +366,41 @@ defmodule CrowdControl.Session do
     %{state | timeout_ref: ref}
   end
 
-  defp shutdown_process(state) do
-    if state.proc && safe_alive?(state.proc) do
-      _ = safe_kill(state.proc, :sigterm)
+  # Idempotent: clearing :proc means terminate/2 does not repeat the escalation
+  # after handle_info(:session_timeout) or handle_call(:stop) already ran it.
+  defp shutdown_process(%{proc: nil} = state), do: state
 
-      case safe_await_exit(state.proc, 1_000) do
+  defp shutdown_process(state) do
+    # Reap before killing. If the subprocess is already gone this returns
+    # immediately; going straight to kill/2 would leave NetRunner blocked on an
+    # exit it has already reported, costing the full timeout twice over.
+    case safe_await_exit(state.proc, @reap_probe_timeout) do
+      {:ok, _} -> :ok
+      _ -> escalate_kill(state.proc)
+    end
+
+    %{state | proc: nil}
+  end
+
+  defp escalate_kill(proc) do
+    if safe_alive?(proc) do
+      _ = safe_kill(proc, :sigterm)
+
+      case safe_await_exit(proc, @kill_wait_timeout) do
         {:ok, _} ->
           :ok
 
         _ ->
-          _ = safe_kill(state.proc, :sigkill)
-          _ = safe_await_exit(state.proc, 1_000)
+          _ = safe_kill(proc, :sigkill)
+          _ = safe_await_exit(proc, @kill_wait_timeout)
           :ok
       end
     end
 
-    state
+    :ok
   end
+
+  defp safe_await_exit(nil, _timeout), do: :timeout
 
   defp safe_await_exit(proc, timeout) do
     NetRunner.Process.await_exit(proc, timeout)

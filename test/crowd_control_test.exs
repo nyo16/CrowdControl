@@ -76,6 +76,26 @@ defmodule CrowdControlTest do
       assert {:timeout, _partial} = CrowdControl.collect(pids, 500)
       CrowdControl.stop_all(pids)
     end
+
+    test "returns results for sessions that finished before collect subscribed" do
+      # run_many/2 sends the prompt from init/1 and only subscribes afterwards,
+      # so a fast CLI can emit its result before collect/2 attaches. The result
+      # must still be delivered rather than lost.
+      {:ok, pid} =
+        CrowdControl.start_session(
+          executable: TestHelpers.fake_cli_path(),
+          timeout: 5_000,
+          prompt: "hi"
+        )
+
+      TestHelpers.wait_until(fn ->
+        CrowdControl.Session.get_status(pid) == :completed
+      end)
+
+      assert [{^pid, {:result, _, _}}] = CrowdControl.collect([pid], 2_000)
+
+      CrowdControl.stop_all([pid])
+    end
   end
 
   describe "run/2" do
