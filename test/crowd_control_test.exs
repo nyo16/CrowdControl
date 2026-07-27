@@ -112,6 +112,30 @@ defmodule CrowdControlTest do
                  timeout: 300
                )
     end
+
+    test "times out on an absolute deadline under a steady non-result stream" do
+      # A continuous stream of assistant (non-result) messages must not keep
+      # pushing the deadline out. Discrimination window:
+      #   * fixed (absolute) deadline  -> returns at ~1000ms (1x the timeout)
+      #   * regressed resetting window -> the session self-expires at 1000ms and
+      #     stops the stream; the last timer reset is that expiry message, so the
+      #     stale window fires ~1000ms later, i.e. ~2000ms (2x).
+      # Both are real monotonic timers (no large drift), so the 1500ms midpoint
+      # cleanly separates correct (<1500ms) from regressed (~2000ms).
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          CrowdControl.run("go",
+            executable: TestHelpers.fake_cli_path(),
+            env: %{"FAKE_CLI_STREAM_NORESULT" => "100"},
+            timeout: 1_000
+          )
+        end)
+
+      assert result == {:error, :timeout}
+
+      assert div(elapsed_us, 1_000) < 1_500,
+             "expected timeout near the 1000ms deadline, took #{div(elapsed_us, 1_000)}ms"
+    end
   end
 
   describe "run_many/2" do

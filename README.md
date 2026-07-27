@@ -318,6 +318,27 @@ CrowdControl.run_many("Refactor this module for clarity", [
 ])
 ```
 
+### Resource limits
+
+Each session bounds its own memory and lifetime so a misbehaving CLI can't
+exhaust the host. All limits are per-session options with safe defaults:
+
+```elixir
+CrowdControl.start_session(
+  # inactivity ceiling; on expiry the session broadcasts
+  # {:timeout, :session_expired} and stops (reset on each prompt)
+  timeout: 300_000,
+  # reject prompts larger than this with {:error, :prompt_too_large}
+  max_prompt_size: 1_000_000,
+  # a single newline-free output line over this kills the subprocess and
+  # broadcasts {:error, :line_too_large} instead of buffering unbounded
+  max_line_bytes: 1_000_000,
+  # cap on messages kept for get_messages/1 (oldest dropped past the cap);
+  # live subscribers still receive every message
+  max_messages: 10_000
+)
+```
+
 ## Authentication
 
 CrowdControl supports all Claude Code authentication methods:

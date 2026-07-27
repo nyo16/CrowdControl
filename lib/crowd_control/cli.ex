@@ -84,7 +84,7 @@ defmodule CrowdControl.CLI do
     * `:bare` - `true` for minimal mode
     * `:extra_args` - list of additional string arguments
     * `:env` - map of environment variables (keys must match `~r/\\A[A-Za-z_][A-Za-z0-9_]*\\z/`,
-      values must be binaries without null bytes or newlines)
+      values must be binaries with no C0 control characters, i.e. `[\\x00-\\x1f]`)
     * `:api_key` - shorthand for setting `ANTHROPIC_API_KEY`
     * `:api_url` - shorthand for setting `ANTHROPIC_BASE_URL`
   """
@@ -220,7 +220,7 @@ defmodule CrowdControl.CLI do
 
   @doc """
   Sanitizes a filesystem path. Rejects non-binaries, null bytes, and
-  ASCII control characters. Returns the expanded absolute path.
+  C0 control characters (`[\\x00-\\x1f]`). Returns the expanded absolute path.
 
   Raises `ArgumentError` on invalid input.
   """
@@ -253,8 +253,10 @@ defmodule CrowdControl.CLI do
   Explicit `:env` entries take precedence over shorthands.
 
   Validates every key against `~r/\\A[A-Za-z_][A-Za-z0-9_]*\\z/` and ensures
-  values are binaries without null bytes or newlines, raising `ArgumentError`
-  on violation to prevent shell injection through the env-file mechanism.
+  values are binaries with no C0 control characters (`[\\x00-\\x1f]`),
+  raising `ArgumentError` on violation to prevent shell injection through the
+  env-file mechanism. (DEL `\\x7f` and Unicode separators are left to
+  `shell_escape/1`, which renders every surviving byte inert.)
   """
   @spec build_env(opts()) :: %{optional(String.t()) => String.t()}
   def build_env(opts) do
@@ -291,13 +293,7 @@ defmodule CrowdControl.CLI do
         raise ArgumentError, "env value for #{key} must be a binary, got: #{inspect(value)}"
       end
 
-      if String.contains?(value, <<0>>) do
-        raise ArgumentError, "env value for #{key} contains a null byte"
-      end
-
-      if String.contains?(value, "\n") do
-        raise ArgumentError, "env value for #{key} contains a newline"
-      end
+      validate_no_control_chars!(value, "env value for #{key}")
     end)
   end
 end

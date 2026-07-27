@@ -7,6 +7,11 @@ defmodule CrowdControl do
 
   alias CrowdControl.Session
 
+  # Per-session start ceiling for `start_sessions/1`. Without a finite timeout,
+  # `on_timeout: :kill_task` is dead code and a wedged start blocks the stream
+  # forever. A killed start normalizes to `{:error, {:task_exit, _}}`.
+  @start_timeout 30_000
+
   @type opts :: keyword()
   @type session :: pid()
   @type result_message :: {:result, String.t(), map()}
@@ -59,7 +64,7 @@ defmodule CrowdControl do
       |> Task.async_stream(&start_session/1,
         max_concurrency: concurrency,
         on_timeout: :kill_task,
-        timeout: :infinity
+        timeout: @start_timeout
       )
       |> Enum.map(&normalize_task_result/1)
 
@@ -160,7 +165,8 @@ defmodule CrowdControl do
 
     with {:ok, session} <- start_session(opts) do
       Session.subscribe(session)
-      result = wait_for_result(session, Keyword.get(opts, :timeout, 60_000))
+      deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, 60_000)
+      result = wait_for_result(session, deadline)
 
       try do
         Session.stop(session)
@@ -187,7 +193,13 @@ defmodule CrowdControl do
     end
   end
 
-  defp wait_for_result(session, timeout) do
+  # `deadline` is an absolute `System.monotonic_time(:millisecond)` value. Each
+  # non-result message recomputes the remaining wait against it instead of
+  # restarting the full timeout window (which made the deadline unbounded under
+  # a steady stream of intermediate messages).
+  defp wait_for_result(session, deadline) do
+    wait = max(deadline - System.monotonic_time(:millisecond), 0)
+
     receive do
       {:crowd_control, ^session, {:result, _, _} = msg} ->
         msg
@@ -195,10 +207,18 @@ defmodule CrowdControl do
       {:crowd_control, ^session, {:exit, _status}} ->
         {:error, :session_exited}
 
+      {:crowd_control, ^session, {:error, _reason} = err} ->
+        err
+
+      # The session hit its own expiry; from the caller's perspective that is a
+      # timeout (in `run/2` the session and wait deadlines share `:timeout`).
+      {:crowd_control, ^session, {:timeout, _}} ->
+        {:error, :timeout}
+
       {:crowd_control, ^session, _other} ->
-        wait_for_result(session, timeout)
+        wait_for_result(session, deadline)
     after
-      timeout -> {:error, :timeout}
+      wait -> {:error, :timeout}
     end
   end
 end

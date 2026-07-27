@@ -293,7 +293,9 @@ defmodule CrowdControl.CLITest do
     end
 
     test "rejects env value with newline" do
-      assert_raise ArgumentError, ~r/newline/, fn ->
+      # Newline is an ASCII control char; env values now reject the whole
+      # 0x00–0x1f range via the shared validator (consistent with path opts).
+      assert_raise ArgumentError, ~r/control char/, fn ->
         CLI.build_env(env: %{"K" => "v\nbad"})
       end
     end
