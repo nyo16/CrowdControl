@@ -55,7 +55,7 @@ defmodule CrowdControl.MixProject do
 
   defp package do
     [
-      licenses: ["MIT"],
+      licenses: ["Apache-2.0"],
       maintainers: ["Niko Maroulis"],
       links: %{
         "GitHub" => @source_url,

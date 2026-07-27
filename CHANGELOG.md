@@ -4,6 +4,11 @@
 
 ### Breaking
 
+- **Licensed under Apache-2.0**, replacing MIT. Apache-2.0 adds an express
+  patent grant and an attribution/NOTICE requirement. Nothing was ever
+  published under MIT — the package has not been released to Hex — so no
+  existing user's terms change.
+
 - **`CrowdControl.Session` state no longer exposes `:proc`, `:env_dir`, or
   `:env_file`.** Everything transport-specific moved behind the new
   `CrowdControl.Backend` behaviour. The public API (`start_link/1`,
@@ -111,7 +116,7 @@
   `error_handling.exs`, `bounded_pool.exs`).
 - `SECURITY.md` with private disclosure address and supported-version policy.
 - `CONTRIBUTING.md` with local dev workflow and security-sensitive checklist.
-- `LICENSE` (MIT).
+- `LICENSE` (Apache-2.0).
 - New tests: full `CrowdControl.Session` GenServer coverage, end-to-end
   orchestrator tests against a `test/support/fake_cli.sh` stand-in, security
   tests for shell escaping and env/path validation, and StreamData property

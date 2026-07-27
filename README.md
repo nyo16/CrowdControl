@@ -3,7 +3,7 @@
 [![CI](https://github.com/nikoma/crowd_control/actions/workflows/ci.yml/badge.svg)](https://github.com/nikoma/crowd_control/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/crowd_control.svg)](https://hex.pm/packages/crowd_control)
 [![HexDocs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/crowd_control)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/nyo16/CrowdControl/blob/master/LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/nyo16/CrowdControl/blob/master/LICENSE)
 
 Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Open Code](https://github.com/anthropics/open-code) CLI instances in parallel from Elixir.
 
@@ -1116,4 +1116,4 @@ See the [Docker](#docker) section for container hardening details (non-root user
 
 ## License
 
-MIT
+Apache License 2.0. See [LICENSE](https://github.com/nyo16/CrowdControl/blob/master/LICENSE).
