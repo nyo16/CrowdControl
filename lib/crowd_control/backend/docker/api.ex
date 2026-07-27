@@ -136,12 +136,16 @@ defmodule CrowdControl.Backend.Docker.API do
   # Matched via __struct__ rather than a struct pattern so this module still
   # compiles when the optional :req dependency is absent -- the module names are
   # plain atoms in a guard, which needs nothing loaded.
+  #
+  # There is deliberately no catch-all clause. `Req.request/1` is spec'd
+  # `{:ok, Req.Response.t()} | {:error, Exception.t()}`, so the second clause
+  # already covers every value that can reach here; a third would be dead code
+  # (dialyzer on OTP 27 flags it as pattern_match_cov, though OTP 29 does not).
   defp transport_reason(%{__struct__: struct, reason: reason})
        when struct in [Req.TransportError, Mint.TransportError],
        do: {:transport, reason}
 
-  defp transport_reason(%{__exception__: true} = e), do: {:exception, Exception.message(e)}
-  defp transport_reason(other), do: other
+  defp transport_reason(exception), do: {:exception, Exception.message(exception)}
 
   # Docker error bodies are `{"message": "..."}`. Keep them short: they end up
   # in crash reports and must never carry a large response payload -- or an
