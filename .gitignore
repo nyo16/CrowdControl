@@ -22,3 +22,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 crowd_control-*.tar
 
+# Local agent scratch: dependency inventories, changelog notes, review reports.
+/.claude/
+
