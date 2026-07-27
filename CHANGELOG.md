@@ -137,8 +137,8 @@
 - `CrowdControl.broadcast/2` catches `:exit` from dead session pids.
 - `CrowdControl.Session` is marked `restart: :temporary` so a failing CLI
   subprocess does not trigger `DynamicSupervisor` restart-intensity shutdown.
-- `CrowdControl.Application` validates `:max_sessions` is a positive integer
-  at boot, raising a clear `ArgumentError` otherwise.
+- `:max_sessions` is validated at application boot as a positive integer,
+  raising a clear `ArgumentError` otherwise.
 - `net_runner` bumped to `~> 1.2` (was `~> 1.0`).
 
 ### Fixed

@@ -2,7 +2,7 @@ defmodule CrowdControl.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/nikoma/crowd_control"
+  @source_url "https://github.com/nyo16/CrowdControl"
 
   def project do
     [
@@ -90,10 +90,11 @@ defmodule CrowdControl.MixProject do
           CrowdControl.Store.DETS,
           CrowdControl.Reaper
         ],
+        # CrowdControl.Application is deliberately absent: it is @moduledoc false,
+        # so listing it here groups a module that never renders.
         Internal: [
           CrowdControl.CLI,
           CrowdControl.Protocol,
-          CrowdControl.Application,
           CrowdControl.Backend.Shell,
           CrowdControl.Backend.Docker.API,
           CrowdControl.Backend.Docker.Demux
