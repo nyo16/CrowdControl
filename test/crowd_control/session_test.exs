@@ -75,6 +75,37 @@ defmodule CrowdControl.SessionTest do
     end
   end
 
+  describe "resource bounds" do
+    test "nil bounds fall back to defaults rather than disabling the guard" do
+      # Term ordering puts numbers below atoms, so a nil that reached the guard
+      # would make `byte_size(x) > nil` always false -- silently unbounded.
+      {:ok, pid} =
+        Session.start_link(
+          executable: TestHelpers.fake_cli_path(),
+          max_line_bytes: nil,
+          max_messages: nil,
+          timeout: 5_000
+        )
+
+      state = :sys.get_state(pid)
+      assert is_integer(state.max_line_bytes) and state.max_line_bytes > 0
+      assert is_integer(state.max_messages) and state.max_messages > 0
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a non-integer bound is rejected loudly" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{}, _}} =
+               Session.start_link(
+                 executable: TestHelpers.fake_cli_path(),
+                 max_messages: :unlimited,
+                 timeout: 5_000
+               )
+    end
+  end
+
   describe "send_prompt validation" do
     test "rejects non-binary prompt" do
       {:ok, pid} = start_fake_session()

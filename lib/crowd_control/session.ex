@@ -143,8 +143,8 @@ defmodule CrowdControl.Session do
         reader = spawn_link(fn -> reader_loop(proc, session_pid) end)
         timeout = Keyword.get(opts, :timeout, @default_timeout)
         max_prompt_size = Keyword.get(opts, :max_prompt_size)
-        max_line_bytes = Keyword.get(opts, :max_line_bytes, @default_max_line_bytes)
-        max_messages = max(Keyword.get(opts, :max_messages, @default_max_messages), 0)
+        max_line_bytes = bound_opt!(opts, :max_line_bytes, @default_max_line_bytes)
+        max_messages = bound_opt!(opts, :max_messages, @default_max_messages)
 
         state = %__MODULE__{
           proc: proc,
@@ -263,6 +263,26 @@ defmodule CrowdControl.Session do
   end
 
   # --- Private ---
+
+  # These two options are resource-exhaustion guards, and Erlang term ordering
+  # puts every number below every atom -- so `byte_size(x) > nil` is always
+  # false and `max(nil, 0)` is nil. Passing nil (the shape you get straight out
+  # of an unset `Application.get_env/2`) would therefore switch the guard OFF
+  # silently, which is the exact opposite of what the caller intended. Treat nil
+  # as "unset" and fall back to the default; reject anything else loudly.
+  defp bound_opt!(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      n when is_integer(n) and n >= 0 ->
+        n
+
+      nil ->
+        default
+
+      other ->
+        raise ArgumentError,
+              "#{inspect(key)} must be a non-negative integer or nil, got: #{inspect(other)}"
+    end
+  end
 
   defp validate_prompt(prompt, _max) when not is_binary(prompt), do: {:error, :invalid_prompt}
 

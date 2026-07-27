@@ -81,9 +81,13 @@ while IFS= read -r line; do
   fi
 
   if [ -n "${FAKE_CLI_ECHO_ENV:-}" ]; then
-    # Bash indirect expansion — read the env var named by FAKE_CLI_ECHO_ENV
-    # without `eval`, so a hostile var name/value can't be executed.
-    val="${!FAKE_CLI_ECHO_ENV}"
+    # Read the env var named by FAKE_CLI_ECHO_ENV without evaluating anything.
+    # NOT `${!FAKE_CLI_ECHO_ENV}`: bash evaluates array subscripts inside
+    # indirect expansion arithmetically, so a value like 'x[$(touch /tmp/pwned)]'
+    # -- which passes CrowdControl.CLI.validate_env!/1 -- executes. This script
+    # is the oracle that proves the escaping works, so it must not itself be
+    # bypassable. printenv performs a plain lookup.
+    val=$(printenv "$FAKE_CLI_ECHO_ENV" || true)
     val_escaped=$(json_escape "$val")
     printf '{"type":"result","subtype":"success","result":"%s=%s","total_cost_usd":0}\n' "$FAKE_CLI_ECHO_ENV" "$val_escaped"
   else

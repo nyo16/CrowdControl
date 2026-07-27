@@ -137,4 +137,58 @@ defmodule CrowdControl.SecurityTest do
       TestHelpers.stop_session(pid)
     end
   end
+
+  describe "secret redaction" do
+    test "a rejected env value is never echoed in the exception message" do
+      # build_env/1 runs inside Session.init/1, so anything in this message ends
+      # up in a GenServer crash report -- Logger, erl_crash.dump, Sentry.
+      # Reading a key from a file leaves a trailing newline, which is enough to
+      # reach this path.
+      secret = "sk-ant-SUPERSECRETVALUE-DO-NOT-LOG\n"
+
+      err = assert_raise ArgumentError, fn -> CLI.build_env(api_key: secret) end
+      message = Exception.message(err)
+
+      refute message =~ "SUPERSECRETVALUE",
+             "exception leaked the secret: #{message}"
+
+      assert message =~ "redacted"
+      assert message =~ "ANTHROPIC_API_KEY"
+    end
+
+    test "a rejected :env value is never echoed either" do
+      err =
+        assert_raise ArgumentError, fn ->
+          CLI.build_env(env: %{"TOKEN" => "tok-SUPERSECRETVALUE\0"})
+        end
+
+      refute Exception.message(err) =~ "SUPERSECRETVALUE"
+      assert Exception.message(err) =~ ~r/null byte/
+    end
+  end
+
+  describe "test oracle integrity" do
+    test "an env value cannot execute commands inside fake_cli.sh" do
+      # The oracle proves CrowdControl's escaping works, so it must not itself
+      # be bypassable. `${!VAR}` was: bash evaluates array subscripts inside
+      # indirect expansion arithmetically, so this value -- which passes
+      # validate_env!/1 -- used to run `touch`.
+      marker = Path.join(System.tmp_dir!(), "cc_injection_#{System.unique_integer([:positive])}")
+      refute File.exists?(marker)
+
+      {:ok, pid} =
+        Session.start_link(
+          executable: TestHelpers.fake_cli_path(),
+          env: %{"FAKE_CLI_ECHO_ENV" => "x[$(touch #{marker})]"},
+          timeout: 5_000
+        )
+
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "hi")
+      assert_receive {:crowd_control, ^pid, {:result, _, _}}, 5_000
+      TestHelpers.stop_session(pid)
+
+      refute File.exists?(marker), "fake_cli.sh evaluated an env value as code"
+    end
+  end
 end

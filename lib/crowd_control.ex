@@ -99,6 +99,12 @@ defmodule CrowdControl do
   Subscribes to each session and collects `{:result, _, _}` messages.
   Returns a list of `{session_pid, result_message}` tuples, or
   `{:timeout, partial_results}` if the deadline is reached first.
+
+  A session that broadcasts a terminal message instead of a result -- it
+  exited, expired, or hit `:line_too_large` -- is dropped from the wait set
+  rather than waited out, since it can never produce one. Such a session is
+  simply absent from the returned list, so the list can be shorter than
+  `sessions`.
   """
   @spec collect([session()], pos_integer()) ::
           [{session(), result_message()}] | {:timeout, [{session(), result_message()}]}
@@ -128,6 +134,13 @@ defmodule CrowdControl do
         else
           do_collect(remaining, results, deadline)
         end
+
+      # Terminal for this session: it can never produce a result now, so stop
+      # waiting on it instead of burning the whole deadline. wait_for_result/2
+      # already short-circuits on these; collect/2 did not, which left
+      # run_many/2 blocked for the full 60s on any session that errored.
+      {:crowd_control, pid, {terminal, _}} when terminal in [:exit, :error, :timeout] ->
+        do_collect(Map.delete(remaining, pid), results, deadline)
 
       {:crowd_control, _pid, _other} ->
         do_collect(remaining, results, deadline)

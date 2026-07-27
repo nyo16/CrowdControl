@@ -96,6 +96,30 @@ defmodule CrowdControlTest do
 
       CrowdControl.stop_all([pid])
     end
+
+    test "stops waiting on a session that expires instead of producing a result" do
+      # The session can never produce a result once it has expired, so collect/2
+      # must drop it rather than burn its own deadline -- the bug that left
+      # run_many/2 blocked for a full 60s.
+      {:ok, pid} =
+        CrowdControl.start_session(
+          executable: TestHelpers.fake_cli_path(),
+          env: %{"FAKE_CLI_SLEEP" => "5"},
+          timeout: 1_000,
+          prompt: "slow"
+        )
+
+      started = System.monotonic_time(:millisecond)
+      result = CrowdControl.collect([pid], 10_000)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert result == []
+
+      assert elapsed < 5_000,
+             "collect/2 waited #{elapsed}ms; it should stop when the session expires (~1000ms)"
+
+      CrowdControl.stop_all([pid])
+    end
   end
 
   describe "run/2" do

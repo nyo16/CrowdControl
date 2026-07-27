@@ -10,6 +10,9 @@ defmodule CrowdControl.CLI do
 
   @env_key_re ~r/\A[A-Za-z_][A-Za-z0-9_]*\z/
 
+  # C0 control bytes, as single-byte patterns for :binary.match/2.
+  @control_bytes for b <- 0..31, do: <<b>>
+
   @base_args [
     "--print",
     "--output-format",
@@ -233,16 +236,23 @@ defmodule CrowdControl.CLI do
   def sanitize_path!(other),
     do: raise(ArgumentError, "path must be a binary, got: #{inspect(other)}")
 
+  # NEVER echo the offending value. This runs on env values -- including
+  # :api_key -- and build_env/1 is called from Session.init/1, so a raise here
+  # becomes a GenServer crash report that carries the secret into Logger,
+  # erl_crash.dump, and any error-reporting handler. Reading a key out of a file
+  # leaves a trailing newline, which is enough to trigger it. Report the
+  # position and size instead; that is sufficient to debug the input.
   defp validate_no_control_chars!(value, label) when is_binary(value) do
-    cond do
-      String.contains?(value, <<0>>) ->
-        raise ArgumentError, "#{label} contains a null byte: #{inspect(value)}"
-
-      Regex.match?(~r/[\x00-\x1f]/, value) ->
-        raise ArgumentError, "#{label} contains control characters: #{inspect(value)}"
-
-      true ->
+    case :binary.match(value, @control_bytes) do
+      :nomatch ->
         :ok
+
+      {pos, _} ->
+        kind = if :binary.at(value, pos) == 0, do: "a null byte", else: "a control character"
+
+        raise ArgumentError,
+              "#{label} contains #{kind} at byte #{pos} " <>
+                "(#{byte_size(value)} bytes); value redacted"
     end
   end
 
