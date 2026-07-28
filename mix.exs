@@ -82,7 +82,8 @@ defmodule CrowdControl.MixProject do
         Backends: [
           CrowdControl.Backend,
           CrowdControl.Backend.Local,
-          CrowdControl.Backend.Docker
+          CrowdControl.Backend.Docker,
+          CrowdControl.Backend.Kubernetes
         ],
         Persistence: [
           CrowdControl.Store,
@@ -96,8 +97,10 @@ defmodule CrowdControl.MixProject do
           CrowdControl.CLI,
           CrowdControl.Protocol,
           CrowdControl.Backend.Shell,
+          CrowdControl.Backend.Credentials,
           CrowdControl.Backend.Docker.API,
-          CrowdControl.Backend.Docker.Demux
+          CrowdControl.Backend.Docker.Demux,
+          CrowdControl.Backend.Kubernetes.API
         ]
       ]
     ]
@@ -110,6 +113,14 @@ defmodule CrowdControl.MixProject do
       # one-runtime-dep footprint is worth protecting. Unconditional in :test so
       # CI always exercises the Docker backend's pure paths.
       {:req, "~> 0.5", optional: true},
+      # Optional for the same reason as :req, and behind the same trade: only
+      # CrowdControl.Backend.Kubernetes needs it. kubereq requires `req ~> 0.6.0`,
+      # and mix.lock already pins req 0.6.3, mint 1.9.3 and yaml_elixir 2.12.2, so
+      # the only genuinely new transitive deps are :mint_web_socket and :pluggable.
+      # The :req constraint below stays at "~> 0.5" on purpose — Docker works on
+      # 0.5 and bumping it would break Docker-only users for no reason; kubereq's
+      # own constraint does the lifting for anyone who opts in.
+      {:kubereq, "~> 0.4.4", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:stream_data, "~> 1.1", only: :test},
       {:excoveralls, "~> 0.18", only: :test},

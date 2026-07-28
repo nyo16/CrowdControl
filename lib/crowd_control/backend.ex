@@ -8,11 +8,13 @@ defmodule CrowdControl.Backend do
   message accumulation, subscriber broadcast, timeouts — and never learns which
   backend it is talking to.
 
-  Two implementations ship:
+  Three implementations ship:
 
     * `CrowdControl.Backend.Local` — a local subprocess via `NetRunner`. The
       default, and behaviourally identical to pre-behaviour CrowdControl.
     * `CrowdControl.Backend.Docker` — a container over the Docker Engine API.
+    * `CrowdControl.Backend.Kubernetes` — a Pod over the Kubernetes API server,
+      session-facing semantics indistinguishable from the Docker one.
 
   ## Selecting a backend
 

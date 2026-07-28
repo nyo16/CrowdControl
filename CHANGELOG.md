@@ -40,6 +40,36 @@
   identical to previous releases) and `CrowdControl.Backend.Docker` (one
   container per session). Select with
   `backend: {CrowdControl.Backend.Docker, image: "..."}`.
+- **`CrowdControl.Backend.Kubernetes`.** A third backend: one Pod per session,
+  driven over the API server, `reattachable?/0 == true`. Session-facing
+  semantics are indistinguishable from the Docker backend — same FIFO/tee I/O,
+  same byte-exact resume, same reader contract. Three differences are not
+  cosmetic:
+
+  - The exec API has no `env` parameter, so the environment is written as a
+    file over the exec **stdin** channel at `umask 077` and sourced *and
+    unlinked* before the CLI starts. Secrets never enter argv, never enter the
+    Pod object, and therefore never reach etcd — unlike `env` in the Pod spec
+    or a `Secret` plus `envFrom`, both of which were rejected for that reason.
+  - **Hardening regression: there is no `PidsLimit` equivalent.** Docker's
+    512-PID fork-bomb ceiling has no Pod-spec counterpart; `podPidsLimit` is
+    node-level kubelet configuration. A fork bomb in model output is unbounded
+    from anything this library can set, and an operator who needs the ceiling
+    must configure it on the nodes.
+  - **Hardening regression: `noexec,nosuid` is not expressible.** Docker's
+    `Tmpfs` takes mount flags; `emptyDir` mounts `rw,relatime` with no flag
+    control, so `/tmp` can stage and execute a binary even under
+    `readOnlyRootFilesystem: true`.
+
+  Against those, two requirements with no Docker analogue are applied and are
+  not overridable: `automountServiceAccountToken: false` (a projected API token
+  inside a sandbox running untrusted model-driven code is a sandbox escape) and
+  `enableServiceLinks: false`. `:network` is explicit (`:deny_all` |
+  `{:policy, name}` | `:unrestricted`) because a Pod always has cluster
+  networking, and `:deny_all` runs a one-time per-cluster probe proving the
+  policy is actually enforced — a NetworkPolicy object is accepted by every API
+  server but only enforced by a CNI with a policy controller. See
+  [SECURITY.md](SECURITY.md#the-kubernetes-backend).
 - **Session durability and reattach.** `CrowdControl.Store` behaviour with
   `Store.ETS` (default, in-memory) and `Store.DETS` (disk-backed, survives a
   node restart). Neither adds a dependency.
@@ -56,11 +86,18 @@
 - `:owner_id` config, stamped onto every sandbox as a label, so multiple nodes
   cannot reap each other's sandboxes.
 - Optional `:req` dependency, needed only for `CrowdControl.Backend.Docker`.
+- Optional `:kubereq` dependency, needed only for
+  `CrowdControl.Backend.Kubernetes`.
 - Sandbox hardening options on `CrowdControl.Backend.Docker`: `:cap_drop`,
   `:security_opt`, `:pids_limit` (all applied by default), plus opt-in `:user`,
   `:readonly_rootfs`, and `:tmpfs`.
 - `c:CrowdControl.Backend.scrub/1` optional callback, so a backend can strip
   credentials from its handle before persistence.
+- `CrowdControl.Backend.Credentials` — the proxy-credential rewriting that
+  removes (rather than overrides) a real `:api_key`, extracted from
+  `CrowdControl.Backend.Docker` so both remote backends share one
+  implementation. `Docker.apply_credentials/2` now delegates to it and its
+  public behaviour is unchanged.
 
 ### Security
 
