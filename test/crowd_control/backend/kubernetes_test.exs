@@ -148,7 +148,13 @@ defmodule CrowdControl.Backend.KubernetesTest do
       assert sh(ro, "test -p /var/run/cc.fifo && echo FIFO_OK") =~ "FIFO_OK"
       assert sh(ro, "test -d /var/log/cc && echo DIR_OK") =~ "DIR_OK"
 
-      assert sh(ro, "touch /etc/nope 2>/dev/null && echo WRITABLE || echo READONLY") =~ "READONLY",
+      # Bound to a name rather than inlined: at 99 columns the inline form sits
+      # right on the formatter's wrap threshold, and Elixir 1.18 and 1.20
+      # disagree about which side of it the line falls on. CI checks formatting
+      # with one of them and contributors may run the other.
+      rootfs = sh(ro, "touch /etc/nope 2>/dev/null && echo WRITABLE || echo READONLY")
+
+      assert rootfs =~ "READONLY",
              "the root filesystem stayed writable under readonly_rootfs: true"
 
       Kubernetes.destroy(ro)
