@@ -34,6 +34,9 @@ In scope:
 - Sandbox escape or credential disclosure through
   `CrowdControl.Backend.Docker` (container config, exec command
   construction, environment injection).
+- Sandbox escape or credential disclosure through
+  `CrowdControl.Backend.Kubernetes` (Pod manifest hardening, exec command
+  construction, the env-file stdin channel, NetworkPolicy posture).
 - `CrowdControl.Reaper` destroying sandboxes it does not own.
 - Information disclosure through temp files, logs, or process listings.
 - Denial of service against the session supervisor or individual sessions
@@ -101,6 +104,98 @@ both the session opts and the backend handle before anything is written.
 Nothing about reattaching needs them — the sandbox already holds the
 environment it was started with. `Store.DETS` additionally restricts its file
 to `0600` inside a `0700` directory.
+
+### The Kubernetes backend
+
+`CrowdControl.Backend.Kubernetes` runs a CLI inside a Pod over the API server.
+Session-facing semantics match the Docker backend exactly. The security posture
+does not, and the differences below cut in both directions.
+
+**Secrets travel the exec stdin channel.** The Kubernetes exec API has no `env`
+parameter — `pods/exec` has no such field and `kubectl exec` has no `--env` —
+so the `Env` array that keeps provider keys out of argv under Docker has no
+counterpart here. Instead the environment is written as a file over the exec
+**stdin** channel (websocket channel 0) at `umask 077`, and the launch command
+sources *and unlinks* it before the CLI starts. The bytes never enter argv,
+never enter the Pod object, and therefore never reach etcd; the file is gone by
+the time anything in the sandbox could read it back.
+
+The two obvious alternatives were rejected, both for widening the blast radius
+rather than narrowing it:
+
+- **`env` in the Pod spec.** Puts the provider key in the Pod object — in etcd,
+  readable by anyone with `get pods`, printed by `kubectl describe`. That trades
+  an in-sandbox `ps` leak for a cluster-wide one.
+- **A `Secret` plus `envFrom`.** Same etcd residency, plus `secrets` RBAC on the
+  backend's identity, plus a second object left behind on a crash.
+
+**REGRESSION: there is no `PidsLimit` equivalent.** Docker sets a 512-PID
+fork-bomb ceiling deliberately and separately from `Memory`, because neither
+`:memory` nor `:cpus` bounds process count. Kubernetes has no Pod-spec field for
+it: `podPidsLimit` is node-level kubelet configuration. A fork bomb in model
+output is therefore **unbounded from anything this library can set**. An
+operator who needs the ceiling must set `podPidsLimit` in the kubelet
+configuration of every node these sandboxes can land on, and until that is done
+should assume a sandbox can exhaust the node's PID space for every other Pod
+scheduled beside it.
+
+**REGRESSION: `noexec,nosuid` is not expressible.** Docker's `Tmpfs` option
+takes mount flags. `emptyDir` does not — it mounts `rw,relatime` with no flag
+control — so `/tmp` can stage and execute a binary even under
+`readOnlyRootFilesystem: true`. Verified on `v1.34.8+orb1`. Enabling
+`:readonly_rootfs` is still worth it, because it stops writes everywhere except
+the mounted volumes, but it does not make those volumes non-executable and must
+not be read as if it did.
+
+**Two settings are requirements, not options.** Neither has a Docker analogue,
+and neither is overridable:
+
+- `automountServiceAccountToken: false`. A default Pod is handed roughly 1.1 KB
+  of projected bearer token on disk, plus a reachable API server, inside a
+  sandbox running untrusted model-driven code. That is a sandbox escape, not a
+  hardening nicety.
+- `enableServiceLinks: false`. Otherwise every Service's host and port in the
+  namespace is injected into the sandbox's environment: free cluster
+  reconnaissance for anything running in there.
+
+**Network posture is never inferred.** There is no `NetworkMode: "none"` here —
+a Pod always has cluster networking — so `:network` is explicit and mandatory in
+the one case where guessing removes the boundary:
+
+- `:deny_all` — the backend creates a deny-all `Ingress`+`Egress` NetworkPolicy
+  selecting the Pod, before the Pod exists, and deletes it with the Pod.
+- `{:policy, name}` — a policy the caller manages. It is fetched and
+  provisioning fails if it is absent, rather than trusting the claim.
+- `:unrestricted` — the Pod reaches the cluster and the internet.
+
+Omitting `:network` while setting `:proxy_url` or `:api_url` returns
+`{:error, {:k8s, :network_policy_required}}`, for the same reason the Docker
+backend refuses to infer `bridge`.
+
+**A declaration is not enforcement.** Any API server accepts a NetworkPolicy
+object; only a CNI with a policy controller acts on one. OrbStack accepts them
+and enforces nothing — verified: a deny-all policy selecting the probe Pod, and
+egress still succeeded. A backend that created the object and reported the
+sandbox contained would be describing a boundary that does not exist. So
+`:deny_all` runs a one-time per-cluster enforcement probe (a throwaway Pod under
+a deny-all policy attempting egress) and refuses to provision with
+`{:error, {:k8s, :network_policy_not_enforced}}` when egress succeeds. Set
+`network_probe: false` only if you already know your CNI enforces.
+
+**RBAC the backend needs.** In its `:namespace`, and nothing wider:
+
+    pods            create, get, list, delete
+    pods/exec       create
+    networkpolicies create, get, delete     # only under network: :deny_all
+
+**One place this backend is stricter than Docker.** The sandbox container keeps
+`capabilities.drop: ["ALL"]` with *nothing* added. Creating the FIFO needs
+`CAP_MKNOD`, once, at startup — under `drop: ["ALL"]` plus
+`allowPrivilegeEscalation: false` together, `mkfifo` fails with a misleading
+`ENOENT`. Adding `MKNOD` to the sandbox would fix it in one line and is what
+Docker's own default capability set does, but it would hold the capability for
+the life of the session in exchange for one syscall. A short-lived init
+container holds it for milliseconds and exits instead.
 
 ## Egress proxy contract
 

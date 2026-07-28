@@ -334,37 +334,12 @@ defmodule CrowdControl.Backend.Docker do
   @doc """
   Rewrite the CLI's credential env for egress-proxy mode.
 
-  When `:proxy_url` is set, the container is pointed at the proxy and given a
-  per-session token instead of the real key:
-
-      ANTHROPIC_BASE_URL = proxy_url
-      ANTHROPIC_API_KEY  = session_token
-
-  **The real `:api_key` is removed, not merely overridden.** Leaving it in place
-  would hand the sandbox a working provider credential even though every request
-  is nominally routed through the proxy — which defeats the entire point of
-  running the sandbox on an isolated network. That silent double-injection is
-  the failure mode this function exists to prevent, and `docker_test.exs`
-  asserts it directly.
-
-  With no `:proxy_url`, the env is returned untouched.
+  Delegates to `CrowdControl.Backend.Credentials.apply_credentials/2`, which
+  `Backend.Kubernetes` shares — see that module for why there is exactly one
+  implementation. Kept here as part of the Docker backend's public API.
   """
   @spec apply_credentials(map(), keyword()) :: map()
-  def apply_credentials(env, config) do
-    case config[:proxy_url] do
-      nil ->
-        env
-
-      proxy_url ->
-        env
-        |> Map.delete("ANTHROPIC_API_KEY")
-        |> Map.put("ANTHROPIC_BASE_URL", proxy_url)
-        |> put_token(config[:session_token])
-    end
-  end
-
-  defp put_token(env, nil), do: env
-  defp put_token(env, token), do: Map.put(env, "ANTHROPIC_API_KEY", token)
+  defdelegate apply_credentials(env, config), to: CrowdControl.Backend.Credentials
 
   defp create_exec(handle, cmd, opts) do
     attach = Keyword.get(opts, :attach, true)

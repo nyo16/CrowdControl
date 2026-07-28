@@ -13,8 +13,13 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   MIX_ENV: test
-  ELIXIR_VERSION: "1.18.3"
-  OTP_VERSION: "27.2"
+  # The toolchain every single-version job uses -- format, credo, dialyzer,
+  # docs, coverage, publish -- and the one the setup job's build cache is keyed
+  # to. Kept in step with what the maintainers actually run locally: the
+  # formatter's output changes between Elixir minors, so a CI formatter older
+  # than the local one fails `--check-formatted` on correctly-formatted code.
+  ELIXIR_VERSION: "1.20.2"
+  OTP_VERSION: "29.0.3"
 
 jobs:
   # Fetches and compiles dependencies exactly once. Every Linux job below
@@ -138,13 +143,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Current toolchain, and the only leg whose build cache the setup job
+          # can supply -- see the shared-cache note below.
+          - os: ubuntu-latest
+            elixir: "1.20.2"
+            otp: "29.0.3"
+            shared-cache: true
+          # Lower bound. mix.exs declares `elixir: "~> 1.18"`, and an untested
+          # lower bound is a claim, not a guarantee. Drop this leg only together
+          # with that constraint.
           - os: ubuntu-latest
             elixir: "1.18.3"
             otp: "27.2"
-            shared-cache: true
+            shared-cache: false
           - os: macos-latest
-            elixir: "1.18.3"
-            otp: "27.2"
+            elixir: "1.20.2"
+            otp: "29.0.3"
             shared-cache: false
     steps:
       - uses: actions/checkout@v6
@@ -154,8 +168,10 @@ jobs:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
 
-      # The setup job runs on Linux, so its cache key does not apply to the
-      # macOS leg; that leg keeps its own cache and builds deps itself.
+      # `_build` artifacts are toolchain-specific, so the setup job's cache is
+      # only valid for a leg on the SAME OS and the same Elixir/OTP pair it ran
+      # with. Every other leg -- macOS, and the 1.18 lower bound -- keeps its
+      # own cache and builds deps itself.
       - uses: actions/cache/restore@v5
         if: matrix.shared-cache
         with:
@@ -175,7 +191,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-test-
 
-      - name: Build deps (macOS)
+      - name: Build deps (legs without the shared cache)
         if: ${{ !matrix.shared-cache }}
         run: |
           mix deps.get

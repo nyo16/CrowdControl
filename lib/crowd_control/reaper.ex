@@ -30,13 +30,21 @@ defmodule CrowdControl.Reaper do
 
   ## Two-node safety
 
-  Every sandbox carries a `crowd_control.owner` label
-  (`CrowdControl.Store.owner_id/0`, default `to_string(node())`), `list_live/1`
-  filters on it, and the reaper only ever destroys sandboxes matching its own
-  owner. Two nodes with independent stores therefore cannot reap each other's
-  work. Callers sharing one backend across nodes with a *shared* store (Ecto,
-  Redis) should set a single shared `:owner_id` — the label is the coordination
-  primitive either way.
+  Every sandbox carries its owner (`CrowdControl.Store.owner_id/0`, default
+  `to_string(node())`), `list_live/1` filters on it, and the reaper only ever
+  destroys sandboxes matching its own owner. Two nodes with independent stores
+  therefore cannot reap each other's work. Callers sharing one backend across
+  nodes with a *shared* store (Ecto, Redis) should set a single shared
+  `:owner_id` — the owner stamp is the coordination primitive either way.
+
+  `CrowdControl.Backend.Docker` stamps it as a `crowd_control.owner` label.
+  `CrowdControl.Backend.Kubernetes` cannot: `nonode@nohost` is not a legal
+  Kubernetes label value, and sanitizing it is lossy in exactly the way that
+  lets one node's reaper destroy another's Pods. So it puts the raw owner in a
+  `crowd_control.owner` *annotation*, whose values are unconstrained, and a
+  sha256 prefix in a `crowd_control.owner_hash` label for the server-side
+  selector. `owned_by?/3`'s local re-check still compares raw owners exactly,
+  because `list_live/1` rebuilds each handle's owner from the annotation.
 
   A `:reap_grace_ms` window (default 60s), measured against the
   `crowd_control.created_at` label, protects a container created by a node that

@@ -699,12 +699,16 @@ CrowdControl.start_session(
 )
 ```
 
-Implement `CrowdControl.Backend` (nine callbacks) for anything else.
+Implement `CrowdControl.Backend` for anything else: nine required callbacks,
+plus `scrub/1` — optional in the behaviour, but mandatory in practice for any
+backend whose handle carries credentials — and `push_workspace/2` /
+`pull_artifacts/2`, which no backend ships yet.
 
 | Backend | Sandbox | Survives a VM restart? |
 |---------|---------|------------------------|
 | `Backend.Local` (default) | local subprocess | no — dies with the VM |
 | `Backend.Docker` | container | yes — reattachable |
+| `Backend.Kubernetes` | Pod, over the API server | yes — reattachable |
 
 ### Docker backend
 
@@ -762,6 +766,109 @@ CrowdControl injects everything else it needs at provision time.
 explicit `:network_mode` returns `{:error, {:docker, :network_mode_required}}`
 rather than silently picking `bridge`, which would give the sandbox general
 outbound access and make an egress proxy advisory rather than enforcing.
+
+### Kubernetes backend
+
+Requires the optional `:kubereq` dependency:
+
+```elixir
+{:kubereq, "~> 0.4.4"}
+```
+
+One Pod per session, driven over the API server. Session-facing behaviour is
+indistinguishable from the Docker backend — same FIFO/tee I/O, same byte-exact
+resume, same reader contract, `reattachable?/0 == true`.
+
+```elixir
+CrowdControl.start_session(
+  backend: {CrowdControl.Backend.Kubernetes,
+    image: "my-cli:latest",
+    namespace: "sandboxes",
+    network: :deny_all,
+    cpus: 1.5,
+    memory: 512 * 1024 * 1024
+  },
+  prompt: "Refactor lib/foo.ex"
+)
+```
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `:image` | — | **Required.** Needs the CLI and `sh` on `PATH` |
+| `:namespace` | kubeconfig context's namespace, else `"default"` | |
+| `:kubeconfig` | `Kubereq.Kubeconfig.Default` | A `%Kubereq.Kubeconfig{}`, a pipeline module, or `{module, opts}`. The default covers both a developer's `~/.kube/config` and an in-cluster ServiceAccount |
+| `:network` | — | `:deny_all` \| `{:policy, name}` \| `:unrestricted`. **Required** when `:proxy_url`/`:api_url` is set — see below |
+| `:network_probe` | `true` | `false` skips the `:deny_all` enforcement probe, for callers who already know their CNI enforces |
+| `:network_probe_image` | `"busybox:1.36"` | Image the enforcement probe runs |
+| `:network_probe_url` | `"http://1.1.1.1"` | Egress target the probe attempts |
+| `:cpus` | unset | Fractional, e.g. `1.5` |
+| `:memory` | unset | Bytes |
+| `:tee_path` | `/var/log/cc/out.jsonl` | Where output is recorded |
+| `:fifo_path` | `/var/run/cc.fifo` | Where prompts are written |
+| `:env_path` | `/var/run/cc.env` | Env file, written over exec stdin and unlinked before the CLI starts |
+| `:timeout` | 30s | HTTP receive timeout |
+| `:exec_timeout` | 15s | Wall-clock bound on every short exec |
+| `:provision_timeout` | 120s | Wall-clock bound on reaching `Running` |
+| `:pod_poll_ms` | 60s | Reader's idle Pod-liveness poll |
+| `:max_inflight_bytes` | 4 MiB | Reader backpressure watermark |
+| `:proxy_url`, `:session_token` | unset | Egress proxy — see [SECURITY.md](SECURITY.md#egress-proxy-contract) |
+
+Hardening:
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `:cap_drop` | `["ALL"]` | On by default; the sandbox container adds nothing back |
+| `:allow_privilege_escalation` | `false` | On by default |
+| `:run_as_user` / `:run_as_group` | image default | Opt-in; also sets `runAsNonRoot` (for a non-zero uid) and the Pod's `fsGroup`, so the `emptyDir` volumes are writable |
+| `:readonly_rootfs` | `false` | Opt-in. The fifo and tee directories are `emptyDir` volumes either way (the init container has to hand the FIFO across), so this is a pure toggle: it makes them in-memory (`medium: Memory`) and adds `/tmp` |
+| `:volume_sizes` | `64Mi`, `/var/run` `8Mi` | `sizeLimit` per mount path; used only under `:readonly_rootfs` |
+
+`automountServiceAccountToken: false` and `enableServiceLinks: false` are not
+options — a projected API token inside a sandbox running untrusted model-driven
+code is a sandbox escape, and service links map the namespace into its
+environment. Two Docker hardening measures also have **no Kubernetes
+equivalent**: there is no `PidsLimit` (`podPidsLimit` is node-level kubelet
+config) and `emptyDir` cannot be mounted `noexec,nosuid`. Both are stated in
+[SECURITY.md](SECURITY.md#the-kubernetes-backend) rather than silently dropped;
+read that before running this against untrusted output.
+
+**Network posture is never inferred.** A Pod always has cluster networking —
+there is no `NetworkMode: "none"` here — so `:network` is explicit, and omitting
+it while setting `:proxy_url`/`:api_url` returns
+`{:error, {:k8s, :network_policy_required}}`. Under `:deny_all` the backend also
+*proves* the policy is enforced with a one-time per-cluster probe, and refuses
+to provision with `{:error, {:k8s, :network_policy_not_enforced}}` if it is not.
+Any API server accepts a NetworkPolicy object; only a CNI with a policy
+controller acts on one.
+
+RBAC the backend's identity needs, in `:namespace`:
+
+    pods            create, get, list, delete
+    pods/exec       create
+    networkpolicies create, get, delete     # only under network: :deny_all
+
+Reaper configuration is the same shape as Docker's — the backend entry needs
+whatever `list_live/1` requires to reach the cluster and rebuild handles:
+
+```elixir
+config :crowd_control,
+  store: {CrowdControl.Store.DETS, path: "/var/lib/crowd_control/sessions.dets"},
+  owner_id: "worker-1",
+
+  reaper: [
+    backends: [
+      {CrowdControl.Backend.Kubernetes,
+       image: "my-cli:latest", namespace: "sandboxes", network: :deny_all}
+    ],
+    sweep_interval: :timer.minutes(5),
+    reap_grace_ms: 60_000
+  ]
+```
+
+Pods are selected by a `crowd_control.owner_hash` label rather than the raw
+owner, because `nonode@nohost` is not a legal label value. The raw owner rides
+along in a `crowd_control.owner` annotation, so the reaper's local ownership
+re-check still compares exact strings.
 
 ### Durability and reattach
 
