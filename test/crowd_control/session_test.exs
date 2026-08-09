@@ -1,6 +1,8 @@
 defmodule CrowdControl.SessionTest do
   use ExUnit.Case, async: true
 
+  alias CrowdControl.Agent.Omp
+  alias CrowdControl.Backend.Local
   alias CrowdControl.{Session, TestHelpers}
 
   describe "init/1" do
@@ -140,6 +142,23 @@ defmodule CrowdControl.SessionTest do
       {:ok, pid} = start_fake_session(max_prompt_size: 5)
       Session.subscribe(pid)
       assert :ok = Session.send_prompt(pid, "abcde")
+      TestHelpers.stop_session(pid)
+    end
+
+    test "rejects a prompt once the subprocess has exited" do
+      # The `:completed when not state.exited` gate is what makes multi-turn
+      # possible; `exited` is the half that keeps it honest. Without it the
+      # session happily writes prompts into a dead process forever.
+      Process.flag(:trap_exit, true)
+      {:ok, pid} = start_fake_session()
+      Session.subscribe(pid)
+
+      # fake_cli.sh exits after one prompt cycle, like `claude --print`.
+      :ok = Session.send_prompt(pid, "hi")
+      assert_receive {:crowd_control, ^pid, {:exit, _}}, 5_000
+
+      assert {:error, :completed} = Session.send_prompt(pid, "again")
+
       TestHelpers.stop_session(pid)
     end
   end
@@ -299,6 +318,41 @@ defmodule CrowdControl.SessionTest do
     end
   end
 
+  describe "agent handshake" do
+    alias CrowdControl.Backend.Mock
+
+    test "a failed handshake write stops the session instead of hanging it" do
+      # For omp the handshake IS the get_state that produces the session id.
+      # Swallowing the write error left the session sitting in :starting until
+      # its inactivity timeout, with no id and no way to know why.
+      Process.flag(:trap_exit, true)
+      ctl = start_supervised!({Mock, events: [], fail: %{write: :pipe_closed}})
+
+      assert {:error, {:handshake_failed, :pipe_closed}} =
+               Session.start_link(
+                 backend: {Mock, mock: ctl},
+                 agent: :omp,
+                 executable: "omp",
+                 timeout: 5_000
+               )
+    end
+
+    test "a Claude session has no handshake to fail" do
+      # ClaudeCode.init_frames/1 returns [], so a broken pipe cannot be
+      # misreported as a handshake failure before the CLI has said anything.
+      ctl = start_supervised!({Mock, events: [], fail: %{write: :pipe_closed}})
+
+      assert {:ok, pid} =
+               Session.start_link(
+                 backend: {Mock, mock: ctl},
+                 executable: "claude",
+                 timeout: 5_000
+               )
+
+      TestHelpers.stop_session(pid)
+    end
+  end
+
   describe "reattach mode" do
     alias CrowdControl.Backend.Mock
     alias CrowdControl.Store
@@ -406,16 +460,114 @@ defmodule CrowdControl.SessionTest do
 
       Session.subscribe(pid)
 
-      assert_receive {:crowd_control, ^pid, {:system_init, init}}, 5_000
-      assert init["session_id"] == "omp-fixed-id"
-      assert init["tools"] == ["read", "write"]
-
-      assert_receive {:crowd_control, ^pid, {:assistant, _}}, 5_000
       assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
       assert result["result"] == "done:hi"
       assert result["total_cost_usd"] == 0.75
 
+      # Ordering is asserted from the accumulated history, not from
+      # assert_receive: assert_receive is a *selective* receive, so it matches
+      # a system_init that arrived after the result just as happily. The whole
+      # point of write_init_frames/1 is that the handshake precedes the prompt.
+      messages = Session.get_messages(pid)
+      init_at = Enum.find_index(messages, &match?({:system_init, _}, &1))
+      turn_at = Enum.find_index(messages, &match?({:assistant, _}, &1))
+      result_at = Enum.find_index(messages, &match?({:result, _, _}, &1))
+
+      assert init_at < turn_at and turn_at < result_at,
+             "expected handshake before the turn, got #{inspect(Enum.map(messages, &elem(&1, 0)))}"
+
+      assert {:system_init, init} = Enum.at(messages, init_at)
+      assert init["session_id"] == "omp-fixed-id"
+      assert init["tools"] == ["read", "write"]
+
       assert Session.get_session_id(pid) == "omp-fixed-id"
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a type-drifted get_state payload does not kill the session" do
+      # decode_line/1 runs inside handle_cast/2. A frame whose "model" is a
+      # string and whose "dumpTools" is a string -- the shape a future omp
+      # schema change would produce -- used to raise FunctionClauseError and
+      # take the whole session down with it.
+      Process.flag(:trap_exit, true)
+
+      {:ok, pid} =
+        Session.start_link(
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          env: %{"FAKE_OMP_BAD_STATE" => "1"},
+          timeout: 10_000,
+          prompt: "hi"
+        )
+
+      Session.subscribe(pid)
+
+      assert_receive {:crowd_control, ^pid, {:result, "success", %{"result" => "done:hi"}}}, 5_000
+      refute_received {:EXIT, ^pid, _}
+      assert Process.alive?(pid)
+      # The unusable session id is clamped, not propagated as a map.
+      assert Session.get_session_id(pid) == nil
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a local-only prompt completes instead of hanging until the deadline" do
+      # A slash command omp answers itself emits no agent_end; its only
+      # completion signal is agentInvoked: false.
+      {:ok, pid} =
+        Session.start_link(
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          env: %{"FAKE_OMP_LOCAL_ONLY" => "1"},
+          timeout: 10_000,
+          prompt: "/tools"
+        )
+
+      Session.subscribe(pid)
+
+      assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
+      assert result["local_only"] == true
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a non-terminal agent_end does not end the turn early" do
+      {:ok, pid} =
+        Session.start_link(
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          env: %{"FAKE_OMP_NONTERMINAL" => "1"},
+          timeout: 10_000,
+          prompt: "hi"
+        )
+
+      Session.subscribe(pid)
+
+      # The isTerminal:false frame is broadcast as a stream event; only the
+      # terminal one that follows completes the turn.
+      assert_receive {:crowd_control, ^pid, {:result, "success", %{"result" => "done:hi"}}}, 5_000
+
+      assert Enum.count(Session.get_messages(pid), &match?({:result, _, _}, &1)) == 1
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "an option set inside a backend config tuple reaches the framing callbacks" do
+      # build_command/1 has always seen the backend-merged opts; encode_prompt/3
+      # saw the raw ones, so :streaming_behavior written here was silently inert.
+      {:ok, pid} =
+        Session.start_link(
+          backend: {Local, streaming_behavior: "steer"},
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          timeout: 10_000
+        )
+
+      assert :sys.get_state(pid).agent_opts[:streaming_behavior] == "steer"
+
+      assert %{"streamingBehavior" => "steer"} =
+               JSON.decode!(Omp.encode_prompt("x", 0, :sys.get_state(pid).agent_opts))
 
       TestHelpers.stop_session(pid)
     end
@@ -440,6 +592,26 @@ defmodule CrowdControl.SessionTest do
 
       assert_receive {:crowd_control, ^pid, {:result, "success", %{"result" => "done:two"}}},
                      5_000
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "each result is stamped with the turn it belongs to" do
+      {:ok, pid} =
+        Session.start_link(
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          timeout: 10_000,
+          prompt: "one"
+        )
+
+      Session.subscribe(pid)
+      assert_receive {:crowd_control, ^pid, {:result, _, %{"turn" => 1}}}, 5_000
+      assert Session.current_turn(pid) == 1
+
+      :ok = Session.send_prompt(pid, "two")
+      assert Session.current_turn(pid) == 2
+      assert_receive {:crowd_control, ^pid, {:result, _, %{"turn" => 2}}}, 5_000
 
       TestHelpers.stop_session(pid)
     end

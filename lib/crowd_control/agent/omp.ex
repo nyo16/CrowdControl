@@ -16,6 +16,7 @@ defmodule CrowdControl.Agent.Omp do
   | `message_update` | `{:stream_event, map}` |
   | `agent_end` with `isTerminal != false` | `{:result, "success", map}` |
   | `agent_end` with `isTerminal == false` | `{:stream_event, map}` |
+  | `prompt` response or `prompt_result` with `agentInvoked: false` | `{:result, "success", map}` with `"local_only" => true` |
   | failed `prompt` response | `{:result, "error_prompt_failed", map}` |
   | anything else | `{:unknown, map}` |
 
@@ -25,6 +26,13 @@ defmodule CrowdControl.Agent.Omp do
   `agent_end` is turned into a Claude-shaped result map: `"result"` is the final
   assistant text, `"total_cost_usd"` the summed cost of the turn's assistant
   messages, plus `"usage"`, `"num_turns"`, `"duration_ms"` and `"stop_reason"`.
+
+  A prompt that omp resolves locally — a slash command such as `/tools` — never
+  produces an `agent_end`. It completes with `agentInvoked: false`, which maps
+  to a result carrying `"local_only" => true` and an empty `"result"`: the
+  command's own text arrives separately as `command_output` frames, and
+  `decode_line/1` is stateless. Without this a local-only prompt would hang a
+  collector until its deadline.
 
   The adapter stays on protocol v1 (no `negotiate_protocol`), so an oversized
   logical frame is truncated by omp rather than chunked; `:max_line_bytes` on
@@ -105,6 +113,11 @@ defmodule CrowdControl.Agent.Omp do
   @spec build_command(keyword()) :: {String.t(), [String.t()], CrowdControl.Agent.env()}
   def build_command(opts \\ []) do
     reject_unsupported!(opts)
+    # Validated here, not just at prompt time: encode_prompt/3 runs inside
+    # Session.init/1 and handle_call/3, where a raise takes down the session
+    # and the caller. Every other option fails at build time with a plain
+    # {:error, _} from start_link/1, and this one should too.
+    _ = streaming_behavior!(opts)
 
     executable = Keyword.get(opts, :executable, "omp")
     {executable, @base_args ++ optional_args(opts), CLI.build_env(opts)}
@@ -146,11 +159,23 @@ defmodule CrowdControl.Agent.Omp do
 
   # --- argv ---
 
+  # `false` counts as absent. `bare: false` and `strict_mcp_config: false`
+  # request omp's *default* behaviour, so dropping them changes nothing --
+  # and raising would break the shared option list that drives a mixed
+  # claude+omp fan-out. Only a value that would actually change behaviour
+  # is worth refusing.
   defp reject_unsupported!(opts) do
     Enum.each(@unsupported, fn {key, hint} ->
-      if not is_nil(opts[key]) do
-        raise ArgumentError,
-              "#{inspect(key)} is a Claude Code option with no omp equivalent (#{hint})"
+      case opts[key] do
+        nil ->
+          :ok
+
+        false ->
+          :ok
+
+        _ ->
+          raise ArgumentError,
+                "#{inspect(key)} is a Claude Code option with no omp equivalent (#{hint})"
       end
     end)
   end
@@ -327,6 +352,26 @@ defmodule CrowdControl.Agent.Omp do
      }}
   end
 
+  # A local-only prompt -- a slash command that omp resolves without a model
+  # turn -- emits NO agent_end. Its completion signal is `agentInvoked: false`,
+  # either inline on the prompt response or on a later prompt_result frame.
+  # Without these two clauses `CrowdControl.run("/tools", agent: :omp)` blocks
+  # until its own deadline for a command that finished in milliseconds.
+  #
+  # An *absent* `data` is deliberately not treated as completion: omp v17.2.12
+  # omits it entirely for ordinary agent-invoking prompts, whose real terminal
+  # frame is agent_end.
+  defp classify(%{
+         "type" => "response",
+         "command" => "prompt",
+         "success" => true,
+         "data" => %{"agentInvoked" => false}
+       }),
+       do: {:result, "success", local_result()}
+
+  defp classify(%{"type" => "prompt_result", "agentInvoked" => false}),
+    do: {:result, "success", local_result()}
+
   defp classify(%{"type" => "agent_end", "isTerminal" => false} = map), do: {:stream_event, map}
   defp classify(%{"type" => "agent_end"} = map), do: {:result, "success", result(map)}
 
@@ -339,21 +384,62 @@ defmodule CrowdControl.Agent.Omp do
   defp classify(%{"type" => "message_update"} = map), do: {:stream_event, map}
   defp classify(map), do: {:unknown, map}
 
+  defp local_result do
+    %{
+      "type" => "result",
+      "subtype" => "success",
+      "agent" => "omp",
+      "is_error" => false,
+      # The command's own text was already delivered as command_output frames;
+      # decode_line/1 is stateless and cannot accumulate them into this map.
+      "result" => "",
+      "local_only" => true,
+      "total_cost_usd" => 0.0,
+      "num_turns" => 0
+    }
+  end
+
+  # Every read here is shape-guarded. decode_line/1 runs inside
+  # Session.handle_cast/2, so a raise on an unexpected value type does not
+  # return an error -- it kills the session, skips the {:error, _} broadcast,
+  # and dumps state (including :api_key) into the crash report. `|| %{}`
+  # defends against nil and nothing else; omp changing "model" from an object
+  # to a bare id string would be enough.
   defp system_init(data) do
-    model = Map.get(data, "model") || %{}
+    model = submap(data, "model")
 
     %{
       "type" => "system",
       "subtype" => "init",
       "agent" => "omp",
-      "session_id" => data["sessionId"],
-      "session_file" => data["sessionFile"],
+      "session_id" => string_or_nil(data["sessionId"]),
+      "session_file" => string_or_nil(data["sessionFile"]),
       "model" => model["id"],
       "provider" => model["provider"],
       "context_window" => model["contextWindow"],
       "thinking_level" => data["thinkingLevel"],
-      "tools" => data |> Map.get("dumpTools", []) |> Enum.map(& &1["name"])
+      "tools" => tool_names(data)
     }
+  end
+
+  defp submap(data, key) do
+    case Map.get(data, key) do
+      value when is_map(value) -> value
+      _ -> %{}
+    end
+  end
+
+  # `session_id` is spec'd String.t() | nil all the way through Session and
+  # Store, and is fed back to omp as `--resume`. Clamp it at the boundary
+  # rather than letting a map travel three modules and raise in to_string/1.
+  defp string_or_nil(value) when is_binary(value), do: value
+  defp string_or_nil(_value), do: nil
+
+  defp tool_names(data) do
+    case Map.get(data, "dumpTools") do
+      tools when is_list(tools) -> for tool <- tools, is_map(tool), do: tool["name"]
+      _ -> []
+    end
   end
 
   defp result(%{"messages" => messages}) when is_list(messages) do

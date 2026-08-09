@@ -371,8 +371,9 @@ CrowdControl.start_session(
   # reject prompts larger than this with {:error, :prompt_too_large}
   max_prompt_size: 1_000_000,
   # a single newline-free output line over this kills the subprocess and
-  # broadcasts {:error, :line_too_large} instead of buffering unbounded
-  max_line_bytes: 1_000_000,
+  # broadcasts {:error, :line_too_large} instead of buffering unbounded.
+  # Defaults to 1 MiB, matching the maxFrameBytes omp advertises.
+  max_line_bytes: 1_048_576,
   # cap on messages kept for get_messages/1 (oldest dropped past the cap);
   # live subscribers still receive every message
   max_messages: 10_000
@@ -1045,6 +1046,7 @@ options — see `CrowdControl.Agent.Omp`.
 | `get_status(session)` | Returns `:starting`, `:running`, `:completed`, or `:error` |
 | `get_session_id(session)` | CLI-assigned session ID |
 | `get_messages(session)` | All accumulated messages |
+| `current_turn(session)` | Turn currently in flight (prompts written so far) |
 | `stop(session)` | Graceful shutdown |
 
 ### Message types
@@ -1057,7 +1059,7 @@ the same shape for every agent adapter:
 | `{:system_init, map}` | CLI initialized, contains `session_id`, `tools`, `model` |
 | `{:assistant, map}` | Assistant response with `content` blocks |
 | `{:user, map}` | Tool execution results |
-| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` (Claude Code), `"error_prompt_failed"` (omp) |
+| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` (Claude Code), `"error_prompt_failed"` (omp). `map["turn"]` is the 1-based turn the result belongs to; omp adds `map["local_only"]` for slash commands answered without a model call |
 | `{:stream_event, map}` | Partial message delta (Claude Code: requires `:include_partial_messages`; omp: always) |
 | `{:timeout, :session_expired}` | Session timed out (requires `:timeout` option) |
 | `{:exit, status}` | CLI process exited with OS status code |

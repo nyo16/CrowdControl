@@ -112,10 +112,33 @@ defmodule CrowdControl.Agent.OmpTest do
       end
     end
 
+    test "an explicitly-false Claude-only flag is treated as absent, not rejected" do
+      # `bare: false` asks for omp's default behaviour, so dropping it changes
+      # nothing. Raising would break a shared option list driving a mixed
+      # claude+omp fan-out.
+      assert ["--mode", "rpc"] = args(bare: false, strict_mcp_config: false)
+    end
+
+    test "an invalid :streaming_behavior is rejected at build time, not at prompt time" do
+      # encode_prompt/3 runs inside Session.init/1 and handle_call/3, where a
+      # raise takes down the session and the caller instead of returning an error.
+      assert_raise ArgumentError, ~r/:streaming_behavior must be one of/, fn ->
+        args(streaming_behavior: "nope")
+      end
+    end
+
     test "builds env through the shared, validated builder" do
       {_exec, _args, env} = Omp.build_command(api_key: "sk-test", env: %{"FOO" => "bar"})
 
       assert env == %{"ANTHROPIC_API_KEY" => "sk-test", "FOO" => "bar"}
+    end
+
+    test "the api key never reaches argv" do
+      # Backends splice argv into an `sh -c` string; a key there is readable
+      # via `ps`. The env-file / exec-Env path is the only sanctioned channel.
+      {_exec, args, _env} = Omp.build_command(api_key: "sk-test-SECRET")
+
+      refute Enum.any?(args, &String.contains?(&1, "sk-test-SECRET"))
     end
   end
 
@@ -280,6 +303,87 @@ defmodule CrowdControl.Agent.OmpTest do
                decode(%{"type" => "ready", "protocolVersion" => 1})
 
       assert {:unknown, _} = decode(%{"type" => "turn_start"})
+    end
+
+    test "a local-only prompt completes the turn instead of waiting for agent_end" do
+      # A slash command omp resolves itself emits NO agent_end. Without this
+      # clause a collector blocks until its own deadline for a command that
+      # finished in milliseconds.
+      assert {:result, "success", result} =
+               decode(%{
+                 "type" => "response",
+                 "command" => "prompt",
+                 "success" => true,
+                 "data" => %{"agentInvoked" => false}
+               })
+
+      assert result["local_only"] == true
+      assert result["is_error"] == false
+      assert result["result"] == ""
+
+      assert {:result, "success", %{"local_only" => true}} =
+               decode(%{
+                 "type" => "prompt_result",
+                 "id" => "cc-prompt-0",
+                 "agentInvoked" => false
+               })
+    end
+
+    test "an agent-invoking prompt ack is not mistaken for completion" do
+      # omp v17.2.12 omits `data` entirely for prompts that do invoke the
+      # agent; treating a missing/true agentInvoked as terminal would end the
+      # turn before the model had answered.
+      assert {:unknown, _} =
+               decode(%{"type" => "response", "command" => "prompt", "success" => true})
+
+      assert {:unknown, _} =
+               decode(%{
+                 "type" => "response",
+                 "command" => "prompt",
+                 "success" => true,
+                 "data" => %{"agentInvoked" => true}
+               })
+    end
+
+    # decode_line/1 runs inside Session.handle_cast/2: a raise here does not
+    # return an error, it kills the session. These are the shapes a schema
+    # change in omp would produce, and every one of them used to raise.
+    test "a type-drifted get_state payload decodes instead of raising" do
+      for {label, data} <- [
+            {"model as string", %{"model" => "claude-opus-5"}},
+            {"model as list", %{"model" => ["a"]}},
+            {"model as number", %{"model" => 7}},
+            {"dumpTools as string", %{"dumpTools" => "read,write"}},
+            {"dumpTools as object", %{"dumpTools" => %{"a" => 1}}},
+            {"dumpTools entries not maps", %{"dumpTools" => ["read", 2, nil]}},
+            {"everything hostile", %{"model" => "x", "dumpTools" => "y", "sessionId" => %{}}}
+          ] do
+        assert {:system_init, init} =
+                 decode(%{
+                   "type" => "response",
+                   "command" => "get_state",
+                   "success" => true,
+                   "data" => data
+                 }),
+               "#{label} should decode"
+
+        assert is_list(init["tools"]), "#{label} should still yield a tool list"
+      end
+    end
+
+    test "a non-string sessionId is clamped to nil rather than propagated" do
+      # session_id is spec'd String.t() | nil through Session and Store, and is
+      # fed back to omp as --resume, where a map raises in to_string/1.
+      assert {:system_init, init} =
+               decode(%{
+                 "type" => "response",
+                 "command" => "get_state",
+                 "success" => true,
+                 "data" => %{"sessionId" => %{"nested" => 1}, "sessionFile" => 42}
+               })
+
+      assert init["session_id"] == nil
+      assert init["session_file"] == nil
     end
 
     test "never raises on garbage" do

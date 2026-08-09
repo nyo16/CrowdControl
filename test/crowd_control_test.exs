@@ -77,6 +77,30 @@ defmodule CrowdControlTest do
       CrowdControl.stop_all(pids)
     end
 
+    test "waits for the in-flight turn instead of replaying the previous one" do
+      # collect/2 subscribes, and subscribe/1 replays history. A session that
+      # already finished turn 1 would otherwise hand that stale result straight
+      # back the instant collect/2 attached for turn 2.
+      {:ok, pid} =
+        CrowdControl.Session.start_link(
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          timeout: 10_000,
+          prompt: "turn one"
+        )
+
+      CrowdControl.Session.subscribe(pid)
+      assert_receive {:crowd_control, ^pid, {:result, _, %{"result" => "done:turn one"}}}, 5_000
+
+      :ok = CrowdControl.Session.send_prompt(pid, "turn two")
+
+      assert [{^pid, {:result, _, result}}] = CrowdControl.collect([pid], 5_000)
+      assert result["result"] == "done:turn two"
+      assert result["turn"] == 2
+
+      TestHelpers.stop_session(pid)
+    end
+
     test "returns results for sessions that finished before collect subscribed" do
       # run_many/2 sends the prompt from init/1 and only subscribes afterwards,
       # so a fast CLI can emit its result before collect/2 attaches. The result

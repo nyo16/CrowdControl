@@ -56,7 +56,10 @@ defmodule CrowdControl.Session do
   alias CrowdControl.{Agent, Backend, Protocol, Store}
 
   @default_timeout 300_000
-  @default_max_line_bytes 1_000_000
+  # 1 MiB, matching the `maxFrameBytes` omp advertises in its ready frame. A
+  # lower cap would destroy a session over a frame omp considers legal, which
+  # is a worse failure than the 48 KiB of extra headroom this costs.
+  @default_max_line_bytes 1_048_576
   @default_max_messages 10_000
 
   defstruct [
@@ -68,6 +71,11 @@ defmodule CrowdControl.Session do
     :store_key,
     :owner,
     :opts,
+    # The backend-merged option list. `:opts` is what gets persisted and
+    # re-derived from; `:agent_opts` is what the adapter's framing callbacks
+    # see, so an option written inside a `{Backend, config}` tuple reaches
+    # them the same way it already reaches build_command/1.
+    :agent_opts,
     :timeout,
     :timeout_ref,
     :max_prompt_size,
@@ -119,6 +127,19 @@ defmodule CrowdControl.Session do
   @spec get_session_id(session()) :: String.t() | nil
   def get_session_id(session) do
     GenServer.call(session, :get_session_id)
+  end
+
+  @doc """
+  The turn currently in flight, i.e. the number of prompts written so far.
+
+  Every `{:result, _, map}` carries the same number under `"turn"`. A collector
+  that reads this *before* subscribing can tell a replayed result from an
+  earlier turn apart from the one it is waiting for; see `CrowdControl.collect/2`.
+  Returns `0` for a session that has not been prompted.
+  """
+  @spec current_turn(session()) :: non_neg_integer()
+  def current_turn(session) do
+    GenServer.call(session, :current_turn)
   end
 
   @doc "Subscribe the calling process to receive session messages."
@@ -181,6 +202,9 @@ defmodule CrowdControl.Session do
         session_id: record.session_id,
         persist?: Backend.reattachable?(backend),
         opts: record.opts,
+        # The merged list is not persisted, so the record's opts are the best
+        # available. Backend config is re-applied by the reattach path itself.
+        agent_opts: record.opts,
         timeout: Keyword.get(record.opts, :timeout, @default_timeout),
         max_prompt_size: Keyword.get(record.opts, :max_prompt_size),
         max_line_bytes: bound_opt!(record.opts, :max_line_bytes, @default_max_line_bytes),
@@ -250,6 +274,7 @@ defmodule CrowdControl.Session do
           owner: owner,
           persist?: Backend.reattachable?(backend),
           opts: opts,
+          agent_opts: backend_opts,
           timeout: Keyword.get(opts, :timeout, @default_timeout),
           max_prompt_size: Keyword.get(opts, :max_prompt_size),
           max_line_bytes: max_line_bytes,
@@ -257,20 +282,31 @@ defmodule CrowdControl.Session do
           max_messages: max_messages
         }
 
-        state = state |> schedule_timeout() |> write_init_frames()
-
-        state =
-          case Keyword.get(opts, :prompt) do
-            nil -> state
-            prompt -> do_send_prompt(state, prompt)
-          end
-
-        {:ok, state}
+        start_turn(schedule_timeout(state), opts)
 
       {:error, reason} ->
         {:stop, reason}
     end
   end
+
+  # A failed handshake is fatal, not something to discover via the inactivity
+  # timeout minutes later: for omp it means no `get_state`, so no session id
+  # and no `{:system_init, _}` ever.
+  defp start_turn(state, opts) do
+    case write_init_frames(state) do
+      :ok ->
+        {:ok, maybe_prompt(state, Keyword.get(opts, :prompt))}
+
+      {:error, reason} ->
+        # init/1 returning :stop does not run terminate/2, so the sandbox has
+        # to be torn down here or a billed container leaks.
+        destroy_backend(state)
+        {:stop, reason}
+    end
+  end
+
+  defp maybe_prompt(state, nil), do: state
+  defp maybe_prompt(state, prompt), do: do_send_prompt(state, prompt)
 
   # provision -> exec -> start_reader, tearing down whatever was created if a
   # later step fails. Without the destroy/1 on the error paths, a backend that
@@ -331,6 +367,10 @@ defmodule CrowdControl.Session do
 
   def handle_call(:get_status, _from, state) do
     {:reply, state.status, state}
+  end
+
+  def handle_call(:current_turn, _from, state) do
+    {:reply, state.prompt_seq, state}
   end
 
   def handle_call(:get_session_id, _from, state) do
@@ -461,16 +501,18 @@ defmodule CrowdControl.Session do
   # which is what makes a session id observable). Written before the initial
   # prompt so the id lands first, exactly where Claude Code emits its own
   # system/init.
+  @spec write_init_frames(t()) :: :ok | {:error, term()}
   defp write_init_frames(state) do
-    Enum.each(state.agent.init_frames(state.opts), fn frame ->
-      state.backend.write(state.backend_state, frame)
+    Enum.reduce_while(state.agent.init_frames(state.agent_opts), :ok, fn frame, :ok ->
+      case state.backend.write(state.backend_state, frame) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:handshake_failed, reason}}}
+      end
     end)
-
-    state
   end
 
   defp do_send_prompt(state, prompt) do
-    encoded = state.agent.encode_prompt(prompt, state.prompt_seq, state.opts)
+    encoded = state.agent.encode_prompt(prompt, state.prompt_seq, state.agent_opts)
     _ = state.backend.write(state.backend_state, encoded)
     %{state | prompt_seq: state.prompt_seq + 1}
   end
@@ -569,7 +611,12 @@ defmodule CrowdControl.Session do
     state
   end
 
-  defp handle_message(state, {:result, _subtype, _map} = msg) do
+  # Every result carries the turn it belongs to. `subscribe/1` replays history,
+  # so without this a collector attaching during turn 2 matches turn 1's
+  # replayed result and returns stale data instantly. `prompt_seq` is the
+  # number of prompts written, which is exactly the turn number.
+  defp handle_message(state, {:result, subtype, map}) do
+    msg = {:result, subtype, Map.put(map, "turn", state.prompt_seq)}
     state = accumulate(%{state | status: :completed}, msg)
     broadcast(state, msg)
     state

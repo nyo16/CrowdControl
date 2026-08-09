@@ -11,6 +11,12 @@
 #   FAKE_OMP_SESSION_ID=<id>   override the reported session id
 #   FAKE_OMP_PROMPT_FAIL=1     reject prompts with success:false
 #   FAKE_OMP_NONTERMINAL=1     emit a non-terminal agent_end before the real one
+#   FAKE_OMP_BAD_STATE=1       reply to get_state with a type-drifted payload
+#                              ("model" a string, "dumpTools" a string). Models
+#                              a future omp whose schema moved; decode must not
+#                              raise, because it runs inside handle_cast/2.
+#   FAKE_OMP_LOCAL_ONLY=1      answer prompts the way a local-only slash command
+#                              does: agentInvoked:false and NO agent_end.
 #
 # Content extraction is the same deliberately crude sed as fake_cli.sh: it does
 # not handle embedded quotes or backslashes in a prompt, so tests must not
@@ -32,8 +38,12 @@ while IFS= read -r line; do
 
   case "$type" in
     get_state)
-      printf '{"id":"%s","type":"response","command":"get_state","success":true,"data":{"sessionId":"%s","sessionFile":"/tmp/%s.jsonl","model":{"id":"fake-model","provider":"fake","contextWindow":1000},"thinkingLevel":"off","dumpTools":[{"name":"read"},{"name":"write"}]}}\n' \
-        "$id" "$SESSION_ID" "$SESSION_ID"
+      if [ "${FAKE_OMP_BAD_STATE:-}" = "1" ]; then
+        printf '{"id":"%s","type":"response","command":"get_state","success":true,"data":{"sessionId":{"nested":1},"model":"fake-model","dumpTools":"read,write"}}\n' "$id"
+      else
+        printf '{"id":"%s","type":"response","command":"get_state","success":true,"data":{"sessionId":"%s","sessionFile":"/tmp/%s.jsonl","model":{"id":"fake-model","provider":"fake","contextWindow":1000},"thinkingLevel":"off","dumpTools":[{"name":"read"},{"name":"write"}]}}\n' \
+          "$id" "$SESSION_ID" "$SESSION_ID"
+      fi
       ;;
 
     prompt)
@@ -42,6 +52,12 @@ while IFS= read -r line; do
       if [ "${FAKE_OMP_PROMPT_FAIL:-}" = "1" ]; then
         printf '{"id":"%s","type":"response","command":"prompt","success":false,"error":"rejected: %s","code":"session_busy"}\n' \
           "$id" "$message"
+        continue
+      fi
+
+      if [ "${FAKE_OMP_LOCAL_ONLY:-}" = "1" ]; then
+        printf '{"type":"command_output","output":"tool listing for %s"}\n' "$message"
+        printf '{"id":"%s","type":"response","command":"prompt","success":true,"data":{"agentInvoked":false}}\n' "$id"
         continue
       fi
 

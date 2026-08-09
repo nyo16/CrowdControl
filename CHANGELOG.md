@@ -57,6 +57,12 @@
   (`CrowdControl.Agent.ClaudeCode`, `CrowdControl.Agent.Omp`, or your own
   module). `CrowdControl.CLI` and `CrowdControl.Protocol` are unchanged and
   remain the Claude Code implementation.
+- **Results carry the turn they belong to.** Every `{:result, _, map}` now
+  includes `map["turn"]`, and `CrowdControl.Session.current_turn/1` reports the
+  turn in flight. `CrowdControl.collect/2` reads it before subscribing and
+  ignores results from earlier turns — without that, `subscribe/1`'s history
+  replay handed a collector the *previous* turn's result the instant it
+  attached, which multi-turn sessions made reachable.
 - **Pluggable sandbox backends.** `CrowdControl.Backend` behaviour, with
   `CrowdControl.Backend.Local` (the default; a local subprocess, behaviourally
   identical to previous releases) and `CrowdControl.Backend.Docker` (one
@@ -129,6 +135,33 @@
   afterwards, so the old `{:error, :completed}` made multi-turn conversations
   impossible. A prompt is now accepted while the subprocess is alive and moves
   the session back to `:running`; only an exited subprocess is terminal.
+- **A local-only omp prompt no longer hangs the collector.** A slash command
+  omp answers itself (`/tools`) emits no `agent_end`; its only completion
+  signal is `agentInvoked: false`, on the prompt response or a later
+  `prompt_result`. Both are now terminal, producing
+  `{:result, "success", %{"local_only" => true}}`. Previously
+  `CrowdControl.run("/tools", agent: :omp)` blocked for its full deadline.
+- **A type-drifted omp frame no longer kills the session.** `decode_line/1`
+  runs inside `handle_cast/2`, so a `get_state` payload whose `"model"` was a
+  string rather than an object raised `FunctionClauseError` and took the
+  session down. Every field read is now shape-guarded, and `"sessionId"` is
+  clamped to a binary before it reaches `Session` and `Store`, both of which
+  spec it as `String.t() | nil`.
+- **A failed handshake write stops the session instead of wedging it.**
+  `Session.init/1` now returns `{:error, {:handshake_failed, reason}}` and
+  tears down the sandbox, rather than leaving an omp session in `:starting`
+  with no session id until its inactivity timeout.
+- **Options set inside a `{Backend, config}` tuple reach the agent's framing
+  callbacks.** `build_command/1` always saw the merged list; `init_frames/1`
+  and `encode_prompt/3` saw the raw one, so `:streaming_behavior` written
+  there was silently inert.
+- **An explicitly-`false` Claude-Code-only option no longer raises for omp.**
+  `bare: false` and `strict_mcp_config: false` request default behaviour, so
+  dropping them changes nothing; raising broke shared option lists in a mixed
+  fan-out.
+- **An invalid `:streaming_behavior` is rejected by `build_command/1`.** It
+  used to surface only when a prompt was encoded — inside `Session.init/1` or
+  `handle_call/3` — killing the session and the calling process.
 
 ### Security
 
