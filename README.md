@@ -274,12 +274,60 @@ lifecycle, and `remove_provider_dir/1` to delete it.
 
 > **`PI_CODING_AGENT_DIR` relocates more than `models.yml`.** It moves the whole
 > `~/.omp/agent` base for that session — `config.yml`, the auth store, saved
-> sessions — so a custom-provider session does not see your global omp settings
-> or stored logins. That is usually what you want for an isolated endpoint, but
-> it does mean `:custom_provider` and your normal Anthropic credentials do not
-> mix within one session. `~/.omp` itself (skills, plugins) is unaffected.
-> For the Docker and Kubernetes backends the directory must exist *inside* the
-> sandbox: mount your own and pass `:agent_dir`.
+> sessions — so a custom-provider session starts with none of your global omp
+> settings and none of your stored logins. Usually what you want for an isolated
+> endpoint; add `inherit_auth: true` when you want the logins back (see
+> [Authentication](#authentication)). `~/.omp` itself (skills, plugins) is
+> unaffected. For the Docker and Kubernetes backends the directory must exist
+> *inside* the sandbox: mount your own and pass `:agent_dir`.
+
+### Tuning prefill against a self-hosted endpoint
+
+A coding agent sends its whole system prompt and tool schema on every turn. On a
+hosted provider that is absorbed by prompt caching and priced at a discount; on
+your own GPU it is prefill you pay for in latency.
+
+Both CLIs default to a large prompt, and both can be trimmed. Measured against
+one vLLM box (`deepseek-v4-flash`), three runs per row, prompt tokens and
+request count read from vLLM's own `/metrics`:
+
+| Configuration | Prompt tokens | Requests/turn | Wall time |
+|---|---|---|---|
+| `agent: :claude`, default | 28,631 | 1 | ~2.0s |
+| `agent: :claude` + `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | **23,850** (−17%) | 1 | ~1.7s |
+| `agent: :omp`, default | 20,641 | 1, **sometimes 2** | 1.8–2.6s |
+| `agent: :omp` + `no_extensions: true` | 20,641 | **1** | ~1.2s |
+| `agent: :omp` + `no_extensions`, `no_skills`, `no_rules` | **17,072** (−17%) | 1 | ~1.2s |
+
+```elixir
+# omp, trimmed
+CrowdControl.run("…", agent: :omp,
+  custom_provider: [base_url: "http://10.0.0.5:8000/v1"],
+  model: "vllm/…",
+  no_extensions: true, no_skills: true, no_rules: true)
+
+# Claude Code, trimmed
+CrowdControl.run("…", api_url: "http://10.0.0.5:8000", auth_token: key,
+  model: "…", env: %{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" => "1"})
+```
+
+Two things worth knowing before you go hunting further:
+
+- **Prefix caching is not the problem.** Both agents sat at a **99% vLLM
+  prefix-cache hit rate** out of the box, across separate sessions. Nothing in
+  either CLI's default configuration defeats it.
+- **`DISABLE_PROMPT_CACHING=1` does nothing here.** It controls the Anthropic
+  `cache_control` breakpoints in the request body; vLLM ignores those and does
+  its own automatic, content-addressed prefix caching. Measured identical
+  (99.2%, 28,631 tokens) with and without it.
+
+The omp "sometimes 2 requests" row is the one real trap: a discovered extension
+fires a second full-size (~20k token) call on some turns, roughly doubling
+prefill. `no_extensions: true` removes it and makes latency stable.
+
+`no_skills`/`no_rules`/`no_extensions` trade capability for prefill — drop them
+if a session actually needs those. Numbers are from one model on one box; re-measure
+with `curl $BASE/metrics | grep prefix_cache` on yours.
 
 ### Working with project directories
 
