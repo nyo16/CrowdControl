@@ -433,8 +433,9 @@ exhaust the host. All limits are per-session options with safe defaults:
 
 ```elixir
 CrowdControl.start_session(
-  # inactivity ceiling; on expiry the session broadcasts
-  # {:timeout, :session_expired} and stops (reset on each prompt)
+  # ceiling on a single TURN. Armed at start, re-armed by send_prompt/2 --
+  # not by output, so a turn that streams for longer is still killed
+  # mid-flight. Size it against the slowest turn, not the conversation.
   timeout: 300_000,
   # reject prompts larger than this with {:error, :prompt_too_large}
   max_prompt_size: 1_000_000,
@@ -1347,14 +1348,14 @@ When the limit is reached, `start_session/1` returns `{:error, :max_sessions_rea
 Sessions can be configured with an automatic timeout to prevent runaway processes:
 
 ```elixir
-# Session expires after 5 minutes of inactivity
+# A turn gets 5 minutes to finish
 CrowdControl.run("Analyze this code",
   timeout: 300_000,
   add_dir: "/workspace"
 )
 ```
 
-The timer resets on each `send_prompt` call. On expiry, subscribers receive `{:timeout, :session_expired}` and the session shuts down.
+The timer is armed at start and re-armed by each `send_prompt/2` call — it is **not** refreshed by output, so a single turn that streams for longer than the timeout is killed mid-flight. Size it against the slowest turn you expect rather than the length of the conversation; long autonomous tasks against a self-hosted model routinely need more than the default. On expiry, subscribers receive `{:timeout, :session_expired}` and the session shuts down.
 
 ### Input validation
 

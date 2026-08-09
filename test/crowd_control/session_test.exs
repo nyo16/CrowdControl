@@ -207,6 +207,29 @@ defmodule CrowdControl.SessionTest do
 
       assert_receive {:crowd_control, ^pid, {:timeout, :session_expired}}, 2_000
     end
+
+    test "a steadily streaming turn still expires -- the timer is not refreshed by output" do
+      # :timeout is a per-turn deadline, not an idle timer: schedule_timeout/1
+      # runs on init and send_prompt/2 and nowhere else. This pins the
+      # documented semantics, because "inactivity ceiling" reads like output
+      # would keep the session alive -- it does not, and a long autonomous turn
+      # against a slow model is exactly where that bites.
+      Process.flag(:trap_exit, true)
+
+      {:ok, pid} =
+        start_fake_session(
+          timeout: 300,
+          # 100 assistant messages, 50ms apart: ~5s of uninterrupted output,
+          # far longer than the 300ms deadline, and never a result.
+          env: %{"FAKE_CLI_STREAM_NORESULT" => "100"}
+        )
+
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "stream")
+
+      assert_receive {:crowd_control, ^pid, {:assistant, _}}, 2_000
+      assert_receive {:crowd_control, ^pid, {:timeout, :session_expired}}, 3_000
+    end
   end
 
   describe "non-JSON output" do

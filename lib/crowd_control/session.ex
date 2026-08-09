@@ -26,14 +26,18 @@ defmodule CrowdControl.Session do
       `{module, config}` tuple whose config is merged into these opts. Defaults
       to `CrowdControl.Backend.Local`.
     * `:prompt` - initial prompt sent once the CLI starts (optional)
-    * `:timeout` - inactivity ceiling in ms before the session self-expires and
-      broadcasts `{:timeout, :session_expired}`; reset on each `send_prompt/2`.
-      Use `:infinity` or `nil` to disable. Defaults to `300_000`.
+    * `:timeout` - ceiling in ms on a single **turn**, after which the session
+      self-expires and broadcasts `{:timeout, :session_expired}`. The timer is
+      armed at start and re-armed by `send_prompt/2` — **not** by output, so a
+      turn that streams for longer than this is still killed mid-flight. Size it
+      against the slowest turn you expect, not the length of the conversation;
+      long autonomous tasks against a self-hosted model routinely need more than
+      the default. Use `:infinity` or `nil` to disable. Defaults to `300_000`.
     * `:max_prompt_size` - reject prompts whose byte size exceeds this with
       `{:error, :prompt_too_large}` (optional; unbounded when unset)
     * `:max_line_bytes` - cap for a single newline-free output line. Exceeding it
       kills the subprocess and broadcasts `{:error, :line_too_large}` rather than
-      buffering an unbounded remainder. Defaults to `1_000_000`.
+      buffering an unbounded remainder. Defaults to `1_048_576` (1 MiB).
     * `:max_stream_bytes` - cap on a session's **total** output. Exceeding it
       destroys the sandbox and broadcasts `{:error, :stream_too_large}`. Mainly
       for remote backends, whose output file grows without bound; unbounded when
