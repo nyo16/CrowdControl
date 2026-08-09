@@ -465,6 +465,14 @@ defmodule CrowdControl.Agent.OmpTest do
         Omp.build_command(oauth_token: :secret)
       end
     end
+
+    test ":auth_token is rejected rather than silently ignored" do
+      # ANTHROPIC_AUTH_TOKEN is a Claude Code mechanism; setting it for omp would
+      # look like it worked and change nothing.
+      assert_raise ArgumentError, ~r/no omp equivalent.*custom_provider/s, fn ->
+        Omp.build_command(auth_token: "bearer")
+      end
+    end
   end
 
   describe "init_frames/1" do

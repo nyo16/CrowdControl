@@ -209,7 +209,10 @@ defmodule CrowdControl.Agent.Omp do
     setting_sources: "omp has no setting-source selector",
     max_budget_usd: "omp has no spend ceiling flag; use :max_time",
     session_id: "omp mints its own session id; use :resume to rejoin one",
-    bare: "omp has no bare mode"
+    bare: "omp has no bare mode",
+    auth_token:
+      "omp has no ANTHROPIC_AUTH_TOKEN equivalent; use :custom_provider for a " <>
+        "self-hosted endpoint, or :oauth_token for a Claude subscription"
   ]
 
   @impl true

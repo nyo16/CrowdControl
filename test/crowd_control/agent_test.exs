@@ -99,5 +99,23 @@ defmodule CrowdControl.AgentTest do
         ClaudeCode.build_command(oauth_token: :secret)
       end
     end
+
+    test ":auth_token sends a bearer credential for a self-hosted endpoint" do
+      # ANTHROPIC_AUTH_TOKEN => `Authorization: Bearer`, which is what a vLLM or
+      # LiteLLM front end expects; :api_key would send `x-api-key` instead.
+      {_exe, args, env} =
+        ClaudeCode.build_command(auth_token: "vllm-secret", api_url: "http://10.0.0.5:8000")
+
+      assert env["ANTHROPIC_AUTH_TOKEN"] == "vllm-secret"
+      assert env["ANTHROPIC_BASE_URL"] == "http://10.0.0.5:8000"
+      refute Enum.any?(args, &String.contains?(&1, "vllm-secret"))
+    end
+
+    test ":auth_token and :oauth_token are independent" do
+      {_exe, _args, env} = ClaudeCode.build_command(auth_token: "bearer", oauth_token: "sub")
+
+      assert env["ANTHROPIC_AUTH_TOKEN"] == "bearer"
+      assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sub"
+    end
   end
 end

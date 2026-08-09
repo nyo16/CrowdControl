@@ -463,13 +463,46 @@ through argv: a `0600` env file that is sourced and deleted before the CLI start
 | **API key** (pay-per-use) | `api_key: "sk-ant-…"` → `ANTHROPIC_API_KEY` | same |
 | **Subscription**, headless (Pro/Max/Team) | `oauth_token: "…"` from `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN` | `oauth_token: "…"` → `ANTHROPIC_OAUTH_TOKEN` |
 | **Subscription**, already logged in on this host | `env: %{"CLAUDE_CONFIG_DIR" => "/home/me/.claude"}` | nothing — omp reads `~/.omp/agent/agent.db` automatically |
-| **Custom endpoint** (vLLM, SGLang, LiteLLM) | not supported | `custom_provider: [base_url: …, api_key: …]` |
-| **Another hosted provider** (OpenAI, Groq, …) | not supported | `env: %{"OPENAI_API_KEY" => …}` |
-| **Gateway / proxy** | `api_url:` + `api_key:` | `custom_provider: [base_url: …, api_key: …]` |
+| **Self-hosted endpoint** (vLLM, SGLang, LiteLLM) | `api_url:` + `auth_token:` — **only if it serves `/v1/messages`** | `custom_provider: [base_url: …, api_key: …]` |
+| **Another hosted provider** (OpenAI, Groq, …) | only through an Anthropic-compatible gateway | `env: %{"OPENAI_API_KEY" => …}` |
+| **Gateway / proxy** | `api_url:` + (`auth_token:` for Bearer, `api_key:` for `x-api-key`) | `custom_provider: [base_url: …, api_key: …]` |
 
-`:api_key` and `:api_url` are Anthropic-specific shorthands. For any other hosted
-provider under omp, use `:env` with the variable that provider documents — omp
-resolves each provider's own variable.
+The difference in that first row is the wire protocol, not the vendor. **Claude
+Code speaks only the Anthropic Messages API**, so an endpoint has to serve
+`/v1/messages`; an OpenAI-only `/v1/chat/completions` server will not work with
+it. **omp speaks OpenAI-compatible** through `:custom_provider` (and
+`api: "anthropic-messages"` when you want the other shape). Recent vLLM builds
+serve both, so either agent can drive them:
+
+```bash
+# does this endpoint speak Anthropic?
+curl -sS $BASE/v1/messages -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"…","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+# a body with "type": "message" => Claude Code can drive it
+```
+
+```elixir
+# Claude Code against a self-hosted Anthropic-compatible endpoint
+CrowdControl.run("Summarize this repo",
+  api_url: "http://10.0.0.5:8000",        # no /v1 -- the CLI appends it
+  auth_token: System.fetch_env!("VLLM_KEY"),
+  model: "deepseek-v4-flash"
+)
+
+# omp against the OpenAI-compatible side of the same server
+CrowdControl.run("Summarize this repo",
+  agent: :omp,
+  custom_provider: [base_url: "http://10.0.0.5:8000/v1", api_key: System.fetch_env!("VLLM_KEY")],
+  model: "vllm/deepseek-v4-flash"
+)
+```
+
+`:api_key` sends `x-api-key`, `:auth_token` sends `Authorization: Bearer` — most
+self-hosted servers want the latter. `"total_cost_usd"` is meaningless on a
+self-hosted model: Claude Code prices it against Anthropic's table, omp reports
+`0.0`. For a hosted provider under omp that is not Anthropic, use `:env` with the
+variable that provider documents.
 
 ### Subscription passthrough, in one line each
 
@@ -1139,6 +1172,7 @@ options — see `CrowdControl.Agent.Omp`.
 | `:extra_args` | List of additional CLI arguments |
 | `:api_key` | Anthropic API key (sets `ANTHROPIC_API_KEY` for the subprocess) |
 | `:oauth_token` | Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN` for Claude Code, `ANTHROPIC_OAUTH_TOKEN` for omp) |
+| `:auth_token` | Bearer credential for a gateway or self-hosted endpoint (`ANTHROPIC_AUTH_TOKEN`; Claude Code only) |
 | `:api_url` | Custom API base URL (sets `ANTHROPIC_BASE_URL` for the subprocess) |
 | `:env` | Map of arbitrary environment variables for the subprocess |
 | `:timeout` | Session timeout in milliseconds (default: `nil` / no timeout) |
