@@ -74,6 +74,25 @@
   out of both disk and argv. `:agent_dir` supplies a caller-owned directory
   instead — needed for the Docker and Kubernetes backends, where a host temp
   dir is not visible inside the sandbox. See `CrowdControl.Agent.Omp`.
+- **Subscription passthrough via `:oauth_token`.** Sessions could bill an
+  Anthropic API key but had no first-class way to bill a Claude
+  Pro/Max/Team subscription headlessly. Each adapter now maps the option to the
+  variable its CLI actually reads — `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code,
+  `ANTHROPIC_OAUTH_TOKEN` for omp — through the same validated `0600`
+  environment channel as every other credential:
+
+  ```elixir
+  CrowdControl.run("Explain this repo", agent: :omp, oauth_token: token)
+  ```
+
+  A host that has already run `/login` needs nothing at all: omp reads its
+  stored logins from `~/.omp/agent/agent.db`, so plain sessions inherit the
+  subscription automatically. `:custom_provider` is the exception, because it
+  relocates the agent directory and leaves that store behind —
+  `inherit_auth: true` links it back in, letting one session reach both a
+  self-hosted endpoint and Anthropic. Off by default: it exposes the OAuth store
+  to a session whose `bash` tool may be talking to a third-party endpoint.
+  README has a per-agent credentials matrix.
 - **`CrowdControl.Agent` behaviour.** The CLI dialect a session speaks —
   argv plus wire format — is now a pluggable adapter
   (`CrowdControl.Agent.ClaudeCode`, `CrowdControl.Agent.Omp`, or your own

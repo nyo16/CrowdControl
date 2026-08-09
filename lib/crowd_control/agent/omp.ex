@@ -38,6 +38,43 @@ defmodule CrowdControl.Agent.Omp do
   logical frame is truncated by omp rather than chunked; `:max_line_bytes` on
   the session still bounds what a single line may cost.
 
+  ## Credentials
+
+  Everything below travels through the session's validated environment — a
+  `0600` env file locally, the exec `Env` array remotely. Never argv, never `ps`.
+
+  | You have | Pass | Sets |
+  | --- | --- | --- |
+  | An Anthropic API key | `:api_key` | `ANTHROPIC_API_KEY` |
+  | A Claude **subscription**, headless | `:oauth_token` | `ANTHROPIC_OAUTH_TOKEN`, which omp resolves *ahead of* the API key |
+  | A Claude subscription already logged in on this host | nothing — it just works | omp reads `~/.omp/agent/agent.db` |
+  | A self-hosted endpoint (vLLM, SGLang, LiteLLM) | `custom_provider: [base_url: …, api_key: …]` | a generated `models.yml` plus one env var |
+  | Any other provider (OpenAI, Groq, …) | `env: %{"OPENAI_API_KEY" => …}` | that variable verbatim |
+
+  `:api_key` and `:api_url` are Anthropic-specific shorthands inherited from
+  `CrowdControl.CLI`; for any other hosted provider use `:env` with the variable
+  omp documents for it.
+
+  ### Subscription passthrough
+
+  A session with no `:custom_provider` uses omp's real agent directory, so a
+  `/login` you have already done applies with no configuration at all — that is
+  the easiest way to bill sessions to a Claude subscription.
+
+  Two cases need help:
+
+    * **No stored login** (CI, a container, another user): mint a token with
+      `omp` and pass it as `:oauth_token`.
+    * **`:custom_provider` is in play**: it relocates the agent directory
+      (see below), which leaves the stored login behind. Add
+      `inherit_auth: true` to the spec to link the real store back in, and the
+      session can reach both its custom endpoint and Anthropic.
+
+  `inherit_auth` is opt-in rather than the default on purpose: it symlinks your
+  OAuth store into a directory a session's own `bash` tool can read, while that
+  session is talking to a third-party endpoint. Turn it on for endpoints you
+  trust; leave it off for ones you do not.
+
   ## Options
 
   Shared with `CrowdControl.CLI` (Claude Code): `:executable` (default `"omp"`),
@@ -68,6 +105,7 @@ defmodule CrowdControl.Agent.Omp do
     * `:agent_dir` - path for `PI_CODING_AGENT_DIR`, the directory omp reads
       `models.yml` and `config.yml` from (sanitized + expanded)
     * `:custom_provider` - declarative OpenAI-compatible endpoint; see below
+    * `:oauth_token` - Claude subscription token; sets `ANTHROPIC_OAUTH_TOKEN`
 
   Claude-Code-only options (`:mcp_config`, `:strict_mcp_config`, `:agents`,
   `:plugin_dir`, `:settings`, `:settings_file`, `:settings_json`,
@@ -106,6 +144,11 @@ defmodule CrowdControl.Agent.Omp do
       ..., max_tokens: ..., reasoning: true | false, input: ["text", "image"]]`.
       Omit to discover models from the server's `/v1/models` instead.
     * `:headers` - extra request headers as a string-keyed map
+    * `:inherit_auth` - `true` to link omp's stored-login database
+      (`~/.omp/agent/agent.db`) into the generated directory, so the session
+      keeps the logins omp already has despite the relocation. Accepts a path to
+      a specific agent directory instead of `true`. Off by default — see
+      "Subscription passthrough" above for the trade-off.
 
   The directory is content-addressed, so every session in a fan-out sharing one
   spec shares one directory rather than writing N copies. Build it yourself with
@@ -117,11 +160,11 @@ defmodule CrowdControl.Agent.Omp do
   > #### `PI_CODING_AGENT_DIR` relocates more than `models.yml` {: .warning}
   >
   > It moves the whole `~/.omp/agent` base for that session: `config.yml`, the
-  > auth store (`agent.db`), and saved sessions. A session pointed at a custom
-  > provider therefore does not see your global omp settings or stored logins,
-  > which is usually what you want for an isolated endpoint but does mean
-  > `:custom_provider` and your normal Anthropic credentials do not mix in one
-  > session. `~/.omp` itself (skills, plugins) is unaffected.
+  > auth store (`agent.db`), and saved sessions. So a `:custom_provider` session
+  > starts with none of your global omp settings and none of your stored
+  > logins — usually what you want for an isolated endpoint. Add
+  > `inherit_auth: true` when you want the logins back, and `:config` to point
+  > at a settings overlay. `~/.omp` itself (skills, plugins) is unaffected.
   """
 
   @behaviour CrowdControl.Agent
@@ -150,6 +193,10 @@ defmodule CrowdControl.Agent.Omp do
   @default_provider_key_env "OMP_CUSTOM_PROVIDER_KEY"
   @provider_apis ~w(openai-completions openai-responses anthropic-messages)
   @agent_dir_env "PI_CODING_AGENT_DIR"
+  @oauth_env "ANTHROPIC_OAUTH_TOKEN"
+  # omp keeps stored logins (OAuth subscriptions included) in this SQLite file
+  # under the agent directory, which is why relocating the directory loses them.
+  @auth_store "agent.db"
 
   @unsupported [
     mcp_config: "omp configures MCP servers through its config file",
@@ -240,13 +287,77 @@ defmodule CrowdControl.Agent.Omp do
 
       dir = CrowdControl.Agent.Omp.provider_dir!(base_url: "http://10.0.0.5:8000/v1")
       CrowdControl.run("hi", agent: :omp, agent_dir: dir, model: "vllm/my-model")
+
+  `inherit_auth: true` additionally links omp's stored-login database into the
+  directory, so the session keeps the logins `omp` already has — see the
+  moduledoc for why that is opt-in.
   """
   @spec provider_dir!(keyword() | map()) :: String.t()
   def provider_dir!(spec) do
+    spec = normalize_spec!(spec)
     config = render_models_config!(spec)
-    dir = Path.join(System.tmp_dir!(), "cc_omp_#{salt()}_#{digest(config)}")
+    auth_store = auth_store_source(spec[:inherit_auth])
 
-    write_provider_dir!(dir, config)
+    # The auth link is part of the directory's identity: two specs that differ
+    # only in :inherit_auth must not collide on one content-addressed path.
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "cc_omp_#{salt()}_#{digest([config, "auth:", to_string(auth_store)])}"
+      )
+
+    dir = write_provider_dir!(dir, config)
+    link_auth_store!(dir, auth_store)
+
+    dir
+  end
+
+  defp auth_store_source(nil), do: nil
+  defp auth_store_source(false), do: nil
+
+  defp auth_store_source(true) do
+    base = System.get_env(@agent_dir_env) || Path.expand("~/.omp/agent")
+    auth_store_source(base)
+  end
+
+  defp auth_store_source(dir) when is_binary(dir) do
+    path = dir |> CLI.sanitize_path!() |> Path.join(@auth_store)
+
+    if File.exists?(path) do
+      path
+    else
+      raise ArgumentError,
+            "inherit_auth: no omp auth store at #{path}. Run `omp` and `/login` first, " <>
+              "or pass inherit_auth: \"/path/to/agent-dir\"."
+    end
+  end
+
+  defp auth_store_source(other),
+    do: raise(ArgumentError, ":inherit_auth must be a boolean or a path, got: #{inspect(other)}")
+
+  # A symlink, not a copy: omp refreshes OAuth tokens in place, and a copy would
+  # strand the refreshed token in a temp directory while the real store went
+  # stale.
+  defp link_auth_store!(_dir, nil), do: :ok
+
+  # Both paths are ours by construction: `dir` came from provider_dir!/1 (temp
+  # dir, `cc_omp_` prefix, salted name) and `source` was resolved and existence-
+  # checked by auth_store_source/1. `link` is always `<dir>/agent.db` -- the
+  # caller never names the file.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp link_auth_store!(dir, source) do
+    link = Path.join(dir, @auth_store)
+
+    case File.read_link(link) do
+      {:ok, ^source} -> :ok
+      _ -> _ = File.rm(link)
+    end
+
+    case File.ln_s(source, link) do
+      :ok -> :ok
+      {:error, :eexist} -> :ok
+      {:error, reason} -> raise File.Error, reason: reason, action: "link auth store", path: link
+    end
   end
 
   @doc """
@@ -316,24 +427,39 @@ defmodule CrowdControl.Agent.Omp do
     spec = opts[:custom_provider]
     dir = opts[:agent_dir]
 
-    cond do
-      spec && dir ->
-        raise ArgumentError,
-              ":custom_provider and :agent_dir are mutually exclusive -- " <>
-                ":custom_provider generates an agent dir, :agent_dir supplies one. " <>
-                "Pass the result of provider_dir!/1 as :agent_dir to do both."
+    base =
+      cond do
+        spec && dir ->
+          raise ArgumentError,
+                ":custom_provider and :agent_dir are mutually exclusive -- " <>
+                  ":custom_provider generates an agent dir, :agent_dir supplies one. " <>
+                  "Pass the result of provider_dir!/1 as :agent_dir to do both."
 
-      spec ->
-        normalized = normalize_spec!(spec)
+        spec ->
+          normalized = normalize_spec!(spec)
 
-        %{@agent_dir_env => provider_dir!(normalized)}
-        |> put_provider_key(normalized)
+          %{@agent_dir_env => provider_dir!(normalized)}
+          |> put_provider_key(normalized)
 
-      dir ->
-        %{@agent_dir_env => CLI.sanitize_path!(dir)}
+        dir ->
+          %{@agent_dir_env => CLI.sanitize_path!(dir)}
 
-      true ->
-        %{}
+        true ->
+          %{}
+      end
+
+    put_oauth_token(base, opts)
+  end
+
+  # omp resolves ANTHROPIC_OAUTH_TOKEN ahead of ANTHROPIC_API_KEY, so this is
+  # how a session bills a Claude subscription instead of an API key without a
+  # stored login. Independent of :custom_provider -- a session can carry a
+  # subscription token and still point its default model at a local endpoint.
+  defp put_oauth_token(env, opts) do
+    case Keyword.get(opts, :oauth_token) do
+      nil -> env
+      token when is_binary(token) -> Map.put(env, @oauth_env, token)
+      other -> raise ArgumentError, ":oauth_token must be a binary, got: #{inspect(other)}"
     end
   end
 

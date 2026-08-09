@@ -451,7 +451,59 @@ CrowdControl.start_session(
 
 ## Authentication
 
-CrowdControl supports all Claude Code authentication methods:
+Every credential below reaches the CLI through the session's **environment**, never
+through argv: a `0600` env file that is sourced and deleted before the CLI starts
+(`Backend.Local`), or the exec `Env` array (Docker, Kubernetes). Nothing shows up in
+`ps`.
+
+### Which option do I pass?
+
+| You have | `agent: :claude` / `:open_code` | `agent: :omp` |
+|---|---|---|
+| **API key** (pay-per-use) | `api_key: "sk-ant-…"` → `ANTHROPIC_API_KEY` | same |
+| **Subscription**, headless (Pro/Max/Team) | `oauth_token: "…"` from `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN` | `oauth_token: "…"` → `ANTHROPIC_OAUTH_TOKEN` |
+| **Subscription**, already logged in on this host | `env: %{"CLAUDE_CONFIG_DIR" => "/home/me/.claude"}` | nothing — omp reads `~/.omp/agent/agent.db` automatically |
+| **Custom endpoint** (vLLM, SGLang, LiteLLM) | not supported | `custom_provider: [base_url: …, api_key: …]` |
+| **Another hosted provider** (OpenAI, Groq, …) | not supported | `env: %{"OPENAI_API_KEY" => …}` |
+| **Gateway / proxy** | `api_url:` + `api_key:` | `custom_provider: [base_url: …, api_key: …]` |
+
+`:api_key` and `:api_url` are Anthropic-specific shorthands. For any other hosted
+provider under omp, use `:env` with the variable that provider documents — omp
+resolves each provider's own variable.
+
+### Subscription passthrough, in one line each
+
+```elixir
+# omp, host already logged in: nothing to pass.
+CrowdControl.run("Explain this repo", agent: :omp)
+
+# omp, headless (CI, container, another user):
+CrowdControl.run("Explain this repo", agent: :omp, oauth_token: System.fetch_env!("OMP_OAUTH"))
+
+# Claude Code, headless: token from `claude setup-token`
+CrowdControl.run("Explain this repo", oauth_token: System.fetch_env!("CLAUDE_OAUTH"))
+
+# Claude Code, inherit an existing ~/.claude login
+CrowdControl.run("Explain this repo", env: %{"CLAUDE_CONFIG_DIR" => "/home/me/.claude"})
+```
+
+A subscription and a self-hosted endpoint can coexist in **one** omp session. The
+catch: `:custom_provider` relocates omp's agent directory, which is where the stored
+login lives, so opt back in with `inherit_auth: true`:
+
+```elixir
+CrowdControl.run("Compare these two approaches",
+  agent: :omp,
+  custom_provider: [base_url: "http://10.0.0.5:8000/v1", inherit_auth: true],
+  model: "anthropic/claude-haiku-4-5"   # or "vllm/…" — both resolve
+)
+```
+
+> `inherit_auth` symlinks your OAuth store into a directory the session's own `bash`
+> tool can read, while that session may be talking to a third-party endpoint. It is
+> off by default for that reason. Turn it on for endpoints you trust.
+
+### Claude Code auth methods
 
 ```mermaid
 graph LR
@@ -1086,6 +1138,7 @@ options — see `CrowdControl.Agent.Omp`.
 | `:bare` | `true` for minimal mode (skip hooks, LSP, plugins, auto-memory) |
 | `:extra_args` | List of additional CLI arguments |
 | `:api_key` | Anthropic API key (sets `ANTHROPIC_API_KEY` for the subprocess) |
+| `:oauth_token` | Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN` for Claude Code, `ANTHROPIC_OAUTH_TOKEN` for omp) |
 | `:api_url` | Custom API base URL (sets `ANTHROPIC_BASE_URL` for the subprocess) |
 | `:env` | Map of arbitrary environment variables for the subprocess |
 | `:timeout` | Session timeout in milliseconds (default: `nil` / no timeout) |

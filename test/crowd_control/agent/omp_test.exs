@@ -359,6 +359,112 @@ defmodule CrowdControl.Agent.OmpTest do
 
       assert {:error, :not_a_provider_dir} = Omp.remove_provider_dir(path)
     end
+
+    test "inherit_auth links the real store in, and a plain spec does not" do
+      fake_agent =
+        Path.join(System.tmp_dir!(), "cc_fake_agent_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(fake_agent)
+      File.write!(Path.join(fake_agent, "agent.db"), "pretend-sqlite")
+      on_exit(fn -> File.rm_rf(fake_agent) end)
+
+      inheriting = Omp.provider_dir!(base_url: "http://h/v1", inherit_auth: fake_agent)
+      plain = Omp.provider_dir!(base_url: "http://h/v1")
+      on_exit(fn -> Enum.each([inheriting, plain], &Omp.remove_provider_dir/1) end)
+
+      assert {:ok, target} = File.read_link(Path.join(inheriting, "agent.db"))
+      assert target == Path.join(fake_agent, "agent.db")
+      refute File.exists?(Path.join(plain, "agent.db"))
+
+      # Same models.yml, different auth intent: the content-addressed path must
+      # not collide, or one spec would silently inherit the other's decision.
+      refute inheriting == plain
+    end
+
+    test "removing an inheriting dir leaves the real auth store alone" do
+      fake_agent =
+        Path.join(System.tmp_dir!(), "cc_fake_agent_#{System.unique_integer([:positive])}")
+
+      store = Path.join(fake_agent, "agent.db")
+      File.mkdir_p!(fake_agent)
+      File.write!(store, "pretend-sqlite")
+      on_exit(fn -> File.rm_rf(fake_agent) end)
+
+      dir = Omp.provider_dir!(base_url: "http://h/v1", inherit_auth: fake_agent)
+      assert :ok = Omp.remove_provider_dir(dir)
+
+      refute File.dir?(dir)
+      assert File.read!(store) == "pretend-sqlite"
+    end
+
+    test "inherit_auth is idempotent across sessions sharing a spec" do
+      fake_agent =
+        Path.join(System.tmp_dir!(), "cc_fake_agent_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(fake_agent)
+      File.write!(Path.join(fake_agent, "agent.db"), "pretend-sqlite")
+      on_exit(fn -> File.rm_rf(fake_agent) end)
+
+      spec = [base_url: "http://h/v1", inherit_auth: fake_agent]
+      a = Omp.provider_dir!(spec)
+      b = Omp.provider_dir!(spec)
+      on_exit(fn -> Omp.remove_provider_dir(a) end)
+
+      assert a == b
+      assert {:ok, _} = File.read_link(Path.join(b, "agent.db"))
+    end
+
+    test "inherit_auth says so when there is no store to inherit" do
+      assert_raise ArgumentError, ~r/no omp auth store at/, fn ->
+        Omp.provider_dir!(base_url: "http://h/v1", inherit_auth: "/tmp/cc-no-such-agent-dir")
+      end
+    end
+
+    test "inherit_auth: false is the same as omitting it" do
+      with_flag = Omp.provider_dir!(base_url: "http://h/v1", inherit_auth: false)
+      without = Omp.provider_dir!(base_url: "http://h/v1")
+      on_exit(fn -> Omp.remove_provider_dir(without) end)
+
+      assert with_flag == without
+    end
+  end
+
+  describe "credentials" do
+    test ":oauth_token carries a Claude subscription, not an API key" do
+      # omp resolves ANTHROPIC_OAUTH_TOKEN ahead of ANTHROPIC_API_KEY, which is
+      # what makes a session bill a subscription instead of per-token usage.
+      {_exe, args, env} = Omp.build_command(oauth_token: "sk-ant-oat-123")
+
+      assert env["ANTHROPIC_OAUTH_TOKEN"] == "sk-ant-oat-123"
+      refute Map.has_key?(env, "ANTHROPIC_API_KEY")
+      refute Enum.any?(args, &String.contains?(&1, "sk-ant-oat-123"))
+    end
+
+    test ":oauth_token and :api_key can both be present" do
+      {_exe, _args, env} = Omp.build_command(oauth_token: "oat", api_key: "key")
+
+      assert env["ANTHROPIC_OAUTH_TOKEN"] == "oat"
+      assert env["ANTHROPIC_API_KEY"] == "key"
+    end
+
+    test ":oauth_token works alongside a custom provider" do
+      {_exe, _args, env} =
+        Omp.build_command(
+          oauth_token: "oat",
+          custom_provider: [base_url: "http://h/v1", api_key: "vllm-key"]
+        )
+
+      assert env["ANTHROPIC_OAUTH_TOKEN"] == "oat"
+      assert env["OMP_CUSTOM_PROVIDER_KEY"] == "vllm-key"
+
+      Omp.remove_provider_dir(env["PI_CODING_AGENT_DIR"])
+    end
+
+    test "rejects a non-binary :oauth_token" do
+      assert_raise ArgumentError, ~r/:oauth_token must be a binary/, fn ->
+        Omp.build_command(oauth_token: :secret)
+      end
+    end
   end
 
   describe "init_frames/1" do

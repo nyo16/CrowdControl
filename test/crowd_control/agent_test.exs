@@ -72,5 +72,32 @@ defmodule CrowdControl.AgentTest do
       assert {:user, _} =
                ClaudeCode.decode_line(String.trim(ClaudeCode.encode_prompt("hi", 0, [])))
     end
+
+    test ":oauth_token carries a Claude subscription via CLAUDE_CODE_OAUTH_TOKEN" do
+      # `claude setup-token` mints this; it is the headless way to bill a
+      # session to a Pro/Max/Team plan instead of an API key. A different
+      # variable from omp's, which is why the adapters own the mapping.
+      {_exe, args, env} = ClaudeCode.build_command(oauth_token: "sk-ant-oat-123")
+
+      assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-123"
+      refute Map.has_key?(env, "ANTHROPIC_API_KEY")
+      refute Enum.any?(args, &String.contains?(&1, "sk-ant-oat-123"))
+    end
+
+    test "an explicit :env entry still wins over :oauth_token" do
+      {_exe, _args, env} =
+        ClaudeCode.build_command(
+          oauth_token: "generated",
+          env: %{"CLAUDE_CODE_OAUTH_TOKEN" => "caller-wins"}
+        )
+
+      assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "caller-wins"
+    end
+
+    test "rejects a non-binary :oauth_token" do
+      assert_raise ArgumentError, ~r/:oauth_token must be a binary/, fn ->
+        ClaudeCode.build_command(oauth_token: :secret)
+      end
+    end
   end
 end
