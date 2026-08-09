@@ -35,6 +35,75 @@
 
 ### Added
 
+- **omp support.** [omp](https://omp.sh/) can now drive a session, alongside
+  Claude Code and Open Code. Select it with `agent: :omp` (or just
+  `executable: "omp"`, which infers the adapter):
+
+  ```elixir
+  CrowdControl.run("Summarize this repo", agent: :omp, approval_mode: "yolo")
+  ```
+
+  The adapter runs `omp --mode rpc` and speaks its newline-delimited JSON-RPC
+  protocol: a `get_state` handshake surfaces the session id as the usual
+  `{:system_init, %{"session_id" => id}}`, and a terminal `agent_end` frame
+  becomes `{:result, "success", %{"result" => text, "total_cost_usd" => cost}}`.
+  Subscribers and `CrowdControl.collect/2` therefore work unchanged across a
+  mixed claude/open-code/omp fan-out. Claude Code's `:permission_mode` is
+  translated to omp's approval modes; Claude-Code-only options
+  (`:mcp_config`, `:max_budget_usd`, `:settings`, ...) raise rather than being
+  silently dropped. See `CrowdControl.Agent.Omp`.
+- **Custom omp providers — vLLM, LiteLLM, any OpenAI-compatible endpoint.**
+  omp resolves a provider's `baseUrl` from `models.yml` under its agent
+  directory and exposes no CLI flag for it, so `:custom_provider` renders that
+  file into a private `0700` temp directory and points `PI_CODING_AGENT_DIR`
+  at it:
+
+  ```elixir
+  CrowdControl.run("Review this diff",
+    agent: :omp,
+    custom_provider: [base_url: "http://10.0.0.5:8000/v1"],
+    model: "vllm/Qwen/Qwen3-Coder-30B"
+  )
+  ```
+
+  Models are discovered from the server's `/v1/models` (the built-in `vllm`
+  provider also reads `max_model_len`), or listed explicitly with `:models`.
+  A provider `:api_key` is **never written to `models.yml`**: the config
+  references it by environment-variable name and the value travels through the
+  same validated `0600` env-file channel as every other credential, so it stays
+  out of both disk and argv. `:agent_dir` supplies a caller-owned directory
+  instead — needed for the Docker and Kubernetes backends, where a host temp
+  dir is not visible inside the sandbox. See `CrowdControl.Agent.Omp`.
+- **Subscription passthrough via `:oauth_token`.** Sessions could bill an
+  Anthropic API key but had no first-class way to bill a Claude
+  Pro/Max/Team subscription headlessly. Each adapter now maps the option to the
+  variable its CLI actually reads — `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code,
+  `ANTHROPIC_OAUTH_TOKEN` for omp — through the same validated `0600`
+  environment channel as every other credential:
+
+  ```elixir
+  CrowdControl.run("Explain this repo", agent: :omp, oauth_token: token)
+  ```
+
+  A host that has already run `/login` needs nothing at all: omp reads its
+  stored logins from `~/.omp/agent/agent.db`, so plain sessions inherit the
+  subscription automatically. `:custom_provider` is the exception, because it
+  relocates the agent directory and leaves that store behind —
+  `inherit_auth: true` links it back in, letting one session reach both a
+  self-hosted endpoint and Anthropic. Off by default: it exposes the OAuth store
+  to a session whose `bash` tool may be talking to a third-party endpoint.
+  README has a per-agent credentials matrix.
+- **`CrowdControl.Agent` behaviour.** The CLI dialect a session speaks —
+  argv plus wire format — is now a pluggable adapter
+  (`CrowdControl.Agent.ClaudeCode`, `CrowdControl.Agent.Omp`, or your own
+  module). `CrowdControl.CLI` and `CrowdControl.Protocol` are unchanged and
+  remain the Claude Code implementation.
+- **Results carry the turn they belong to.** Every `{:result, _, map}` now
+  includes `map["turn"]`, and `CrowdControl.Session.current_turn/1` reports the
+  turn in flight. `CrowdControl.collect/2` reads it before subscribing and
+  ignores results from earlier turns — without that, `subscribe/1`'s history
+  replay handed a collector the *previous* turn's result the instant it
+  attached, which multi-turn sessions made reachable.
 - **Pluggable sandbox backends.** `CrowdControl.Backend` behaviour, with
   `CrowdControl.Backend.Local` (the default; a local subprocess, behaviourally
   identical to previous releases) and `CrowdControl.Backend.Docker` (one
@@ -98,6 +167,42 @@
   `CrowdControl.Backend.Docker` so both remote backends share one
   implementation. `Docker.apply_credentials/2` now delegates to it and its
   public behaviour is unchanged.
+
+### Fixed
+
+- **`Session.send_prompt/2` no longer rejects a prompt after the first result.**
+  A `{:result, _, _}` ends a *turn*, not the process: both
+  `claude --input-format stream-json` and `omp --mode rpc` keep reading stdin
+  afterwards, so the old `{:error, :completed}` made multi-turn conversations
+  impossible. A prompt is now accepted while the subprocess is alive and moves
+  the session back to `:running`; only an exited subprocess is terminal.
+- **A local-only omp prompt no longer hangs the collector.** A slash command
+  omp answers itself (`/tools`) emits no `agent_end`; its only completion
+  signal is `agentInvoked: false`, on the prompt response or a later
+  `prompt_result`. Both are now terminal, producing
+  `{:result, "success", %{"local_only" => true}}`. Previously
+  `CrowdControl.run("/tools", agent: :omp)` blocked for its full deadline.
+- **A type-drifted omp frame no longer kills the session.** `decode_line/1`
+  runs inside `handle_cast/2`, so a `get_state` payload whose `"model"` was a
+  string rather than an object raised `FunctionClauseError` and took the
+  session down. Every field read is now shape-guarded, and `"sessionId"` is
+  clamped to a binary before it reaches `Session` and `Store`, both of which
+  spec it as `String.t() | nil`.
+- **A failed handshake write stops the session instead of wedging it.**
+  `Session.init/1` now returns `{:error, {:handshake_failed, reason}}` and
+  tears down the sandbox, rather than leaving an omp session in `:starting`
+  with no session id until its inactivity timeout.
+- **Options set inside a `{Backend, config}` tuple reach the agent's framing
+  callbacks.** `build_command/1` always saw the merged list; `init_frames/1`
+  and `encode_prompt/3` saw the raw one, so `:streaming_behavior` written
+  there was silently inert.
+- **An explicitly-`false` Claude-Code-only option no longer raises for omp.**
+  `bare: false` and `strict_mcp_config: false` request default behaviour, so
+  dropping them changes nothing; raising broke shared option lists in a mixed
+  fan-out.
+- **An invalid `:streaming_behavior` is rejected by `build_command/1`.** It
+  used to surface only when a prompt was encoded — inside `Session.init/1` or
+  `handle_call/3` — killing the session and the calling process.
 
 ### Security
 

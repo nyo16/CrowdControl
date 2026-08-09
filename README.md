@@ -5,7 +5,7 @@
 [![HexDocs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/crowd_control)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/nyo16/CrowdControl/blob/master/LICENSE)
 
-Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Open Code](https://github.com/anthropics/open-code) CLI instances in parallel from Elixir.
+Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Open Code](https://github.com/anthropics/open-code) / [omp](https://omp.sh/) CLI instances in parallel from Elixir.
 
 Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subprocess management with NIF-based backpressure. Security disclosures: see [`SECURITY.md`](SECURITY.md). Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). Runnable examples: [`examples/`](https://github.com/nyo16/CrowdControl/tree/master/examples).
 
@@ -13,7 +13,7 @@ Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subpro
 graph LR
     CC[CrowdControl] --> S1[claude #1]
     CC --> S2[claude #2]
-    CC --> S3[open-code #3]
+    CC --> S3[omp #3]
     CC --> SN[... #N]
     S1 --> R[Collect Results]
     S2 --> R
@@ -30,13 +30,13 @@ graph LR
 
 ## Features
 
-- Run N Claude Code / Open Code sessions in parallel
+- Run N Claude Code / Open Code / omp sessions in parallel
 - Fan-out the same prompt across different models
 - Multi-turn conversations with subscriber-based message delivery
 - Fault-isolated sessions via OTP DynamicSupervisor
 - Zero zombie OS processes guaranteed by net_runner's Shepherd
 - Docker support with project directory mounting
-- Works with both `claude` and `open-code` CLIs
+- Works with the `claude`, `open-code` and `omp` CLIs — one message contract for all three
 - **Security hardened**: non-root Docker container, API key protection, capability dropping, resource limits
 - Configurable session concurrency limits and timeouts
 - Input validation and structured logging
@@ -172,6 +172,162 @@ CrowdControl.run_many("Explain recursion", [
   [executable: "open-code", permission_mode: "bypassPermissions"]
 ])
 ```
+
+### Using omp (Oh My Pi)
+
+[omp](https://omp.sh/) speaks its own JSON-RPC protocol over stdio, so it gets
+its own adapter (`CrowdControl.Agent.Omp`). Select it with `agent: :omp` — or
+just name the binary, which infers the adapter:
+
+```elixir
+# Single omp session (agent inferred from the executable)
+CrowdControl.run("Hello", executable: "omp", permission_mode: "bypassPermissions")
+
+# Explicit adapter, omp-native options
+CrowdControl.run("Summarize this repo",
+  agent: :omp,
+  model: "anthropic/claude-haiku-4-5",
+  approval_mode: "yolo",
+  thinking: "off",
+  no_session_persistence: true
+)
+
+# Fan the same prompt across all three CLIs
+CrowdControl.run_many("Explain recursion", [
+  [executable: "claude", model: "sonnet", permission_mode: "bypassPermissions"],
+  [executable: "open-code", permission_mode: "bypassPermissions"],
+  [agent: :omp, permission_mode: "bypassPermissions"]
+])
+```
+
+The messages are the same for every agent: `{:system_init, %{"session_id" => id}}`
+once the CLI is up, `{:assistant, _}` / `{:stream_event, _}` while it works, and
+`{:result, "success", %{"result" => text, "total_cost_usd" => cost}}` at the end
+of a turn. `CrowdControl.collect/2` therefore works across a mixed fan-out.
+
+Behind the scenes the adapter runs `omp --mode rpc`, asks for `get_state` to
+surface the session id, and treats a terminal `agent_end` frame as the end of a
+turn. Claude Code's `:permission_mode` is translated to omp's approval modes
+(`"bypassPermissions"` => `yolo`, `"acceptEdits"` => `write`, `"default"` =>
+`always-ask`); Claude-Code-only options such as `:mcp_config` or
+`:max_budget_usd` raise instead of being silently dropped. See
+`CrowdControl.Agent.Omp` for the full option list.
+
+### Custom providers: vLLM, LiteLLM, any OpenAI-compatible endpoint
+
+omp reads a provider's `baseUrl` from `models.yml` under its agent directory —
+there is no CLI flag for it. `:custom_provider` renders that file into a
+private `0700` temp directory and points the session at it:
+
+```elixir
+# Self-hosted vLLM, no auth. Models are discovered from /v1/models,
+# including vLLM's max_model_len as the context window.
+CrowdControl.run("Review this diff",
+  agent: :omp,
+  custom_provider: [base_url: "http://10.0.0.5:8000/v1"],
+  model: "vllm/Qwen/Qwen3-Coder-30B",
+  approval_mode: "yolo"
+)
+
+# Authenticated endpoint. The key is passed through the same 0600 env-file
+# channel as every other credential — it is never written into models.yml
+# and never appears in argv or `ps`.
+CrowdControl.run("Review this diff",
+  agent: :omp,
+  custom_provider: [
+    id: "my-gateway",
+    base_url: "https://gateway.internal/v1",
+    api_key: System.fetch_env!("GATEWAY_KEY")
+  ],
+  model: "my-gateway/qwen3-coder"
+)
+
+# A server without /v1/models: declare the models yourself.
+CrowdControl.run("Review this diff",
+  agent: :omp,
+  custom_provider: [
+    base_url: "http://10.0.0.5:8000/v1",
+    models: [[id: "Qwen/Qwen3-Coder-30B", context_window: 262_144, max_tokens: 65_536]]
+  ],
+  model: "vllm/Qwen/Qwen3-Coder-30B"
+)
+```
+
+Fan out across several vLLM hosts, or mix local and hosted models in one run:
+
+```elixir
+CrowdControl.run_many("Explain recursion", [
+  [agent: :omp, custom_provider: [base_url: "http://gpu-a:8000/v1"], model: "vllm/qwen3-coder"],
+  [agent: :omp, custom_provider: [base_url: "http://gpu-b:8000/v1"], model: "vllm/llama-3.3-70b"],
+  [agent: :omp, model: "anthropic/claude-haiku-4-5"]
+])
+```
+
+Spec keys: `:base_url` (required), `:id` (default `"vllm"`, and the `provider/`
+prefix in `:model`), `:api` (`"openai-completions"`, `"openai-responses"`, or
+`"anthropic-messages"`), `:api_key`, `:api_key_env`, `:models`, `:headers`.
+
+The generated directory is content-addressed, so every session in a fan-out
+sharing one spec shares one directory. Build it yourself with
+`CrowdControl.Agent.Omp.provider_dir!/1` and pass `:agent_dir` to own the
+lifecycle, and `remove_provider_dir/1` to delete it.
+
+> **`PI_CODING_AGENT_DIR` relocates more than `models.yml`.** It moves the whole
+> `~/.omp/agent` base for that session — `config.yml`, the auth store, saved
+> sessions — so a custom-provider session starts with none of your global omp
+> settings and none of your stored logins. Usually what you want for an isolated
+> endpoint; add `inherit_auth: true` when you want the logins back (see
+> [Authentication](#authentication)). `~/.omp` itself (skills, plugins) is
+> unaffected. For the Docker and Kubernetes backends the directory must exist
+> *inside* the sandbox: mount your own and pass `:agent_dir`.
+
+### Tuning prefill against a self-hosted endpoint
+
+A coding agent sends its whole system prompt and tool schema on every turn. On a
+hosted provider that is absorbed by prompt caching and priced at a discount; on
+your own GPU it is prefill you pay for in latency.
+
+Both CLIs default to a large prompt, and both can be trimmed. Measured against
+one vLLM box (`deepseek-v4-flash`), three runs per row, prompt tokens and
+request count read from vLLM's own `/metrics`:
+
+| Configuration | Prompt tokens | Requests/turn | Wall time |
+|---|---|---|---|
+| `agent: :claude`, default | 28,631 | 1 | ~2.0s |
+| `agent: :claude` + `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | **23,850** (−17%) | 1 | ~1.7s |
+| `agent: :omp`, default | 20,641 | 1, **sometimes 2** | 1.8–2.6s |
+| `agent: :omp` + `no_extensions: true` | 20,641 | **1** | ~1.2s |
+| `agent: :omp` + `no_extensions`, `no_skills`, `no_rules` | **17,072** (−17%) | 1 | ~1.2s |
+
+```elixir
+# omp, trimmed
+CrowdControl.run("…", agent: :omp,
+  custom_provider: [base_url: "http://10.0.0.5:8000/v1"],
+  model: "vllm/…",
+  no_extensions: true, no_skills: true, no_rules: true)
+
+# Claude Code, trimmed
+CrowdControl.run("…", api_url: "http://10.0.0.5:8000", auth_token: key,
+  model: "…", env: %{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" => "1"})
+```
+
+Two things worth knowing before you go hunting further:
+
+- **Prefix caching is not the problem.** Both agents sat at a **99% vLLM
+  prefix-cache hit rate** out of the box, across separate sessions. Nothing in
+  either CLI's default configuration defeats it.
+- **`DISABLE_PROMPT_CACHING=1` does nothing here.** It controls the Anthropic
+  `cache_control` breakpoints in the request body; vLLM ignores those and does
+  its own automatic, content-addressed prefix caching. Measured identical
+  (99.2%, 28,631 tokens) with and without it.
+
+The omp "sometimes 2 requests" row is the one real trap: a discovered extension
+fires a second full-size (~20k token) call on some turns, roughly doubling
+prefill. `no_extensions: true` removes it and makes latency stable.
+
+`no_skills`/`no_rules`/`no_extensions` trade capability for prefill — drop them
+if a session actually needs those. Numbers are from one model on one box; re-measure
+with `curl $BASE/metrics | grep prefix_cache` on yours.
 
 ### Working with project directories
 
@@ -325,14 +481,16 @@ exhaust the host. All limits are per-session options with safe defaults:
 
 ```elixir
 CrowdControl.start_session(
-  # inactivity ceiling; on expiry the session broadcasts
-  # {:timeout, :session_expired} and stops (reset on each prompt)
+  # ceiling on a single TURN. Armed at start, re-armed by send_prompt/2 --
+  # not by output, so a turn that streams for longer is still killed
+  # mid-flight. Size it against the slowest turn, not the conversation.
   timeout: 300_000,
   # reject prompts larger than this with {:error, :prompt_too_large}
   max_prompt_size: 1_000_000,
   # a single newline-free output line over this kills the subprocess and
-  # broadcasts {:error, :line_too_large} instead of buffering unbounded
-  max_line_bytes: 1_000_000,
+  # broadcasts {:error, :line_too_large} instead of buffering unbounded.
+  # Defaults to 1 MiB, matching the maxFrameBytes omp advertises.
+  max_line_bytes: 1_048_576,
   # cap on messages kept for get_messages/1 (oldest dropped past the cap);
   # live subscribers still receive every message
   max_messages: 10_000
@@ -341,7 +499,92 @@ CrowdControl.start_session(
 
 ## Authentication
 
-CrowdControl supports all Claude Code authentication methods:
+Every credential below reaches the CLI through the session's **environment**, never
+through argv: a `0600` env file that is sourced and deleted before the CLI starts
+(`Backend.Local`), or the exec `Env` array (Docker, Kubernetes). Nothing shows up in
+`ps`.
+
+### Which option do I pass?
+
+| You have | `agent: :claude` / `:open_code` | `agent: :omp` |
+|---|---|---|
+| **API key** (pay-per-use) | `api_key: "sk-ant-…"` → `ANTHROPIC_API_KEY` | same |
+| **Subscription**, headless (Pro/Max/Team) | `oauth_token: "…"` from `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN` | `oauth_token: "…"` → `ANTHROPIC_OAUTH_TOKEN` |
+| **Subscription**, already logged in on this host | `env: %{"CLAUDE_CONFIG_DIR" => "/home/me/.claude"}` | nothing — omp reads `~/.omp/agent/agent.db` automatically |
+| **Self-hosted endpoint** (vLLM, SGLang, LiteLLM) | `api_url:` + `auth_token:` — **only if it serves `/v1/messages`** | `custom_provider: [base_url: …, api_key: …]` |
+| **Another hosted provider** (OpenAI, Groq, …) | only through an Anthropic-compatible gateway | `env: %{"OPENAI_API_KEY" => …}` |
+| **Gateway / proxy** | `api_url:` + (`auth_token:` for Bearer, `api_key:` for `x-api-key`) | `custom_provider: [base_url: …, api_key: …]` |
+
+The difference in that first row is the wire protocol, not the vendor. **Claude
+Code speaks only the Anthropic Messages API**, so an endpoint has to serve
+`/v1/messages`; an OpenAI-only `/v1/chat/completions` server will not work with
+it. **omp speaks OpenAI-compatible** through `:custom_provider` (and
+`api: "anthropic-messages"` when you want the other shape). Recent vLLM builds
+serve both, so either agent can drive them:
+
+```bash
+# does this endpoint speak Anthropic?
+curl -sS $BASE/v1/messages -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"…","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+# a body with "type": "message" => Claude Code can drive it
+```
+
+```elixir
+# Claude Code against a self-hosted Anthropic-compatible endpoint
+CrowdControl.run("Summarize this repo",
+  api_url: "http://10.0.0.5:8000",        # no /v1 -- the CLI appends it
+  auth_token: System.fetch_env!("VLLM_KEY"),
+  model: "deepseek-v4-flash"
+)
+
+# omp against the OpenAI-compatible side of the same server
+CrowdControl.run("Summarize this repo",
+  agent: :omp,
+  custom_provider: [base_url: "http://10.0.0.5:8000/v1", api_key: System.fetch_env!("VLLM_KEY")],
+  model: "vllm/deepseek-v4-flash"
+)
+```
+
+`:api_key` sends `x-api-key`, `:auth_token` sends `Authorization: Bearer` — most
+self-hosted servers want the latter. `"total_cost_usd"` is meaningless on a
+self-hosted model: Claude Code prices it against Anthropic's table, omp reports
+`0.0`. For a hosted provider under omp that is not Anthropic, use `:env` with the
+variable that provider documents.
+
+### Subscription passthrough, in one line each
+
+```elixir
+# omp, host already logged in: nothing to pass.
+CrowdControl.run("Explain this repo", agent: :omp)
+
+# omp, headless (CI, container, another user):
+CrowdControl.run("Explain this repo", agent: :omp, oauth_token: System.fetch_env!("OMP_OAUTH"))
+
+# Claude Code, headless: token from `claude setup-token`
+CrowdControl.run("Explain this repo", oauth_token: System.fetch_env!("CLAUDE_OAUTH"))
+
+# Claude Code, inherit an existing ~/.claude login
+CrowdControl.run("Explain this repo", env: %{"CLAUDE_CONFIG_DIR" => "/home/me/.claude"})
+```
+
+A subscription and a self-hosted endpoint can coexist in **one** omp session. The
+catch: `:custom_provider` relocates omp's agent directory, which is where the stored
+login lives, so opt back in with `inherit_auth: true`:
+
+```elixir
+CrowdControl.run("Compare these two approaches",
+  agent: :omp,
+  custom_provider: [base_url: "http://10.0.0.5:8000/v1", inherit_auth: true],
+  model: "anthropic/claude-haiku-4-5"   # or "vllm/…" — both resolve
+)
+```
+
+> `inherit_auth` symlinks your OAuth store into a directory the session's own `bash`
+> tool can read, while that session may be talking to a third-party endpoint. It is
+> off by default for that reason. Turn it on for endpoints you trust.
+
+### Claude Code auth methods
 
 ```mermaid
 graph LR
@@ -934,11 +1177,27 @@ If you are tempted to add log rotation here, this is the reason not to.
 
 ## CLI Options
 
-All options from `CrowdControl.CLI.build_command/1` can be passed to `start_session`, `run`, and `run_many`:
+Every session picks an **agent adapter** (`CrowdControl.Agent`), which decides
+both the argv the CLI is launched with and the wire format it speaks:
+
+| `:agent` | Adapter | CLI |
+|----------|---------|-----|
+| `:claude` (default), `:claude_code` | `CrowdControl.Agent.ClaudeCode` | `claude` — `--output-format stream-json` |
+| `:open_code`, `:opencode` | `CrowdControl.Agent.ClaudeCode` | `open-code` — same wire format |
+| `:omp` | `CrowdControl.Agent.Omp` | `omp --mode rpc` — see [Using omp](#using-omp-oh-my-pi) |
+
+Omit `:agent` and it is inferred from the `:executable` basename (`"omp"` =>
+the omp adapter), defaulting to Claude Code.
+
+The options below come from `CrowdControl.CLI.build_command/1` (Claude Code)
+and can be passed to `start_session`, `run`, and `run_many`. The omp adapter
+accepts the shared subset plus its own flags, and raises on Claude-Code-only
+options — see `CrowdControl.Agent.Omp`.
 
 | Option | Description |
 |--------|-------------|
-| `:executable` | CLI binary name or path (default: `"claude"`) |
+| `:agent` | Agent adapter (see table above) |
+| `:executable` | CLI binary name or path (default: `"claude"`, or `"omp"` for `agent: :omp`) |
 | `:prompt` | Initial prompt to send |
 | `:model` | Model to use (`"sonnet"`, `"opus"`, `"haiku"`) |
 | `:system_prompt` | Custom system prompt |
@@ -960,6 +1219,8 @@ All options from `CrowdControl.CLI.build_command/1` can be passed to `start_sess
 | `:bare` | `true` for minimal mode (skip hooks, LSP, plugins, auto-memory) |
 | `:extra_args` | List of additional CLI arguments |
 | `:api_key` | Anthropic API key (sets `ANTHROPIC_API_KEY` for the subprocess) |
+| `:oauth_token` | Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN` for Claude Code, `ANTHROPIC_OAUTH_TOKEN` for omp) |
+| `:auth_token` | Bearer credential for a gateway or self-hosted endpoint (`ANTHROPIC_AUTH_TOKEN`; Claude Code only) |
 | `:api_url` | Custom API base URL (sets `ANTHROPIC_BASE_URL` for the subprocess) |
 | `:env` | Map of arbitrary environment variables for the subprocess |
 | `:timeout` | Session timeout in milliseconds (default: `nil` / no timeout) |
@@ -989,19 +1250,21 @@ All options from `CrowdControl.CLI.build_command/1` can be passed to `start_sess
 | `get_status(session)` | Returns `:starting`, `:running`, `:completed`, or `:error` |
 | `get_session_id(session)` | CLI-assigned session ID |
 | `get_messages(session)` | All accumulated messages |
+| `current_turn(session)` | Turn currently in flight (prompts written so far) |
 | `stop(session)` | Graceful shutdown |
 
 ### Message types
 
-Subscribers receive `{:crowd_control, session_pid, message}` where message is:
+Subscribers receive `{:crowd_control, session_pid, message}` where message is
+the same shape for every agent adapter:
 
 | Message | When |
 |---------|------|
 | `{:system_init, map}` | CLI initialized, contains `session_id`, `tools`, `model` |
 | `{:assistant, map}` | Assistant response with `content` blocks |
 | `{:user, map}` | Tool execution results |
-| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` |
-| `{:stream_event, map}` | Partial message delta (requires `:include_partial_messages`) |
+| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` (Claude Code), `"error_prompt_failed"` (omp). `map["turn"]` is the 1-based turn the result belongs to; omp adds `map["local_only"]` for slash commands answered without a model call |
+| `{:stream_event, map}` | Partial message delta (Claude Code: requires `:include_partial_messages`; omp: always) |
 | `{:timeout, :session_expired}` | Session timed out (requires `:timeout` option) |
 | `{:exit, status}` | CLI process exited with OS status code |
 
@@ -1108,7 +1371,7 @@ graph LR
     style R fill:#ffd43b,color:#333
 ```
 
-### Wire Protocol (stream-json)
+### Wire Protocol — Claude Code (stream-json)
 
 ```mermaid
 sequenceDiagram
@@ -1129,14 +1392,38 @@ sequenceDiagram
     C->>E: {"type":"result","subtype":"success","result":"..."}\n
 ```
 
+### Wire Protocol — omp (`--mode rpc`)
+
+```mermaid
+sequenceDiagram
+    participant E as Elixir
+    participant O as omp --mode rpc
+
+    O->>E: {"type":"ready","protocolVersion":1,...}\n
+
+    Note over E,O: handshake: ask for the session id
+    E->>O: {"id":"cc-init","type":"get_state"}\n
+    O->>E: {"id":"cc-init","type":"response","command":"get_state","data":{"sessionId":"..."}}\n
+
+    Note over E,O: prompt is acked before the turn runs
+    E->>O: {"id":"cc-prompt-0","type":"prompt","message":"Hello","streamingBehavior":"followUp"}\n
+    O->>E: {"id":"cc-prompt-0","type":"response","command":"prompt","success":true}\n
+    O->>E: {"type":"message_update","assistantMessageEvent":{...}}\n
+    O->>E: {"type":"message_end","message":{"role":"assistant",...}}\n
+    O->>E: {"type":"agent_end","isTerminal":true,"messages":[...]}\n
+
+    Note over E,O: agent_end (isTerminal) is the turn boundary
+```
+
 ### Module Dependency
 
 ```mermaid
 graph BT
     P[Protocol<br/><i>pure functions</i>]
     CLI[CLI<br/><i>pure functions</i>]
-    S[Session<br/><i>GenServer</i>] --> P
-    S --> CLI
+    A[Agent<br/><i>adapter behaviour</i>] --> P
+    A --> CLI
+    S[Session<br/><i>GenServer</i>] --> A
     S --> NR[NetRunner.Process]
     CC[CrowdControl<br/><i>public API</i>] --> S
     CC --> DS[DynamicSupervisor]
@@ -1147,6 +1434,7 @@ graph BT
     style S fill:#4a9eff,color:#fff
     style CC fill:#ff6b6b,color:#fff
     style APP fill:#ffd43b,color:#333
+    style A fill:#51cf66,color:#fff
     style NR fill:#cc5de8,color:#fff
     style DS fill:#ffd43b,color:#333
 ```
@@ -1195,14 +1483,14 @@ When the limit is reached, `start_session/1` returns `{:error, :max_sessions_rea
 Sessions can be configured with an automatic timeout to prevent runaway processes:
 
 ```elixir
-# Session expires after 5 minutes of inactivity
+# A turn gets 5 minutes to finish
 CrowdControl.run("Analyze this code",
   timeout: 300_000,
   add_dir: "/workspace"
 )
 ```
 
-The timer resets on each `send_prompt` call. On expiry, subscribers receive `{:timeout, :session_expired}` and the session shuts down.
+The timer is armed at start and re-armed by each `send_prompt/2` call — it is **not** refreshed by output, so a single turn that streams for longer than the timeout is killed mid-flight. Size it against the slowest turn you expect rather than the length of the conversation; long autonomous tasks against a self-hosted model routinely need more than the default. On expiry, subscribers receive `{:timeout, :session_expired}` and the session shuts down.
 
 ### Input validation
 
@@ -1218,7 +1506,7 @@ See the [Docker](#docker) section for container hardening details (non-root user
 - Elixir >= 1.18
 - Erlang/OTP >= 27
 - C compiler (gcc or clang) for net_runner NIF
-- `claude` CLI ([install](https://docs.anthropic.com/en/docs/claude-code)) and/or `open-code` CLI
+- At least one agent CLI: `claude` ([install](https://docs.anthropic.com/en/docs/claude-code)), `open-code`, or `omp` ([omp.sh](https://omp.sh/))
 - `ANTHROPIC_API_KEY` environment variable set
 
 ## License

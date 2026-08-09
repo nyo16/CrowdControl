@@ -28,7 +28,8 @@ disclosure with you.
 
 In scope:
 
-- Shell / argument / environment injection through `CrowdControl.CLI`
+- Shell / argument / environment injection through `CrowdControl.CLI` or a
+  `CrowdControl.Agent` adapter (e.g. `CrowdControl.Agent.Omp`)
   and `CrowdControl.Session` (env file generation, `sanitize_path!/1`,
   `validate_env!/1`, `CrowdControl.Backend.Shell.escape/1`).
 - Sandbox escape or credential disclosure through
@@ -46,7 +47,7 @@ In scope:
 
 Out of scope:
 
-- Vulnerabilities in the upstream `claude` / `opencode` CLIs.
+- Vulnerabilities in the upstream `claude` / `opencode` / `omp` CLIs.
 - Vulnerabilities in `net_runner` (report upstream).
 - Issues that require the attacker to already have local code-execution
   on the host where the library runs.

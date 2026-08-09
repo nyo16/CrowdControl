@@ -7,7 +7,7 @@ standalone `.exs` that you can execute with:
 mix run examples/<name>.exs
 ```
 
-You need a working `claude` (or `opencode`) binary on your `PATH` and a
+You need a working `claude`, `opencode`, or `omp` binary on your `PATH` and a
 valid API key in `ANTHROPIC_API_KEY` (or pass `:api_key` per-session).
 
 | Example | Demonstrates |
@@ -19,3 +19,5 @@ valid API key in `ANTHROPIC_API_KEY` (or pass `:api_key` per-session).
 | [`custom_mcp.exs`](custom_mcp.exs) | Wire up an MCP config and restrict tools |
 | [`error_handling.exs`](error_handling.exs) | Timeouts, oversized prompts, supervisor cap |
 | [`bounded_pool.exs`](bounded_pool.exs) | Saturate `max_sessions` and degrade gracefully |
+| [`omp_agent.exs`](omp_agent.exs) | Drive [omp](https://omp.sh/) over JSON-RPC and mix it with Claude Code |
+| [`omp_custom_provider.exs`](omp_custom_provider.exs) | Point omp at a self-hosted vLLM / OpenAI-compatible endpoint |

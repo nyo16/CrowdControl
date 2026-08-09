@@ -1,8 +1,13 @@
 defmodule CrowdControl do
   @moduledoc """
-  Orchestrate many Claude Code / Open Code CLI instances in parallel.
+  Orchestrate many coding-agent CLI instances in parallel.
 
-  See `CrowdControl.CLI.build_command/1` for the full list of session options.
+  Claude Code, Open Code and [omp](https://omp.sh/) are supported; pick one per
+  session with `:agent` (see `CrowdControl.Agent`). Every agent reports through
+  the same message contract, so a mixed fan-out collects uniformly.
+
+  See `CrowdControl.CLI.build_command/1` (Claude Code / Open Code) and
+  `CrowdControl.Agent.Omp` (omp) for the full list of session options.
   """
 
   alias CrowdControl.Session
@@ -105,14 +110,29 @@ defmodule CrowdControl do
   rather than waited out, since it can never produce one. Such a session is
   simply absent from the returned list, so the list can be shorter than
   `sessions`.
+
+  Results are matched by turn. `Session.subscribe/1` replays history, so a
+  session already carrying a finished turn would otherwise hand the collector
+  that old result the instant it attached -- returning stale data for a turn
+  still in flight. Each session's `Session.current_turn/1` is read *before*
+  subscribing, and only results stamped with that turn or later are accepted.
   """
   @spec collect([session()], pos_integer()) ::
           [{session(), result_message()}] | {:timeout, [{session(), result_message()}]}
   def collect(sessions, timeout \\ 60_000) do
+    remaining = Map.new(sessions, &{&1, current_turn(&1)})
     Enum.each(sessions, &Session.subscribe/1)
-    remaining = Map.new(sessions, &{&1, true})
     deadline = System.monotonic_time(:millisecond) + timeout
     do_collect(remaining, %{}, deadline)
+  end
+
+  # A session that dies between the read and the subscribe is handled by the
+  # terminal-message branch in do_collect_wait/3; treat it as turn 0 here
+  # rather than crashing the collector.
+  defp current_turn(session) do
+    Session.current_turn(session)
+  catch
+    :exit, _ -> 0
   end
 
   defp do_collect(remaining, results, deadline) do
@@ -128,11 +148,18 @@ defmodule CrowdControl do
     wait = max(deadline - now, 0)
 
     receive do
-      {:crowd_control, pid, {:result, _, _} = msg} ->
-        if Map.has_key?(remaining, pid) do
-          do_collect(Map.delete(remaining, pid), Map.put(results, pid, msg), deadline)
-        else
-          do_collect(remaining, results, deadline)
+      {:crowd_control, pid, {:result, _, map} = msg} ->
+        case Map.fetch(remaining, pid) do
+          {:ok, from_turn} when is_map(map) ->
+            if Map.get(map, "turn", from_turn) >= from_turn do
+              do_collect(Map.delete(remaining, pid), Map.put(results, pid, msg), deadline)
+            else
+              # A replayed result from an earlier turn. Keep waiting.
+              do_collect(remaining, results, deadline)
+            end
+
+          _ ->
+            do_collect(remaining, results, deadline)
         end
 
       # Terminal for this session: it can never produce a result now, so stop
