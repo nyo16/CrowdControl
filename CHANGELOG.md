@@ -35,6 +35,28 @@
 
 ### Added
 
+- **omp support.** [omp](https://omp.sh/) can now drive a session, alongside
+  Claude Code and Open Code. Select it with `agent: :omp` (or just
+  `executable: "omp"`, which infers the adapter):
+
+  ```elixir
+  CrowdControl.run("Summarize this repo", agent: :omp, approval_mode: "yolo")
+  ```
+
+  The adapter runs `omp --mode rpc` and speaks its newline-delimited JSON-RPC
+  protocol: a `get_state` handshake surfaces the session id as the usual
+  `{:system_init, %{"session_id" => id}}`, and a terminal `agent_end` frame
+  becomes `{:result, "success", %{"result" => text, "total_cost_usd" => cost}}`.
+  Subscribers and `CrowdControl.collect/2` therefore work unchanged across a
+  mixed claude/open-code/omp fan-out. Claude Code's `:permission_mode` is
+  translated to omp's approval modes; Claude-Code-only options
+  (`:mcp_config`, `:max_budget_usd`, `:settings`, ...) raise rather than being
+  silently dropped. See `CrowdControl.Agent.Omp`.
+- **`CrowdControl.Agent` behaviour.** The CLI dialect a session speaks —
+  argv plus wire format — is now a pluggable adapter
+  (`CrowdControl.Agent.ClaudeCode`, `CrowdControl.Agent.Omp`, or your own
+  module). `CrowdControl.CLI` and `CrowdControl.Protocol` are unchanged and
+  remain the Claude Code implementation.
 - **Pluggable sandbox backends.** `CrowdControl.Backend` behaviour, with
   `CrowdControl.Backend.Local` (the default; a local subprocess, behaviourally
   identical to previous releases) and `CrowdControl.Backend.Docker` (one
@@ -98,6 +120,15 @@
   `CrowdControl.Backend.Docker` so both remote backends share one
   implementation. `Docker.apply_credentials/2` now delegates to it and its
   public behaviour is unchanged.
+
+### Fixed
+
+- **`Session.send_prompt/2` no longer rejects a prompt after the first result.**
+  A `{:result, _, _}` ends a *turn*, not the process: both
+  `claude --input-format stream-json` and `omp --mode rpc` keep reading stdin
+  afterwards, so the old `{:error, :completed}` made multi-turn conversations
+  impossible. A prompt is now accepted while the subprocess is alive and moves
+  the session back to `:running`; only an exited subprocess is terminal.
 
 ### Security
 

@@ -5,7 +5,7 @@
 [![HexDocs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/crowd_control)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/nyo16/CrowdControl/blob/master/LICENSE)
 
-Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Open Code](https://github.com/anthropics/open-code) CLI instances in parallel from Elixir.
+Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Open Code](https://github.com/anthropics/open-code) / [omp](https://omp.sh/) CLI instances in parallel from Elixir.
 
 Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subprocess management with NIF-based backpressure. Security disclosures: see [`SECURITY.md`](SECURITY.md). Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). Runnable examples: [`examples/`](https://github.com/nyo16/CrowdControl/tree/master/examples).
 
@@ -13,7 +13,7 @@ Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subpro
 graph LR
     CC[CrowdControl] --> S1[claude #1]
     CC --> S2[claude #2]
-    CC --> S3[open-code #3]
+    CC --> S3[omp #3]
     CC --> SN[... #N]
     S1 --> R[Collect Results]
     S2 --> R
@@ -30,13 +30,13 @@ graph LR
 
 ## Features
 
-- Run N Claude Code / Open Code sessions in parallel
+- Run N Claude Code / Open Code / omp sessions in parallel
 - Fan-out the same prompt across different models
 - Multi-turn conversations with subscriber-based message delivery
 - Fault-isolated sessions via OTP DynamicSupervisor
 - Zero zombie OS processes guaranteed by net_runner's Shepherd
 - Docker support with project directory mounting
-- Works with both `claude` and `open-code` CLIs
+- Works with the `claude`, `open-code` and `omp` CLIs — one message contract for all three
 - **Security hardened**: non-root Docker container, API key protection, capability dropping, resource limits
 - Configurable session concurrency limits and timeouts
 - Input validation and structured logging
@@ -172,6 +172,46 @@ CrowdControl.run_many("Explain recursion", [
   [executable: "open-code", permission_mode: "bypassPermissions"]
 ])
 ```
+
+### Using omp (Oh My Pi)
+
+[omp](https://omp.sh/) speaks its own JSON-RPC protocol over stdio, so it gets
+its own adapter (`CrowdControl.Agent.Omp`). Select it with `agent: :omp` — or
+just name the binary, which infers the adapter:
+
+```elixir
+# Single omp session (agent inferred from the executable)
+CrowdControl.run("Hello", executable: "omp", permission_mode: "bypassPermissions")
+
+# Explicit adapter, omp-native options
+CrowdControl.run("Summarize this repo",
+  agent: :omp,
+  model: "anthropic/claude-haiku-4-5",
+  approval_mode: "yolo",
+  thinking: "off",
+  no_session_persistence: true
+)
+
+# Fan the same prompt across all three CLIs
+CrowdControl.run_many("Explain recursion", [
+  [executable: "claude", model: "sonnet", permission_mode: "bypassPermissions"],
+  [executable: "open-code", permission_mode: "bypassPermissions"],
+  [agent: :omp, permission_mode: "bypassPermissions"]
+])
+```
+
+The messages are the same for every agent: `{:system_init, %{"session_id" => id}}`
+once the CLI is up, `{:assistant, _}` / `{:stream_event, _}` while it works, and
+`{:result, "success", %{"result" => text, "total_cost_usd" => cost}}` at the end
+of a turn. `CrowdControl.collect/2` therefore works across a mixed fan-out.
+
+Behind the scenes the adapter runs `omp --mode rpc`, asks for `get_state` to
+surface the session id, and treats a terminal `agent_end` frame as the end of a
+turn. Claude Code's `:permission_mode` is translated to omp's approval modes
+(`"bypassPermissions"` => `yolo`, `"acceptEdits"` => `write`, `"default"` =>
+`always-ask`); Claude-Code-only options such as `:mcp_config` or
+`:max_budget_usd` raise instead of being silently dropped. See
+`CrowdControl.Agent.Omp` for the full option list.
 
 ### Working with project directories
 
@@ -934,11 +974,27 @@ If you are tempted to add log rotation here, this is the reason not to.
 
 ## CLI Options
 
-All options from `CrowdControl.CLI.build_command/1` can be passed to `start_session`, `run`, and `run_many`:
+Every session picks an **agent adapter** (`CrowdControl.Agent`), which decides
+both the argv the CLI is launched with and the wire format it speaks:
+
+| `:agent` | Adapter | CLI |
+|----------|---------|-----|
+| `:claude` (default), `:claude_code` | `CrowdControl.Agent.ClaudeCode` | `claude` — `--output-format stream-json` |
+| `:open_code`, `:opencode` | `CrowdControl.Agent.ClaudeCode` | `open-code` — same wire format |
+| `:omp` | `CrowdControl.Agent.Omp` | `omp --mode rpc` — see [Using omp](#using-omp-oh-my-pi) |
+
+Omit `:agent` and it is inferred from the `:executable` basename (`"omp"` =>
+the omp adapter), defaulting to Claude Code.
+
+The options below come from `CrowdControl.CLI.build_command/1` (Claude Code)
+and can be passed to `start_session`, `run`, and `run_many`. The omp adapter
+accepts the shared subset plus its own flags, and raises on Claude-Code-only
+options — see `CrowdControl.Agent.Omp`.
 
 | Option | Description |
 |--------|-------------|
-| `:executable` | CLI binary name or path (default: `"claude"`) |
+| `:agent` | Agent adapter (see table above) |
+| `:executable` | CLI binary name or path (default: `"claude"`, or `"omp"` for `agent: :omp`) |
 | `:prompt` | Initial prompt to send |
 | `:model` | Model to use (`"sonnet"`, `"opus"`, `"haiku"`) |
 | `:system_prompt` | Custom system prompt |
@@ -993,15 +1049,16 @@ All options from `CrowdControl.CLI.build_command/1` can be passed to `start_sess
 
 ### Message types
 
-Subscribers receive `{:crowd_control, session_pid, message}` where message is:
+Subscribers receive `{:crowd_control, session_pid, message}` where message is
+the same shape for every agent adapter:
 
 | Message | When |
 |---------|------|
 | `{:system_init, map}` | CLI initialized, contains `session_id`, `tools`, `model` |
 | `{:assistant, map}` | Assistant response with `content` blocks |
 | `{:user, map}` | Tool execution results |
-| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` |
-| `{:stream_event, map}` | Partial message delta (requires `:include_partial_messages`) |
+| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` (Claude Code), `"error_prompt_failed"` (omp) |
+| `{:stream_event, map}` | Partial message delta (Claude Code: requires `:include_partial_messages`; omp: always) |
 | `{:timeout, :session_expired}` | Session timed out (requires `:timeout` option) |
 | `{:exit, status}` | CLI process exited with OS status code |
 
@@ -1108,7 +1165,7 @@ graph LR
     style R fill:#ffd43b,color:#333
 ```
 
-### Wire Protocol (stream-json)
+### Wire Protocol — Claude Code (stream-json)
 
 ```mermaid
 sequenceDiagram
@@ -1129,14 +1186,38 @@ sequenceDiagram
     C->>E: {"type":"result","subtype":"success","result":"..."}\n
 ```
 
+### Wire Protocol — omp (`--mode rpc`)
+
+```mermaid
+sequenceDiagram
+    participant E as Elixir
+    participant O as omp --mode rpc
+
+    O->>E: {"type":"ready","protocolVersion":1,...}\n
+
+    Note over E,O: handshake: ask for the session id
+    E->>O: {"id":"cc-init","type":"get_state"}\n
+    O->>E: {"id":"cc-init","type":"response","command":"get_state","data":{"sessionId":"..."}}\n
+
+    Note over E,O: prompt is acked before the turn runs
+    E->>O: {"id":"cc-prompt-0","type":"prompt","message":"Hello","streamingBehavior":"followUp"}\n
+    O->>E: {"id":"cc-prompt-0","type":"response","command":"prompt","success":true}\n
+    O->>E: {"type":"message_update","assistantMessageEvent":{...}}\n
+    O->>E: {"type":"message_end","message":{"role":"assistant",...}}\n
+    O->>E: {"type":"agent_end","isTerminal":true,"messages":[...]}\n
+
+    Note over E,O: agent_end (isTerminal) is the turn boundary
+```
+
 ### Module Dependency
 
 ```mermaid
 graph BT
     P[Protocol<br/><i>pure functions</i>]
     CLI[CLI<br/><i>pure functions</i>]
-    S[Session<br/><i>GenServer</i>] --> P
-    S --> CLI
+    A[Agent<br/><i>adapter behaviour</i>] --> P
+    A --> CLI
+    S[Session<br/><i>GenServer</i>] --> A
     S --> NR[NetRunner.Process]
     CC[CrowdControl<br/><i>public API</i>] --> S
     CC --> DS[DynamicSupervisor]
@@ -1147,6 +1228,7 @@ graph BT
     style S fill:#4a9eff,color:#fff
     style CC fill:#ff6b6b,color:#fff
     style APP fill:#ffd43b,color:#333
+    style A fill:#51cf66,color:#fff
     style NR fill:#cc5de8,color:#fff
     style DS fill:#ffd43b,color:#333
 ```
@@ -1218,7 +1300,7 @@ See the [Docker](#docker) section for container hardening details (non-root user
 - Elixir >= 1.18
 - Erlang/OTP >= 27
 - C compiler (gcc or clang) for net_runner NIF
-- `claude` CLI ([install](https://docs.anthropic.com/en/docs/claude-code)) and/or `open-code` CLI
+- At least one agent CLI: `claude` ([install](https://docs.anthropic.com/en/docs/claude-code)), `open-code`, or `omp` ([omp.sh](https://omp.sh/))
 - `ANTHROPIC_API_KEY` environment variable set
 
 ## License

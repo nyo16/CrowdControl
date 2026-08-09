@@ -8,6 +8,11 @@ defmodule CrowdControl.TestHelpers do
     Path.expand("../support/fake_cli.sh", __DIR__)
   end
 
+  @doc "Absolute path to the fake `omp --mode rpc` script used by integration tests."
+  def fake_omp_path do
+    Path.expand("../support/fake_omp_rpc.sh", __DIR__)
+  end
+
   @doc """
   Stop a session, tolerating mailbox congestion. Falls back to a hard
   `Process.exit(pid, :kill)` if the GenServer.call times out.

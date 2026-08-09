@@ -1,8 +1,13 @@
 defmodule CrowdControl do
   @moduledoc """
-  Orchestrate many Claude Code / Open Code CLI instances in parallel.
+  Orchestrate many coding-agent CLI instances in parallel.
 
-  See `CrowdControl.CLI.build_command/1` for the full list of session options.
+  Claude Code, Open Code and [omp](https://omp.sh/) are supported; pick one per
+  session with `:agent` (see `CrowdControl.Agent`). Every agent reports through
+  the same message contract, so a mixed fan-out collects uniformly.
+
+  See `CrowdControl.CLI.build_command/1` (Claude Code / Open Code) and
+  `CrowdControl.Agent.Omp` (omp) for the full list of session options.
   """
 
   alias CrowdControl.Session

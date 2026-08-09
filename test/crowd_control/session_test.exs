@@ -390,6 +390,80 @@ defmodule CrowdControl.SessionTest do
     end
   end
 
+  # End-to-end against a scripted `omp --mode rpc` stand-in: proves the adapter
+  # boundary, not the model. The session must surface an omp session id, a
+  # Claude-shaped result, and survive past the first turn.
+  describe "omp agent" do
+    test "handshake yields a session id and a turn yields a result" do
+      {:ok, pid} =
+        Session.start_link(
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          env: %{"FAKE_OMP_SESSION_ID" => "omp-fixed-id"},
+          timeout: 10_000,
+          prompt: "hi"
+        )
+
+      Session.subscribe(pid)
+
+      assert_receive {:crowd_control, ^pid, {:system_init, init}}, 5_000
+      assert init["session_id"] == "omp-fixed-id"
+      assert init["tools"] == ["read", "write"]
+
+      assert_receive {:crowd_control, ^pid, {:assistant, _}}, 5_000
+      assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
+      assert result["result"] == "done:hi"
+      assert result["total_cost_usd"] == 0.75
+
+      assert Session.get_session_id(pid) == "omp-fixed-id"
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a second prompt is accepted after the first turn completes" do
+      {:ok, pid} =
+        Session.start_link(
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          timeout: 10_000,
+          prompt: "one"
+        )
+
+      Session.subscribe(pid)
+
+      assert_receive {:crowd_control, ^pid, {:result, "success", %{"result" => "done:one"}}},
+                     5_000
+
+      # The turn is over but `omp --mode rpc` is still reading stdin, so the
+      # session must not have latched itself shut.
+      assert :ok = Session.send_prompt(pid, "two")
+
+      assert_receive {:crowd_control, ^pid, {:result, "success", %{"result" => "done:two"}}},
+                     5_000
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a rejected prompt surfaces as an error result instead of hanging" do
+      {:ok, pid} =
+        Session.start_link(
+          agent: :omp,
+          executable: TestHelpers.fake_omp_path(),
+          env: %{"FAKE_OMP_PROMPT_FAIL" => "1"},
+          timeout: 10_000,
+          prompt: "hi"
+        )
+
+      Session.subscribe(pid)
+
+      assert_receive {:crowd_control, ^pid, {:result, "error_prompt_failed", result}}, 5_000
+      assert result["is_error"] == true
+      assert result["error_code"] == "session_busy"
+
+      TestHelpers.stop_session(pid)
+    end
+  end
+
   defp start_fake_session(extra_opts \\ []) do
     opts =
       Keyword.merge(

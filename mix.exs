@@ -49,8 +49,8 @@ defmodule CrowdControl.MixProject do
   defp elixirc_paths(_), do: ["lib"]
 
   defp description do
-    "Orchestrate many Claude Code and Open Code CLI instances in parallel from Elixir, " <>
-      "with zero-zombie subprocess management, structured stream-json I/O, and Docker hardening."
+    "Orchestrate many Claude Code, Open Code, and omp CLI instances in parallel from Elixir, " <>
+      "with zero-zombie subprocess management, structured JSON/RPC I/O, and Docker hardening."
   end
 
   defp package do
@@ -79,6 +79,11 @@ defmodule CrowdControl.MixProject do
       ],
       groups_for_modules: [
         Core: [CrowdControl, CrowdControl.Session],
+        Agents: [
+          CrowdControl.Agent,
+          CrowdControl.Agent.ClaudeCode,
+          CrowdControl.Agent.Omp
+        ],
         Backends: [
           CrowdControl.Backend,
           CrowdControl.Backend.Local,
