@@ -20,3 +20,4 @@ valid API key in `ANTHROPIC_API_KEY` (or pass `:api_key` per-session).
 | [`error_handling.exs`](error_handling.exs) | Timeouts, oversized prompts, supervisor cap |
 | [`bounded_pool.exs`](bounded_pool.exs) | Saturate `max_sessions` and degrade gracefully |
 | [`omp_agent.exs`](omp_agent.exs) | Drive [omp](https://omp.sh/) over JSON-RPC and mix it with Claude Code |
+| [`omp_custom_provider.exs`](omp_custom_provider.exs) | Point omp at a self-hosted vLLM / OpenAI-compatible endpoint |

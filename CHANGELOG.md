@@ -52,6 +52,28 @@
   translated to omp's approval modes; Claude-Code-only options
   (`:mcp_config`, `:max_budget_usd`, `:settings`, ...) raise rather than being
   silently dropped. See `CrowdControl.Agent.Omp`.
+- **Custom omp providers — vLLM, LiteLLM, any OpenAI-compatible endpoint.**
+  omp resolves a provider's `baseUrl` from `models.yml` under its agent
+  directory and exposes no CLI flag for it, so `:custom_provider` renders that
+  file into a private `0700` temp directory and points `PI_CODING_AGENT_DIR`
+  at it:
+
+  ```elixir
+  CrowdControl.run("Review this diff",
+    agent: :omp,
+    custom_provider: [base_url: "http://10.0.0.5:8000/v1"],
+    model: "vllm/Qwen/Qwen3-Coder-30B"
+  )
+  ```
+
+  Models are discovered from the server's `/v1/models` (the built-in `vllm`
+  provider also reads `max_model_len`), or listed explicitly with `:models`.
+  A provider `:api_key` is **never written to `models.yml`**: the config
+  references it by environment-variable name and the value travels through the
+  same validated `0600` env-file channel as every other credential, so it stays
+  out of both disk and argv. `:agent_dir` supplies a caller-owned directory
+  instead — needed for the Docker and Kubernetes backends, where a host temp
+  dir is not visible inside the sandbox. See `CrowdControl.Agent.Omp`.
 - **`CrowdControl.Agent` behaviour.** The CLI dialect a session speaks —
   argv plus wire format — is now a pluggable adapter
   (`CrowdControl.Agent.ClaudeCode`, `CrowdControl.Agent.Omp`, or your own

@@ -142,6 +142,196 @@ defmodule CrowdControl.Agent.OmpTest do
     end
   end
 
+  describe "custom providers" do
+    defp config(spec), do: JSON.decode!(Omp.render_models_config!(spec))
+
+    defp provider(spec) do
+      %{"providers" => providers} = config(spec)
+      {id, body} = Enum.at(providers, 0)
+      {id, body}
+    end
+
+    test "a bare base_url renders the built-in vllm provider with no auth" do
+      # omp's built-in `vllm` id already reads /v1/models (and max_model_len),
+      # so an explicit discovery block would be redundant.
+      assert {"vllm", body} = provider(base_url: "http://10.0.0.5:8000/v1")
+
+      assert body["baseUrl"] == "http://10.0.0.5:8000/v1"
+      assert body["api"] == "openai-completions"
+      assert body["auth"] == "none"
+      refute Map.has_key?(body, "discovery")
+      refute Map.has_key?(body, "models")
+    end
+
+    test "a non-vllm id gets generic OpenAI discovery spelled out" do
+      assert {"my-proxy", body} = provider(id: "my-proxy", base_url: "http://h:8000/v1")
+      assert body["discovery"] == %{"type" => "openai-models-list"}
+    end
+
+    test "an explicit model list replaces discovery" do
+      {_id, body} =
+        provider(
+          id: "my-proxy",
+          base_url: "http://h:8000/v1",
+          models: [
+            [
+              id: "Qwen/Q3",
+              context_window: 32_768,
+              max_tokens: 4096,
+              reasoning: true,
+              input: ["text"]
+            ]
+          ]
+        )
+
+      refute Map.has_key?(body, "discovery")
+
+      assert body["models"] == [
+               %{
+                 "id" => "Qwen/Q3",
+                 "name" => "Qwen/Q3",
+                 "contextWindow" => 32_768,
+                 "maxTokens" => 4096,
+                 "reasoning" => true,
+                 "input" => ["text"]
+               }
+             ]
+    end
+
+    test "an anthropic-shaped endpoint refuses to guess a model list" do
+      # There is no OpenAI /v1/models to probe, so inventing a discovery block
+      # would yield a provider that silently resolves nothing.
+      assert_raise ArgumentError, ~r/cannot discover models/, fn ->
+        config(id: "gw", base_url: "https://gw/v1", api: "anthropic-messages")
+      end
+    end
+
+    test "accepts a map spec as well as a keyword list" do
+      assert {"vllm", %{"baseUrl" => "http://h/v1"}} = provider(%{base_url: "http://h/v1"})
+    end
+
+    test "requires a base_url" do
+      assert_raise ArgumentError, ~r/requires :base_url/, fn -> config(id: "x") end
+    end
+
+    test "rejects an unsupported api" do
+      assert_raise ArgumentError, ~r/:api must be one of/, fn ->
+        config(base_url: "http://h/v1", api: "grpc")
+      end
+    end
+
+    test "rejects control characters in the base url" do
+      assert_raise ArgumentError, ~r/control character/, fn ->
+        config(base_url: "http://h/v1\nX: y")
+      end
+    end
+
+    # The whole point of the env-var indirection: models.yml is a plain file on
+    # disk, and a provider key has no business being in it.
+    test "the provider key is referenced by env var name, never written to the config" do
+      {_id, body} = provider(base_url: "http://h/v1", api_key: "vllm-secret-abc")
+
+      assert body["apiKey"] == "OMP_CUSTOM_PROVIDER_KEY"
+      assert body["authHeader"] == true
+      refute Map.has_key?(body, "auth")
+
+      refute Omp.render_models_config!(base_url: "http://h/v1", api_key: "vllm-secret-abc")
+             |> String.contains?("vllm-secret-abc")
+    end
+
+    test "the provider key travels through env, never through argv" do
+      {_exe, args, env} =
+        Omp.build_command(custom_provider: [base_url: "http://h/v1", api_key: "vllm-secret-abc"])
+
+      assert env["OMP_CUSTOM_PROVIDER_KEY"] == "vllm-secret-abc"
+      refute Enum.any?(args, &String.contains?(&1, "vllm-secret-abc"))
+
+      Omp.remove_provider_dir(env["PI_CODING_AGENT_DIR"])
+    end
+
+    test ":api_key_env renames the variable on both sides" do
+      {_exe, _args, env} =
+        Omp.build_command(
+          custom_provider: [base_url: "http://h/v1", api_key: "k", api_key_env: "MY_VLLM_KEY"]
+        )
+
+      assert env["MY_VLLM_KEY"] == "k"
+
+      {_id, body} = provider(base_url: "http://h/v1", api_key: "k", api_key_env: "MY_VLLM_KEY")
+      assert body["apiKey"] == "MY_VLLM_KEY"
+
+      Omp.remove_provider_dir(env["PI_CODING_AGENT_DIR"])
+    end
+
+    test "build_command points PI_CODING_AGENT_DIR at a private generated dir" do
+      {_exe, _args, env} = Omp.build_command(custom_provider: [base_url: "http://h/v1"])
+      dir = env["PI_CODING_AGENT_DIR"]
+
+      assert File.dir?(dir)
+      # 0o40700 -- owner only, like Backend.Local's env dir.
+      assert File.stat!(dir).mode == 0o40700
+      assert File.stat!(Path.join(dir, "models.yml")).mode == 0o100600
+
+      assert JSON.decode!(File.read!(Path.join(dir, "models.yml")))["providers"]["vllm"][
+               "baseUrl"
+             ] ==
+               "http://h/v1"
+
+      Omp.remove_provider_dir(dir)
+    end
+
+    test "one spec maps to one directory, so a fan-out does not write N copies" do
+      same_a = Omp.provider_dir!(base_url: "http://shared:8000/v1")
+      same_b = Omp.provider_dir!(base_url: "http://shared:8000/v1")
+      other = Omp.provider_dir!(base_url: "http://elsewhere:8000/v1")
+
+      assert same_a == same_b
+      refute same_a == other
+
+      Enum.each([same_a, other], &Omp.remove_provider_dir/1)
+    end
+
+    test "the directory name is not guessable from the spec alone" do
+      # A pure content hash would let another local user pre-create the path (or
+      # plant a symlink at models.yml) before we write it.
+      dir = Omp.provider_dir!(base_url: "http://h:8000/v1")
+      digest = :sha256 |> :crypto.hash("http://h:8000/v1") |> Base.encode16(case: :lower)
+
+      refute String.contains?(Path.basename(dir), binary_part(digest, 0, 16))
+
+      Omp.remove_provider_dir(dir)
+    end
+
+    test ":agent_dir passes a caller-owned directory through instead" do
+      {_exe, _args, env} = Omp.build_command(agent_dir: "/tmp/my-omp-agent")
+      assert env["PI_CODING_AGENT_DIR"] == "/tmp/my-omp-agent"
+    end
+
+    test ":agent_dir and :custom_provider together are a contradiction, not a merge" do
+      assert_raise ArgumentError, ~r/mutually exclusive/, fn ->
+        Omp.build_command(agent_dir: "/tmp/x", custom_provider: [base_url: "http://h/v1"])
+      end
+    end
+
+    test "an explicit :env entry still wins over the generated ones" do
+      {_exe, _args, env} =
+        Omp.build_command(
+          custom_provider: [base_url: "http://h/v1"],
+          env: %{"PI_CODING_AGENT_DIR" => "/tmp/caller-wins"}
+        )
+
+      assert env["PI_CODING_AGENT_DIR"] == "/tmp/caller-wins"
+    end
+
+    test "remove_provider_dir refuses anything it did not create" do
+      assert {:error, :not_a_provider_dir} = Omp.remove_provider_dir("/etc")
+      assert {:error, :not_a_provider_dir} = Omp.remove_provider_dir(System.tmp_dir!())
+
+      assert {:error, :not_a_provider_dir} =
+               Omp.remove_provider_dir(Path.join(System.tmp_dir!(), "cc_omp_x/../../etc"))
+    end
+  end
+
   describe "init_frames/1" do
     test "asks for the session state so a session id is observable" do
       assert [frame] = Omp.init_frames([])

@@ -65,6 +65,9 @@ defmodule CrowdControl.Agent.Omp do
       `:no_rules`, `:no_title`, `:advisor`, `:allow_home`, `:hide_thinking` - booleans
     * `:streaming_behavior` - `"followUp"` (default) or `"steer"`; how a prompt
       sent mid-turn is queued
+    * `:agent_dir` - path for `PI_CODING_AGENT_DIR`, the directory omp reads
+      `models.yml` and `config.yml` from (sanitized + expanded)
+    * `:custom_provider` - declarative OpenAI-compatible endpoint; see below
 
   Claude-Code-only options (`:mcp_config`, `:strict_mcp_config`, `:agents`,
   `:plugin_dir`, `:settings`, `:settings_file`, `:settings_json`,
@@ -72,6 +75,53 @@ defmodule CrowdControl.Agent.Omp do
   equivalent and raise `ArgumentError` rather than being dropped silently.
   `:include_partial_messages` is accepted and ignored: RPC mode always streams
   deltas as `message_update` frames.
+
+  ## Custom providers (vLLM, LiteLLM, any OpenAI-compatible endpoint)
+
+  omp resolves a provider's `baseUrl` from `models.yml` under its agent
+  directory — there is no CLI flag for it. `:custom_provider` renders that file
+  into a private `0700` temp directory and points `PI_CODING_AGENT_DIR` at it:
+
+      CrowdControl.run("Explain this repo",
+        agent: :omp,
+        custom_provider: [base_url: "http://10.0.0.5:8000/v1"],
+        model: "vllm/Qwen/Qwen3-Coder-30B"
+      )
+
+  Spec keys:
+
+    * `:base_url` - **required**, the OpenAI-compatible endpoint
+    * `:id` - provider id, default `"vllm"`. omp has a built-in `vllm` provider
+      that reads `max_model_len` from `/v1/models`; any other id is a plain
+      custom provider. The id is the `provider/` prefix in `:model`.
+    * `:api` - default `"openai-completions"`; use `"openai-responses"` for a
+      server exposing `/v1/responses`, or `"anthropic-messages"`
+    * `:api_key` - provider credential. **Never written to `models.yml`**: it is
+      passed through the same validated environment channel as `:api_key`
+      (a `0600` env file locally, the exec `Env` array remotely), and the config
+      references it by variable name. Omit it for an unauthenticated server,
+      which renders `auth: none`.
+    * `:api_key_env` - name of that variable, default `"OMP_CUSTOM_PROVIDER_KEY"`
+    * `:models` - explicit model list, each `[id: ..., name: ..., context_window:
+      ..., max_tokens: ..., reasoning: true | false, input: ["text", "image"]]`.
+      Omit to discover models from the server's `/v1/models` instead.
+    * `:headers` - extra request headers as a string-keyed map
+
+  The directory is content-addressed, so every session in a fan-out sharing one
+  spec shares one directory rather than writing N copies. Build it yourself with
+  `provider_dir!/1` and pass `:agent_dir` when you want to own the lifecycle
+  (and `remove_provider_dir/1` to delete it). For the Docker and Kubernetes
+  backends the directory has to exist *inside* the sandbox, so mount your own
+  and pass `:agent_dir` — a host temp dir is not visible there.
+
+  > #### `PI_CODING_AGENT_DIR` relocates more than `models.yml` {: .warning}
+  >
+  > It moves the whole `~/.omp/agent` base for that session: `config.yml`, the
+  > auth store (`agent.db`), and saved sessions. A session pointed at a custom
+  > provider therefore does not see your global omp settings or stored logins,
+  > which is usually what you want for an isolated endpoint but does mean
+  > `:custom_provider` and your normal Anthropic credentials do not mix in one
+  > session. `~/.omp` itself (skills, plugins) is unaffected.
   """
 
   @behaviour CrowdControl.Agent
@@ -94,6 +144,12 @@ defmodule CrowdControl.Agent.Omp do
 
   # C0 control bytes, as single-byte patterns for :binary.match/2.
   @control_bytes for b <- 0..31, do: <<b>>
+
+  @default_provider_id "vllm"
+  @default_provider_api "openai-completions"
+  @default_provider_key_env "OMP_CUSTOM_PROVIDER_KEY"
+  @provider_apis ~w(openai-completions openai-responses anthropic-messages)
+  @agent_dir_env "PI_CODING_AGENT_DIR"
 
   @unsupported [
     mcp_config: "omp configures MCP servers through its config file",
@@ -120,6 +176,14 @@ defmodule CrowdControl.Agent.Omp do
     _ = streaming_behavior!(opts)
 
     executable = Keyword.get(opts, :executable, "omp")
+
+    # Merged *under* an explicit :env so a caller can always override, and
+    # merged before CLI.build_env/1 so the provider key and the agent dir go
+    # through the same key/value validation as everything else -- and out to
+    # the subprocess through the same 0600 env file, never through argv.
+    extra = provider_env!(opts)
+    opts = Keyword.update(opts, :env, extra, &Map.merge(extra, &1))
+
     {executable, @base_args ++ optional_args(opts), CLI.build_env(opts)}
   end
 
@@ -154,6 +218,281 @@ defmodule CrowdControl.Agent.Omp do
       {:ok, map} when is_map(map) -> classify(map)
       {:ok, _other} -> {:invalid_json, line}
       {:error, _reason} -> {:invalid_json, line}
+    end
+  end
+
+  @doc """
+  Renders a `models.yml` for a custom provider into a private temp directory
+  and returns its path, for use as `:agent_dir`.
+
+  The directory is `0700`, the file `0600`, and the name is derived from a
+  per-VM random salt plus a digest of the rendered config — so one spec maps to
+  one directory no matter how many sessions share it, and the path is not
+  guessable by another local user. Writing is idempotent.
+
+  The spec never carries a secret to disk: `:api_key` is referenced by
+  environment-variable name (see `:api_key_env`), and the value itself travels
+  through the session's normal environment channel.
+
+  Delete it with `remove_provider_dir/1` when the last session using it is done;
+  it is a few hundred bytes, so leaving it until the OS clears the temp
+  directory is also fine.
+
+      dir = CrowdControl.Agent.Omp.provider_dir!(base_url: "http://10.0.0.5:8000/v1")
+      CrowdControl.run("hi", agent: :omp, agent_dir: dir, model: "vllm/my-model")
+  """
+  @spec provider_dir!(keyword() | map()) :: String.t()
+  def provider_dir!(spec) do
+    config = render_models_config!(spec)
+    dir = Path.join(System.tmp_dir!(), "cc_omp_#{salt()}_#{digest(config)}")
+
+    write_provider_dir!(dir, config)
+  end
+
+  @doc """
+  Removes a directory created by `provider_dir!/1`.
+
+  Refuses any path that is not one of ours, so a caller cannot turn a stray
+  option value into a recursive delete.
+  """
+  @spec remove_provider_dir(String.t()) :: :ok | {:error, :not_a_provider_dir}
+  def remove_provider_dir(dir) when is_binary(dir) do
+    # Path.expand/1 on both sides: System.tmp_dir!/0 keeps a trailing slash on
+    # macOS while Path.dirname/1 never emits one, so a raw comparison silently
+    # refuses to delete our own directories.
+    expanded = Path.expand(dir)
+
+    if Path.dirname(expanded) == Path.expand(System.tmp_dir!()) and
+         String.starts_with?(Path.basename(expanded), "cc_omp_") do
+      _ = File.rm_rf(expanded)
+      :ok
+    else
+      {:error, :not_a_provider_dir}
+    end
+  end
+
+  @doc """
+  Renders the `models.yml` body for a custom-provider spec.
+
+  Emitted as JSON, which every YAML parser accepts: it keeps quoting and
+  escaping in `JSON.encode!/1` rather than in a hand-rolled emitter.
+  """
+  @spec render_models_config!(keyword() | map()) :: binary()
+  def render_models_config!(spec) do
+    spec = normalize_spec!(spec)
+    id = spec[:id] || @default_provider_id
+
+    provider =
+      %{"baseUrl" => base_url!(spec), "api" => provider_api!(spec)}
+      |> put_provider_auth(spec)
+      |> put_provider_models(spec, id)
+      |> put_provider_headers(spec)
+
+    JSON.encode!(%{"providers" => %{id => provider}})
+  end
+
+  # --- custom provider ---
+
+  defp provider_env!(opts) do
+    spec = opts[:custom_provider]
+    dir = opts[:agent_dir]
+
+    cond do
+      spec && dir ->
+        raise ArgumentError,
+              ":custom_provider and :agent_dir are mutually exclusive -- " <>
+                ":custom_provider generates an agent dir, :agent_dir supplies one. " <>
+                "Pass the result of provider_dir!/1 as :agent_dir to do both."
+
+      spec ->
+        normalized = normalize_spec!(spec)
+
+        %{@agent_dir_env => provider_dir!(normalized)}
+        |> put_provider_key(normalized)
+
+      dir ->
+        %{@agent_dir_env => CLI.sanitize_path!(dir)}
+
+      true ->
+        %{}
+    end
+  end
+
+  defp put_provider_key(env, spec) do
+    case spec[:api_key] do
+      nil ->
+        env
+
+      key when is_binary(key) ->
+        Map.put(env, key_env_name!(spec), key)
+
+      other ->
+        raise ArgumentError, ":custom_provider :api_key must be a binary, got: #{inspect(other)}"
+    end
+  end
+
+  defp normalize_spec!(spec) when is_list(spec) do
+    if Keyword.keyword?(spec) do
+      spec
+    else
+      raise ArgumentError, ":custom_provider must be a keyword list or map, got: #{inspect(spec)}"
+    end
+  end
+
+  defp normalize_spec!(spec) when is_map(spec) and not is_struct(spec) do
+    Enum.map(spec, fn
+      {key, value} when is_atom(key) -> {key, value}
+      {key, value} when is_binary(key) -> {String.to_existing_atom(key), value}
+    end)
+  rescue
+    ArgumentError ->
+      reraise ArgumentError, [message: ":custom_provider has an unknown key"], __STACKTRACE__
+  end
+
+  defp normalize_spec!(other),
+    do:
+      raise(
+        ArgumentError,
+        ":custom_provider must be a keyword list or map, got: #{inspect(other)}"
+      )
+
+  defp base_url!(spec) do
+    case spec[:base_url] do
+      url when is_binary(url) and url != "" ->
+        validate!(url, ":custom_provider :base_url")
+        url
+
+      other ->
+        raise ArgumentError,
+              ":custom_provider requires :base_url (e.g. \"http://127.0.0.1:8000/v1\"), " <>
+                "got: #{inspect(other)}"
+    end
+  end
+
+  defp provider_api!(spec) do
+    case spec[:api] || @default_provider_api do
+      api when api in @provider_apis ->
+        api
+
+      other ->
+        raise ArgumentError,
+              ":custom_provider :api must be one of #{inspect(@provider_apis)}, got: #{inspect(other)}"
+    end
+  end
+
+  # The key itself never lands in the file: omp resolves `apiKey` as an
+  # environment-variable name first and a literal only as a fallback, so naming
+  # the variable keeps the secret in the 0600 env file where the rest of the
+  # credentials already live.
+  defp put_provider_auth(provider, spec) do
+    case spec[:api_key] do
+      nil -> Map.put(provider, "auth", "none")
+      _key -> provider |> Map.put("apiKey", key_env_name!(spec)) |> Map.put("authHeader", true)
+    end
+  end
+
+  defp key_env_name!(spec) do
+    case spec[:api_key_env] || @default_provider_key_env do
+      name when is_binary(name) ->
+        name
+
+      other ->
+        raise ArgumentError,
+              ":custom_provider :api_key_env must be a binary, got: #{inspect(other)}"
+    end
+  end
+
+  # No explicit list means "ask the server". omp's built-in `vllm` provider
+  # already knows how to read /v1/models (and vLLM's `max_model_len`); any other
+  # OpenAI-shaped id needs the generic discovery type spelled out. An
+  # Anthropic-shaped endpoint has no OpenAI /v1/models to probe, so guessing one
+  # would produce a provider that silently resolves no models at all -- say so
+  # instead.
+  defp put_provider_models(provider, spec, id) do
+    case {spec[:models], provider["api"]} do
+      {nil, _api} when id == @default_provider_id ->
+        provider
+
+      {nil, "anthropic-messages"} ->
+        raise ArgumentError,
+              ":custom_provider with api: \"anthropic-messages\" cannot discover models " <>
+                "(there is no OpenAI /v1/models to probe); list them with :models"
+
+      {nil, _api} ->
+        Map.put(provider, "discovery", %{"type" => "openai-models-list"})
+
+      {models, _api} when is_list(models) ->
+        Map.put(provider, "models", Enum.map(models, &model_entry!/1))
+
+      {other, _api} ->
+        raise ArgumentError, ":custom_provider :models must be a list, got: #{inspect(other)}"
+    end
+  end
+
+  defp model_entry!(model) do
+    model = normalize_spec!(model)
+
+    id =
+      case model[:id] do
+        id when is_binary(id) and id != "" ->
+          id
+
+        other ->
+          raise ArgumentError, "each :custom_provider model needs an :id, got: #{inspect(other)}"
+      end
+
+    %{"id" => id}
+    |> maybe_put("name", model[:name] || id)
+    |> maybe_put("contextWindow", model[:context_window])
+    |> maybe_put("maxTokens", model[:max_tokens])
+    |> maybe_put("reasoning", model[:reasoning])
+    |> maybe_put("input", model[:input])
+  end
+
+  defp put_provider_headers(provider, spec) do
+    case spec[:headers] do
+      nil ->
+        provider
+
+      headers when is_map(headers) ->
+        Map.put(provider, "headers", headers)
+
+      other ->
+        raise ArgumentError, ":custom_provider :headers must be a map, got: #{inspect(other)}"
+    end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_provider_dir!(dir, config) do
+    File.mkdir_p!(dir)
+    File.chmod!(dir, 0o700)
+
+    path = Path.join(dir, "models.yml")
+    File.write!(path, config)
+    File.chmod!(path, 0o600)
+
+    dir
+  end
+
+  defp digest(config),
+    do: :sha256 |> :crypto.hash(config) |> Base.encode16(case: :lower) |> binary_part(0, 16)
+
+  # A content-only directory name would be guessable, letting another local user
+  # pre-create it (or plant a symlink at models.yml) before we do. The salt is
+  # random per VM, so the path is unpredictable while still being stable enough
+  # for every session in one fan-out to share a directory.
+  defp salt do
+    case :persistent_term.get({__MODULE__, :salt}, nil) do
+      nil ->
+        salt = 8 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower)
+        :persistent_term.put({__MODULE__, :salt}, salt)
+        salt
+
+      salt ->
+        salt
     end
   end
 

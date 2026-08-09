@@ -213,6 +213,74 @@ turn. Claude Code's `:permission_mode` is translated to omp's approval modes
 `:max_budget_usd` raise instead of being silently dropped. See
 `CrowdControl.Agent.Omp` for the full option list.
 
+### Custom providers: vLLM, LiteLLM, any OpenAI-compatible endpoint
+
+omp reads a provider's `baseUrl` from `models.yml` under its agent directory —
+there is no CLI flag for it. `:custom_provider` renders that file into a
+private `0700` temp directory and points the session at it:
+
+```elixir
+# Self-hosted vLLM, no auth. Models are discovered from /v1/models,
+# including vLLM's max_model_len as the context window.
+CrowdControl.run("Review this diff",
+  agent: :omp,
+  custom_provider: [base_url: "http://10.0.0.5:8000/v1"],
+  model: "vllm/Qwen/Qwen3-Coder-30B",
+  approval_mode: "yolo"
+)
+
+# Authenticated endpoint. The key is passed through the same 0600 env-file
+# channel as every other credential — it is never written into models.yml
+# and never appears in argv or `ps`.
+CrowdControl.run("Review this diff",
+  agent: :omp,
+  custom_provider: [
+    id: "my-gateway",
+    base_url: "https://gateway.internal/v1",
+    api_key: System.fetch_env!("GATEWAY_KEY")
+  ],
+  model: "my-gateway/qwen3-coder"
+)
+
+# A server without /v1/models: declare the models yourself.
+CrowdControl.run("Review this diff",
+  agent: :omp,
+  custom_provider: [
+    base_url: "http://10.0.0.5:8000/v1",
+    models: [[id: "Qwen/Qwen3-Coder-30B", context_window: 262_144, max_tokens: 65_536]]
+  ],
+  model: "vllm/Qwen/Qwen3-Coder-30B"
+)
+```
+
+Fan out across several vLLM hosts, or mix local and hosted models in one run:
+
+```elixir
+CrowdControl.run_many("Explain recursion", [
+  [agent: :omp, custom_provider: [base_url: "http://gpu-a:8000/v1"], model: "vllm/qwen3-coder"],
+  [agent: :omp, custom_provider: [base_url: "http://gpu-b:8000/v1"], model: "vllm/llama-3.3-70b"],
+  [agent: :omp, model: "anthropic/claude-haiku-4-5"]
+])
+```
+
+Spec keys: `:base_url` (required), `:id` (default `"vllm"`, and the `provider/`
+prefix in `:model`), `:api` (`"openai-completions"`, `"openai-responses"`, or
+`"anthropic-messages"`), `:api_key`, `:api_key_env`, `:models`, `:headers`.
+
+The generated directory is content-addressed, so every session in a fan-out
+sharing one spec shares one directory. Build it yourself with
+`CrowdControl.Agent.Omp.provider_dir!/1` and pass `:agent_dir` to own the
+lifecycle, and `remove_provider_dir/1` to delete it.
+
+> **`PI_CODING_AGENT_DIR` relocates more than `models.yml`.** It moves the whole
+> `~/.omp/agent` base for that session — `config.yml`, the auth store, saved
+> sessions — so a custom-provider session does not see your global omp settings
+> or stored logins. That is usually what you want for an isolated endpoint, but
+> it does mean `:custom_provider` and your normal Anthropic credentials do not
+> mix within one session. `~/.omp` itself (skills, plugins) is unaffected.
+> For the Docker and Kubernetes backends the directory must exist *inside* the
+> sandbox: mount your own and pass `:agent_dir`.
+
 ### Working with project directories
 
 ```elixir
