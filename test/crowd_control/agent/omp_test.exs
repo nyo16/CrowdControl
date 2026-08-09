@@ -330,6 +330,35 @@ defmodule CrowdControl.Agent.OmpTest do
       assert {:error, :not_a_provider_dir} =
                Omp.remove_provider_dir(Path.join(System.tmp_dir!(), "cc_omp_x/../../etc"))
     end
+
+    test "remove_provider_dir refuses a symlink wearing our prefix" do
+      # A planted `<tmp>/cc_omp_evil -> <victim>` passes both the parent-dir and
+      # prefix checks. File.rm_rf/1 unlinks rather than follows, so the victim
+      # would survive anyway -- but the guard should not be resting on that.
+      victim = Path.join(System.tmp_dir!(), "cc_omp_victim_#{System.unique_integer([:positive])}")
+      link = Path.join(System.tmp_dir!(), "cc_omp_evil_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(Path.join(victim, "nested"))
+      File.write!(Path.join(victim, "keep.txt"), "keep")
+      :ok = File.ln_s(victim, link)
+
+      on_exit(fn ->
+        File.rm(link)
+        File.rm_rf(victim)
+      end)
+
+      assert {:error, :not_a_provider_dir} = Omp.remove_provider_dir(link)
+      assert File.exists?(Path.join(victim, "keep.txt")), "the symlink target must be untouched"
+      assert File.exists?(link), "we refused, so we should not have unlinked it either"
+    end
+
+    test "remove_provider_dir refuses a plain file wearing our prefix" do
+      path = Path.join(System.tmp_dir!(), "cc_omp_notadir_#{System.unique_integer([:positive])}")
+      File.write!(path, "")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:error, :not_a_provider_dir} = Omp.remove_provider_dir(path)
+    end
   end
 
   describe "init_frames/1" do

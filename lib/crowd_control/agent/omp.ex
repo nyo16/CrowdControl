@@ -252,23 +252,42 @@ defmodule CrowdControl.Agent.Omp do
   @doc """
   Removes a directory created by `provider_dir!/1`.
 
-  Refuses any path that is not one of ours, so a caller cannot turn a stray
-  option value into a recursive delete.
+  Refuses anything that is not demonstrably one of ours, so a caller cannot turn
+  a stray option value into a recursive delete: the path must sit directly in
+  the temp directory, carry the `cc_omp_` prefix, and — checked without
+  following symlinks — actually be a directory.
   """
   @spec remove_provider_dir(String.t()) :: :ok | {:error, :not_a_provider_dir}
+  # sobelow_skip ["Traversal.FileModule"]
   def remove_provider_dir(dir) when is_binary(dir) do
     # Path.expand/1 on both sides: System.tmp_dir!/0 keeps a trailing slash on
     # macOS while Path.dirname/1 never emits one, so a raw comparison silently
-    # refuses to delete our own directories.
+    # refuses to delete our own directories. Expanding also collapses `..`, so
+    # `<tmp>/cc_omp_x/../../etc` resolves to `/etc` and fails the parent check
+    # rather than sneaking past the prefix.
     expanded = Path.expand(dir)
 
-    if Path.dirname(expanded) == Path.expand(System.tmp_dir!()) and
-         String.starts_with?(Path.basename(expanded), "cc_omp_") do
+    if provider_dir?(expanded) do
       _ = File.rm_rf(expanded)
       :ok
     else
       {:error, :not_a_provider_dir}
     end
+  end
+
+  defp provider_dir?(path) do
+    Path.dirname(path) == Path.expand(System.tmp_dir!()) and
+      String.starts_with?(Path.basename(path), "cc_omp_") and
+      directory_not_symlink?(path)
+  end
+
+  # lstat, not stat: `File.stat/1` reports a symlink pointing at a directory as
+  # `:directory`, so a planted `<tmp>/cc_omp_evil -> /etc` would pass a naive
+  # type check. `File.rm_rf/1` does not follow symlinks (it unlinks them), so
+  # this is belt-and-braces -- but it keeps the guard true on its own terms
+  # instead of resting on that behaviour.
+  defp directory_not_symlink?(path) do
+    match?({:ok, %File.Stat{type: :directory}}, File.lstat(path))
   end
 
   @doc """
