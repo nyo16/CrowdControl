@@ -38,14 +38,31 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   # CrowdControl.Backend.Kubernetes.provision/1 raises a clear message at
   # runtime if kubereq is genuinely missing.
   @compile {:no_warn_undefined,
-            [Kubereq, Kubereq.Kubeconfig, Kubereq.Kubeconfig.Default, Kubereq.PodExec]}
+            [
+              Kubereq,
+              Kubereq.Kubeconfig,
+              Kubereq.Kubeconfig.Default,
+              Kubereq.PodExec,
+              Kubereq.PodLogs
+            ]}
 
   @default_timeout 30_000
   @default_exec_timeout 15_000
 
+  # v4 rather than v5: v5 adds only close-stdin signalling, which nothing here
+  # needs, and every extra requested subprotocol is another thing an older
+  # apiserver can fail to offer. v4 has been served since Kubernetes 1.7.
+  @exec_subprotocol "v4.channel.k8s.io"
+
   # One page is 500 rather than the API server's 500-ish default because the
   # common case -- one owner's live sandboxes -- fits in a single round trip.
   @page_limit 500
+
+  # A log fetch is a diagnostic, so it is bounded twice: by lines for
+  # readability and by bytes so one chatty container cannot put a megabyte into
+  # a crash report.
+  @default_log_lines 50
+  @default_log_bytes 64 * 1024
 
   @pod_api [api_version: "v1", kind: "Pod"]
   @netpol_api [api_version: "networking.k8s.io/v1", kind: "NetworkPolicy"]
@@ -65,12 +82,74 @@ defmodule CrowdControl.Backend.Kubernetes.API do
       try do
         unquote(body)
       rescue
-        e -> {:error, {:k8s, {:exception, Exception.message(e)}}}
+        e -> {:error, {:k8s, unquote(__MODULE__).exception_reason(e)}}
       catch
         :exit, reason -> {:error, {:k8s, {:exit, reason}}}
       end
     end
   end
+
+  @doc false
+  # The websocket upgrade path produces the worst error term in this codebase,
+  # and it must never reach a log line intact. The chain, all of it inside
+  # kubereq 0.4.4:
+  #
+  #   1. `Kubereq.Connect.connect/1` returns `{req, error}` on failure.
+  #   2. That matches none of `init/1`'s `else` clauses, so Elixir raises
+  #      `WithClauseError`, and `GenServer.start_link/3` returns
+  #      `{:error, {{:else_clause, {req, error}}, stacktrace}}`.
+  #   3. `Kubereq.Connect.start_link/4`'s own `{:ok, resp} = Req.request(...)`
+  #      then raises a `MatchError` whose **term** is that whole structure.
+  #
+  # `Exception.message/1` on that inlines the inspected `%Req.Request{}` — which
+  # carries the kubeconfig's TLS client certificate in `:connect_options` — into
+  # a multi-kilobyte string. Observed against a live cluster: a `404` on the
+  # exec subresource logged ~2 KB including `cert: <<48, 130, 1, 144, ...>>`.
+  #
+  # So the real cause is dug out for the shape we know, and every other
+  # exception message is capped. Two defences rather than one, because the
+  # truncation point of an unrecognised term is not something to bet secrets on.
+  @spec exception_reason(Exception.t()) :: term()
+  def exception_reason(%{__struct__: MatchError, term: term}) do
+    case upgrade_cause(term) do
+      nil -> {:exception, {:match_error, bounded_inspect(term)}}
+      cause -> cause
+    end
+  end
+
+  def exception_reason(exception), do: {:exception, summarize(Exception.message(exception))}
+
+  # Bounds the term **structurally**, not just by length. `limit: 3` elides all
+  # but the first few fields of a struct and all but the first few bytes of a
+  # binary, so a secret nested inside `%Req.Request{}`'s `:connect_options` is
+  # unreachable regardless of where a character cap would happen to fall — while
+  # "a MatchError on a %Req.Response{}" survives, which is the part worth having.
+  defp bounded_inspect(term) do
+    term
+    |> inspect(limit: 3, printable_limit: 64)
+    |> String.slice(0, 200)
+  end
+
+  # Walks the two nestings GenServer/Elixir add around the cause. Matched on
+  # `__struct__` rather than struct patterns for the optional-dep reason above.
+  defp upgrade_cause({:error, reason}), do: upgrade_cause(reason)
+  defp upgrade_cause({{:else_clause, {_req, cause}}, _stacktrace}), do: cause_reason(cause)
+  defp upgrade_cause({:else_clause, {_req, cause}}), do: cause_reason(cause)
+  defp upgrade_cause(_other), do: nil
+
+  # A 404 here is the interesting one: it means the Pod, the container, or the
+  # `exec` subresource itself was not there when the upgrade was attempted —
+  # which is what a deleted or restarted Pod looks like from the client side.
+  defp cause_reason(%{__struct__: Mint.WebSocket.UpgradeFailureError, status_code: status}),
+    do: {:upgrade_failed, status}
+
+  defp cause_reason(%{__struct__: struct, reason: reason})
+       when struct in [Mint.TransportError, Mint.HTTPError],
+       do: {:transport, reason}
+
+  # Known nesting, unknown cause: still never inspect it wholesale.
+  defp cause_reason(%{__struct__: struct}), do: {:upgrade_failed, struct}
+  defp cause_reason(_other), do: {:upgrade_failed, :unknown}
 
   @typedoc """
   Cluster connection config.
@@ -104,6 +183,83 @@ defmodule CrowdControl.Backend.Kubernetes.API do
     |> Req.new()
     |> Kubereq.attach([kubeconfig: kubeconfig(config)] ++ resource)
   end
+
+  @doc """
+  A `client/2` for the `exec` subresource, negotiating `v4.channel.k8s.io`.
+
+  Requesting the subprotocol is what makes exec **exit codes** available at all.
+  Without this header the API server falls back to v1 `channel.k8s.io`, whose
+  channel 3 carries a human string produced by the container *runtime* —
+  measured: `"command terminated with non-zero exit code: Error executing in
+  Docker Container: 7"` under this cluster's runtime, but
+  `"command terminated with exit code 7"` under containerd. Parsing that is
+  parsing a runtime's prose.
+
+  Under v4 the same channel carries a JSON `Status` object instead, so the exit
+  code is a field. Measured against v1.35.6+orb1: `exit 7` yields
+  `%{"status" => "Failure", "reason" => "NonZeroExitCode",
+     "details" => %{"causes" => [%{"reason" => "ExitCode", "message" => "7"}]}}`,
+  and a clean exit yields `%{"metadata" => %{}, "status" => "Success"}` — note
+  that success also produces a frame, which is what makes "no news is good news"
+  the wrong reading of channel 3.
+
+  `kubereq` never sets this itself, but `Kubereq.Connect.connect/1` passes
+  `req.headers` straight into `Mint.WebSocket.upgrade/4`, so a header put here
+  reaches the wire.
+  """
+  @spec exec_client(config()) :: Req.Request.t()
+  def exec_client(config) do
+    config
+    |> client(@pod_api)
+    |> Req.Request.put_header("sec-websocket-protocol", @exec_subprotocol)
+  end
+
+  @doc false
+  # Decodes a channel-3 frame under `v4.channel.k8s.io`.
+  #
+  # Public so the whole table is assertable without an API server; the frames
+  # here are verbatim from a live cluster.
+  @spec exec_status(binary()) :: :ok | {:error, term()}
+  def exec_status(payload) when is_binary(payload) do
+    case JSON.decode(payload) do
+      {:ok, %{"status" => "Success"}} ->
+        :ok
+
+      {:ok, %{"status" => "Failure"} = status} ->
+        {:error, {:k8s, failure_reason(status)}}
+
+      # Not JSON: the server fell back to v1 and sent runtime prose. Keep it,
+      # bounded — it is still the only evidence of what happened.
+      _ ->
+        {:error, {:k8s, {:exec_failed, summarize(payload)}}}
+    end
+  end
+
+  defp failure_reason(%{"details" => %{"causes" => causes}} = status) do
+    causes
+    |> List.wrap()
+    |> Enum.find_value(fn
+      %{"reason" => "ExitCode", "message" => code} -> parse_exit_code(code)
+      _ -> nil
+    end)
+    |> case do
+      nil -> {:exec_failed, summarize(status)}
+      code -> {:exit_status, code}
+    end
+  end
+
+  defp failure_reason(status), do: {:exec_failed, summarize(status)}
+
+  defp parse_exit_code(code) when is_integer(code), do: code
+
+  defp parse_exit_code(code) when is_binary(code) do
+    case Integer.parse(code) do
+      {parsed, ""} -> parsed
+      _ -> nil
+    end
+  end
+
+  defp parse_exit_code(_code), do: nil
 
   defp maybe_put_adapter(opts, nil), do: opts
   defp maybe_put_adapter(opts, adapter), do: [{:adapter, adapter} | opts]
@@ -217,6 +373,102 @@ defmodule CrowdControl.Backend.Kubernetes.API do
     end
   end
 
+  @doc """
+  The container's logs, as a single binary.
+
+  This is the diagnostic channel the backend had none of. A sandbox that dies
+  during provisioning previously produced `{:k8s, {:pod_not_ready,
+  "CrashLoopBackOff"}}` and nothing else — the operator's next step was
+  `kubectl logs` by hand, which is only possible if the Pod still exists, and
+  `destroy/1` has usually removed it by then.
+
+  Bounded by construction, because a log fetch is a diagnostic and must never
+  become the reason a teardown hangs:
+
+    * `follow: false` — **always**, never overridable. `Kubereq.logs/4`'s own
+      docs say `follow: true` "keeps the connection alive which blocks the
+      current process"; that is `Kubereq.PodLogs`' job, not this one.
+    * `tailLines` (default #{@default_log_lines}) and `limitBytes`
+      (default #{@default_log_bytes}) so a chatty container cannot return a
+      megabyte into a crash report.
+    * `:previous` for the case that matters most — a container that already
+      restarted, whose *current* logs are empty precisely because the
+      interesting run is the previous one.
+
+  Built on `Kubereq.PodLogs`, **not** `Kubereq.logs/4`. The latter looks like the
+  obvious call and is a trap three ways: its body is a lazy `Stream`, so a
+  rejected upgrade raises at `Enum` time rather than at the call and escapes the
+  `guard` around it; enumerating it can raise `WithClauseError` from
+  `Kubereq.Connect.create_stream/4`, whose message inspects a `%Mint.HTTP1{}`;
+  and its `:follow` defaults to **true**, so the obvious call blocks forever.
+
+  Returns `{:ok, ""}` when a container has genuinely produced nothing, so a
+  caller can tell "nothing to say" from "could not ask". A Pod whose container
+  never started answers `400` rather than an empty body — there is nothing to
+  read — so `CrowdControl.Backend.Kubernetes` falls back to the Pod's own
+  `state.waiting.message` for that case.
+  """
+  @spec logs(config(), String.t(), keyword()) :: {:ok, binary()} | {:error, term()}
+  def logs(config, pod_name, opts \\ []) do
+    params =
+      [
+        # Never overridable. See above.
+        follow: false,
+        tailLines: Keyword.get(opts, :tail_lines, @default_log_lines),
+        limitBytes: Keyword.get(opts, :limit_bytes, @default_log_bytes),
+        previous: Keyword.get(opts, :previous, false)
+      ]
+      |> maybe_container(opts[:container])
+
+    bounded(config, fn ->
+      # PodLogs links to its caller and raises MatchError on a rejected upgrade.
+      # Inside bounded/2 the caller is this task, so trapping keeps a 400 from
+      # killing it before `guard` can turn it into a value.
+      Process.flag(:trap_exit, true)
+
+      guard do
+        args =
+          [
+            req: client(config, @pod_api),
+            namespace: namespace(config),
+            name: pod_name,
+            into: self()
+          ] ++
+            params
+
+        {:ok, pid} = Kubereq.PodLogs.start_link(args)
+        collect_logs(pid, [])
+      end
+    end)
+  end
+
+  # PodLogs sends `{:stdout, binary}` per frame, then usually
+  # `{:close, code, reason}`, then exits. It does not send `:connected`, unlike
+  # PodExec. The empty first frame is kubereq's priming artefact and is dropped —
+  # for logs, unlike exec, there is no channel byte, so an empty frame is
+  # genuinely empty.
+  #
+  # An abnormal exit **after** bytes have arrived is success, not failure. With
+  # `follow: false` the server writes the body and drops the connection, and
+  # kubereq surfaces that as an `:ssl_closed`-driven
+  # `%Mint.TransportError{reason: :closed}` exit rather than a close frame —
+  # measured against a live cluster on a running Pod. Reporting that as an error
+  # threw away logs we had already received, which is the opposite of the point.
+  # Only a close with nothing in hand is a failure.
+  defp collect_logs(pid, acc) do
+    receive do
+      {:stdout, ""} -> collect_logs(pid, acc)
+      {:stdout, data} -> collect_logs(pid, [data | acc])
+      {:close, _code, _reason} -> {:ok, finish_logs(acc)}
+      {:EXIT, ^pid, :normal} -> {:ok, finish_logs(acc)}
+      {:EXIT, ^pid, _reason} when acc != [] -> {:ok, finish_logs(acc)}
+      {:EXIT, ^pid, reason} -> {:error, {:k8s, {:logs_closed, summarize(inspect(reason))}}}
+      _other -> collect_logs(pid, acc)
+    end
+  end
+
+  defp finish_logs(acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
   defp paginate(req, namespace, opts, continue, acc) do
     params = if continue, do: [limit: @page_limit, continue: continue], else: [limit: @page_limit]
 
@@ -319,21 +571,39 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   defp do_exec_once(config, pod_name, command, opts) do
     params = exec_params(command, Keyword.put_new(opts, :stdin, false))
 
-    case Kubereq.exec(client(config, @pod_api), namespace(config), pod_name, params) do
-      {:ok, %{status: 101, body: stream}} -> {:ok, collect_stdout(stream)}
+    case Kubereq.exec(exec_client(config), namespace(config), pod_name, params) do
+      {:ok, %{status: 101, body: stream}} -> collect_exec(stream)
       other -> normalize(other)
     end
   end
 
-  defp collect_stdout(stream) do
-    stream
-    |> Enum.reduce([], fn
-      {:stdout, data}, acc -> [data | acc]
-      _other, acc -> acc
-    end)
-    |> Enum.reverse()
-    |> IO.iodata_to_binary()
+  # Channel 3 is consumed, not discarded. Discarding it is how a command that
+  # exited non-zero returned `{:ok, ""}`: `Backend.Kubernetes.exec/4` and
+  # `write/2` both read `{:ok, _}` as success, so a failed launch pipeline or a
+  # full FIFO looked exactly like a working one.
+  #
+  # Frame order across channels is not guaranteed — a `{:stderr, _}` before the
+  # first `{:stdout, _}` was observed live — so the stream is drained fully and
+  # the status decided at the end rather than short-circuiting on the first
+  # channel-3 frame.
+  defp collect_exec(stream) do
+    {stdout, status} =
+      Enum.reduce(stream, {[], :ok}, fn
+        {:stdout, data}, {acc, status} -> {[data | acc], status}
+        {:error, payload}, {acc, status} -> {acc, merge_status(status, exec_status(payload))}
+        _other, acc_status -> acc_status
+      end)
+
+    case status do
+      :ok -> {:ok, stdout |> Enum.reverse() |> IO.iodata_to_binary()}
+      {:error, reason} -> {:error, reason}
+    end
   end
+
+  # First failure wins: a later `Success` frame must not overwrite an earlier
+  # non-zero exit.
+  defp merge_status({:error, _} = failure, _next), do: failure
+  defp merge_status(:ok, next), do: next
 
   @doc """
   Run `command` and feed `payload` to its stdin over the exec websocket.
@@ -402,7 +672,7 @@ defmodule CrowdControl.Backend.Kubernetes.API do
     guard do
       args =
         [
-          req: client(config, @pod_api),
+          req: exec_client(config),
           namespace: namespace(config),
           name: pod_name,
           into: into
@@ -497,6 +767,14 @@ defmodule CrowdControl.Backend.Kubernetes.API do
     do: String.slice(message, 0, 200)
 
   def summarize(body) when is_binary(body), do: String.slice(body, 0, 200)
+
+  # A v4 channel-3 `Status` with no "message" — e.g. a Failure whose detail is
+  # only in `details.causes` — would otherwise summarize to "" and lose the one
+  # thing worth reporting. Bounded structurally for the reason bounded_inspect/1
+  # exists.
+  def summarize(%{"status" => _} = status),
+    do: status |> inspect(limit: 5) |> String.slice(0, 200)
+
   def summarize(_), do: ""
 
   # --- Private ---

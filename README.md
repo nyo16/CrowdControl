@@ -36,6 +36,7 @@ graph LR
 - Fault-isolated sessions via OTP DynamicSupervisor
 - Zero zombie OS processes guaranteed by net_runner's Shepherd
 - Docker support with project directory mounting
+- Sandbox each session in a container, a Compose stack or a GCE spot VM — one transport, pluggable [providers](#sandbox-providers)
 - Works with the `claude`, `open-code` and `omp` CLIs — one message contract for all three
 - **Security hardened**: non-root Docker container, API key protection, capability dropping, resource limits
 - Configurable session concurrency limits and timeouts
@@ -952,6 +953,12 @@ backend whose handle carries credentials — and `push_workspace/2` /
 | `Backend.Local` (default) | local subprocess | no — dies with the VM |
 | `Backend.Docker` | container | yes — reattachable |
 | `Backend.Kubernetes` | Pod, over the API server | yes — reattachable |
+| `Backend.Sandboxd` | whatever its **provider** supplies — a container, a stack, or a VM | yes — reattachable |
+
+`Backend.Sandboxd` is the odd one out: it is a transport with no substrate of
+its own, and pairs with a `CrowdControl.Provider` that supplies one. If you want
+a Compose stack or a cloud VM rather than a single container, that is the section
+you want — see [Sandbox Providers](#sandbox-providers).
 
 ### Docker backend
 

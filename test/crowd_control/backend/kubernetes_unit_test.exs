@@ -357,7 +357,7 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
       # offset is a position in the tee file, and the resume command is
       # `tail -c +<offset + 1>`. Losing it re-reads the whole file into the
       # session; advancing it re-reads nothing and drops what was in flight.
-      state = %{podexec: :dead_channel, offset: 4_096, reconnects: 3}
+      state = %{podexec: :dead_channel, offset: 4_096, reconnects: 3, opened_at: nil}
 
       resumed = Kubernetes.attach_stream(state, :fresh_channel)
 
@@ -365,15 +365,119 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
       assert resumed.podexec == :fresh_channel
     end
 
-    test "the reconnect counter is carried through, not reset" do
-      # reconnects counts reconnects since the last *delivered byte*, and only
-      # deliver/2 resets it. Resetting on every successful open would let a
-      # channel that flaps open-then-closed against a Running Pod reconnect
-      # forever instead of giving up at @max_reconnects.
-      state = %{podexec: nil, offset: 0, reconnects: 4}
+    test "the counter survives the swap, so a flapping channel stays bounded" do
+      # attach_stream/2 itself must not reset: a channel that opens and closes
+      # immediately, over and over, has made no progress and has to hit
+      # @max_reconnects eventually.
+      state = %{podexec: nil, offset: 0, reconnects: 4, opened_at: nil}
 
       assert Kubernetes.attach_stream(state, :fresh_channel).reconnects == 4,
-             "resetting here makes @max_reconnects unreachable and a flapping channel unbounded"
+             "resetting on open alone makes @max_reconnects unreachable"
+    end
+
+    test "opening a channel stamps when it opened, which is what bounds the budget" do
+      # The counter is "consecutive failures to establish a stream", so the
+      # reader needs to know how long the last one lived. Without this stamp the
+      # budget silently reverts to "failures since the last delivered byte",
+      # which guarantees idle sessions die: any five stream closes with no output
+      # between them end the session, however far apart they are, and a CRI
+      # streaming server closes an idle exec stream every 4h by default.
+      state = %{podexec: nil, offset: 0, reconnects: 0, opened_at: nil}
+
+      opened = Kubernetes.attach_stream(state, :fresh_channel)
+
+      assert is_integer(opened.opened_at)
+      assert opened.opened_at <= System.monotonic_time(:millisecond)
+    end
+  end
+
+  describe "liveness is tri-state (blocker: one throttled GET kills a healthy session)" do
+    test "a Running pod is :running" do
+      assert Kubernetes.liveness(handle_for(%{"status" => %{"phase" => "Running"}})) == :running
+    end
+
+    test "a terminated pod is :terminal" do
+      for phase <- ["Succeeded", "Failed", "Pending"] do
+        assert Kubernetes.liveness(handle_for(%{"status" => %{"phase" => phase}})) == :terminal
+      end
+    end
+
+    test "a pod being deleted is :terminal even while it still reports Running" do
+      # Reconnecting into a Pod with a deletionTimestamp just races the
+      # deletion, and the race is not worth running.
+      pod = %{
+        "metadata" => %{"deletionTimestamp" => "2026-08-30T12:00:00Z"},
+        "status" => %{"phase" => "Running"}
+      }
+
+      assert Kubernetes.liveness(handle_for(pod)) == :terminal
+    end
+
+    test "a 404 is :terminal, because that is the one error meaning gone" do
+      assert Kubernetes.liveness(handle_erroring({:k8s, {:not_found, "pods 'x' not found"}})) ==
+               :terminal
+    end
+
+    test "any other error is :unknown, NOT dead" do
+      # This is the bug the tri-state exists for: collapsing these to `false`
+      # meant a single 429, 500 or DNS blip during an idle liveness poll ended a
+      # live session and orphaned a billed Pod. await_exit/2 already failed open
+      # on the same errors, so the boolean was the inconsistent one.
+      for reason <- [
+            {:k8s, {:http_status, 429, "too many requests"}},
+            {:k8s, {:http_status, 500, "internal error"}},
+            {:k8s, {:transport, :timeout}},
+            {:k8s, {:transport, :econnrefused}},
+            {:k8s, {:forbidden, "rbac"}}
+          ] do
+        assert Kubernetes.liveness(handle_erroring(reason)) == :unknown,
+               "#{inspect(reason)} was read as evidence the Pod is gone"
+      end
+    end
+
+    test "alive?/1 stays a boolean and only Running is true" do
+      assert Kubernetes.alive?(handle_for(%{"status" => %{"phase" => "Running"}}))
+      refute Kubernetes.alive?(handle_for(%{"status" => %{"phase" => "Failed"}}))
+      refute Kubernetes.alive?(handle_erroring({:k8s, {:transport, :timeout}}))
+    end
+  end
+
+  describe "exec exit codes (blocker: a failed command reported as success)" do
+    test "a v4 Success frame is :ok" do
+      assert API.exec_status(~s({"metadata":{},"status":"Success"})) == :ok
+    end
+
+    test "a non-zero exit is an error carrying the code" do
+      # Verbatim from a live cluster for `sh -c 'exit 7'`.
+      payload =
+        ~s({"metadata":{},"status":"Failure","message":"command terminated with non-zero exit code","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"7"}]}})
+
+      assert API.exec_status(payload) == {:error, {:k8s, {:exit_status, 7}}}
+    end
+
+    test "a Failure with no ExitCode cause still errors rather than passing" do
+      payload = ~s({"status":"Failure","message":"container not found","reason":"NotFound"})
+
+      assert {:error, {:k8s, {:exec_failed, message}}} = API.exec_status(payload)
+      assert message =~ "container not found"
+    end
+
+    test "runtime prose from a v1 fallback is kept, not silently dropped" do
+      # If the subprotocol is ever not honoured the server sends English, and it
+      # is runtime-specific: Docker says "Error executing in Docker Container: 7"
+      # where containerd says "command terminated with exit code 7". Unparseable
+      # on purpose — but it is still the only evidence, so it is preserved.
+      assert {:error, {:k8s, {:exec_failed, message}}} =
+               API.exec_status("command terminated with non-zero exit code: ...: 1")
+
+      assert message =~ "terminated"
+    end
+
+    test "a bounded message, so a chatty status cannot reach a crash report" do
+      payload = ~s({"status":"Failure","message":"#{String.duplicate("x", 500)}"})
+
+      assert {:error, {:k8s, {:exec_failed, message}}} = API.exec_status(payload)
+      assert byte_size(message) <= 200
     end
   end
 
@@ -520,6 +624,68 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
       assert message =~ "nope"
     end
 
+    test "a failed websocket upgrade names the status instead of dumping the request" do
+      # The real term, reproduced. kubereq 0.4.4 builds it three layers deep:
+      # Connect.connect/1 returns {req, error}, which matches no `else` clause in
+      # init/1 (WithClauseError), GenServer wraps that with a stacktrace, and
+      # Connect.start_link/4's own `{:ok, resp} = ...` raises a MatchError whose
+      # *term* is the lot.
+      upgrade_error = %{__struct__: Mint.WebSocket.UpgradeFailureError, status_code: 404}
+      request = %Req.Request{method: :get, options: %{connect_options: [cert: <<48, 130, 1>>]}}
+
+      term =
+        {:error, {{:else_clause, {request, upgrade_error}}, [{Kubereq.Connect, :init, 1, []}]}}
+
+      assert API.exception_reason(%MatchError{term: term}) == {:upgrade_failed, 404}
+    end
+
+    test "a failed upgrade never carries TLS client-certificate material" do
+      # This is the bug, not a hypothetical: against a live cluster a 404 on the
+      # exec subresource logged ~2 KB including `cert: <<48, 130, 1, 144, ...>>`,
+      # because the inspected %Req.Request{} holds the kubeconfig's client
+      # certificate in :connect_options.
+      cert = <<48, 130, 1, 144, 48, 130, 1, 55>>
+      upgrade_error = %{__struct__: Mint.WebSocket.UpgradeFailureError, status_code: 404}
+
+      request = %Req.Request{
+        method: :get,
+        options: %{connect_options: [transport_opts: [cert: cert]]}
+      }
+
+      term = {:error, {{:else_clause, {request, upgrade_error}}, []}}
+      dumped = inspect(API.exception_reason(%MatchError{term: term}))
+
+      refute dumped =~ "cert"
+      refute dumped =~ "Req.Request"
+      refute String.contains?(dumped, "48, 130")
+      assert byte_size(dumped) < 64
+    end
+
+    test "an upgrade transport failure keeps its reason rather than becoming a status" do
+      for struct <- [Mint.TransportError, Mint.HTTPError] do
+        term =
+          {:error, {{:else_clause, {%Req.Request{}, %{__struct__: struct, reason: :closed}}}, []}}
+
+        assert API.exception_reason(%MatchError{term: term}) == {:transport, :closed}
+      end
+    end
+
+    test "a MatchError on something else is bounded structurally, not just in length" do
+      # An unrecognized term must still not become a channel for whatever
+      # happens to be nested inside it. `limit:` elides struct fields and binary
+      # bytes, so the cap does not depend on where a character count lands.
+      secret = String.duplicate("s3cret", 100)
+      term = %Req.Response{status: 500, body: %{"deep" => %{"nested" => secret}}}
+
+      assert {:exception, {:match_error, dumped}} =
+               API.exception_reason(%MatchError{term: term})
+
+      refute dumped =~ "s3cret"
+      assert byte_size(dumped) <= 200
+      # Still says what it was, which is the part worth keeping.
+      assert dumped =~ "Req.Response"
+    end
+
     test "summarize/1 truncates a Status message so a payload cannot reach the logs" do
       long = String.duplicate("a", 500)
       summary = API.summarize(%{"kind" => "Status", "message" => long})
@@ -589,6 +755,32 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
     end
 
     [kubeconfig: kubeconfig("https://k8s.test"), req_adapter: adapter]
+  end
+
+  # A handle whose GET /pods/{name} returns `pod`.
+  defp handle_for(pod) do
+    adapter = fn req -> {req, Req.Response.new(status: 200, body: pod)} end
+    handle(kubeconfig: kubeconfig("https://k8s.test"), req_adapter: adapter)
+  end
+
+  # A handle whose GET /pods/{name} fails with `reason`. Built by serving the
+  # HTTP status that normalize/1 maps to it, so the mapping is exercised too
+  # rather than stubbed past.
+  defp handle_erroring({:k8s, {:not_found, message}}), do: handle_status(404, message)
+  defp handle_erroring({:k8s, {:forbidden, message}}), do: handle_status(403, message)
+
+  defp handle_erroring({:k8s, {:http_status, status, message}}),
+    do: handle_status(status, message)
+
+  defp handle_erroring({:k8s, {:transport, reason}}) do
+    adapter = fn req -> {req, %Req.TransportError{reason: reason}} end
+    handle(kubeconfig: kubeconfig("https://k8s.test"), req_adapter: adapter)
+  end
+
+  defp handle_status(status, message) do
+    body = %{"kind" => "Status", "message" => message}
+    adapter = fn req -> {req, Req.Response.new(status: status, body: body)} end
+    handle(kubeconfig: kubeconfig("https://k8s.test"), req_adapter: adapter)
   end
 
   defp pod_list(items, continue \\ nil) do

@@ -175,7 +175,7 @@ defmodule CrowdControl.Reaper do
 
     reattached = reattach_all(state, records, live_by_key)
     destroyed = destroy_orphans(state, module, live_by_key, stored_keys, owner)
-    pruned = prune_stale(records, live_by_key)
+    pruned = prune_stale(module, records, live_by_key)
 
     %{reattached: reattached, destroyed: destroyed, pruned: pruned, skipped: 0}
   end
@@ -270,11 +270,31 @@ defmodule CrowdControl.Reaper do
   end
 
   # stored + not live -> stale
-  defp prune_stale(records, live_by_key) do
+  #
+  # Destroying before deleting the record is load-bearing, and its absence was a
+  # real leak: two Pods sat on a test cluster for 33 days.
+  #
+  # "Not live" does not mean "gone". Every backend's `list_live/1` reports what
+  # is *reattachable* — `Backend.Kubernetes` filters to phase `Running`,
+  # `Backend.Docker` lists with `all: false` — so a sandbox whose CLI exited
+  # without `destroy/1` ever being called (a killed node, a crashed session)
+  # becomes invisible here while its Pod object or exited container lives on
+  # forever. Deleting only the record made the leak permanent *and*
+  # unobservable, because the record was the last thing that knew the sandbox
+  # existed.
+  #
+  # This is safe rather than merely useful: `c:CrowdControl.Backend.destroy/1`
+  # is contractually idempotent and treats an already-gone resource as success,
+  # so the common case (substrate really is gone) is one 404 per stale record.
+  # It cannot destroy a *starting* sandbox either, which is the race the reap
+  # grace window exists for: a record only exists after `provision/1` returned,
+  # and `provision/1` does not return until the sandbox is running.
+  defp prune_stale(module, records, live_by_key) do
     records
     |> Enum.reject(&Map.has_key?(live_by_key, &1.key))
     |> Enum.count(fn record ->
-      Logger.info("Reaper: pruning stale record #{record.key}")
+      Logger.info("Reaper: pruning stale record #{record.key} and destroying its sandbox")
+      _ = Backend.safe(fn -> module.destroy(record.handle) end, :ok)
       Store.delete(record.key)
       true
     end)
