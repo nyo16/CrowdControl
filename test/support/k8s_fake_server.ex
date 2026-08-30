@@ -356,8 +356,20 @@ defmodule CrowdControl.K8sFakeServer do
   # The key parameters are not decoration: `pkix_test_data/1`'s defaults produce
   # a chain TLS 1.3 refuses to use — `no_suitable_signature_algorithm` on an
   # implicit curve, `unable_to_supply_acceptable_cert` on the default digest.
+  #
+  # The curve is the OID rather than `:secp256r1` because that is what the
+  # contract says: `cert_opt()` is `{key, {namedCurve, oid()} | …}`. OTP happens
+  # to normalize the atom form at runtime, so the atom worked — while dialyzer
+  # correctly proved the call breaks the contract, which made this function
+  # `no_return` and every line of `init/1` after it unreachable. Three helpers
+  # were then reported as dead code that is in fact called on every start.
+  #
+  # `{1, 2, 840, 10045, 3, 1, 7}` is prime256v1, a.k.a. secp256r1, a.k.a. NIST
+  # P-256.
+  @p256 {1, 2, 840, 10_045, 3, 1, 7}
+
   defp tls_material do
-    params = [key: {:namedCurve, :secp256r1}, digest: :sha256]
+    params = [key: {:namedCurve, @p256}, digest: :sha256]
 
     :public_key.pkix_test_data(%{root: params, peer: params})
     |> Keyword.take([:cert, :key])
