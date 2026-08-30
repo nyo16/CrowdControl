@@ -105,6 +105,10 @@ defmodule CrowdControl.Agent.Omp do
     * `:agent_dir` - path for `PI_CODING_AGENT_DIR`, the directory omp reads
       `models.yml` and `config.yml` from (sanitized + expanded)
     * `:custom_provider` - declarative OpenAI-compatible endpoint; see below
+    * `:sandbox_agent_dir` - ship `:custom_provider`'s rendered files *into* a
+      remote sandbox instead of rendering them on the host; `true` for the
+      default in-sandbox directory, or an absolute in-sandbox path. Needs
+      `CrowdControl.Backend.Sandboxd`; see below
     * `:oauth_token` - Claude subscription token; sets `ANTHROPIC_OAUTH_TOKEN`
 
   Claude-Code-only options (`:mcp_config`, `:strict_mcp_config`, `:agents`,
@@ -153,9 +157,35 @@ defmodule CrowdControl.Agent.Omp do
   The directory is content-addressed, so every session in a fan-out sharing one
   spec shares one directory rather than writing N copies. Build it yourself with
   `provider_dir!/1` and pass `:agent_dir` when you want to own the lifecycle
-  (and `remove_provider_dir/1` to delete it). For the Docker and Kubernetes
-  backends the directory has to exist *inside* the sandbox, so mount your own
-  and pass `:agent_dir` — a host temp dir is not visible there.
+  (and `remove_provider_dir/1` to delete it).
+
+  ### Custom providers on a remote sandbox
+
+  A host temp directory is not visible inside a sandbox, so a rendered
+  `models.yml` has to get there some other way. Which backends solve that and
+  which still leave it to you:
+
+    * `CrowdControl.Backend.Sandboxd` — **solved**. Pass
+      `sandbox_agent_dir: true` and the rendered file is written into the
+      sandbox at `/tmp/cc-omp-agent/models.yml`, mode `0600`, over the agent's
+      `PUT /v1/files` — after the sandbox exists and before the CLI starts —
+      with `PI_CODING_AGENT_DIR` pointing there. Pass an absolute in-sandbox
+      path instead of `true` to choose the directory. Nothing at all is
+      rendered on the host on this path.
+    * `CrowdControl.Backend.Docker` and `CrowdControl.Backend.Kubernetes` —
+      **still yours**. Neither has a file-transfer channel, so the directory has
+      to be baked into the image or mounted in (a bind mount, a `ConfigMap`);
+      render it with `provider_dir!/1` and pass `:agent_dir` naming the path it
+      has *inside* the container, not on the host.
+    * `CrowdControl.Backend.Local` — never a problem, since the host *is* the
+      sandbox and `:custom_provider` alone already works.
+
+  `:inherit_auth` is refused together with `:sandbox_agent_dir`. omp's auth
+  store is a host file it refreshes in place, so a symlink means nothing across
+  a substrate boundary and a copy would strand refreshed tokens in the sandbox
+  — while handing a live subscription credential to the untrusted code the
+  sandbox exists to contain. Use `:oauth_token` to bill a subscription from a
+  sandboxed session.
 
   > #### `PI_CODING_AGENT_DIR` relocates more than `models.yml` {: .warning}
   >
@@ -169,6 +199,11 @@ defmodule CrowdControl.Agent.Omp do
 
   @behaviour CrowdControl.Agent
 
+  # Backend.Sandboxd.API for safe_path/1 only, which is pure and needs neither
+  # :req nor a live agent: :sandbox_agent_dir names a path the agent will later
+  # be asked to write, so it is validated against the same definition of "safe"
+  # rather than against a second one that could drift out of agreement with it.
+  alias CrowdControl.Backend.Sandboxd.API
   alias CrowdControl.CLI
 
   @base_args ["--mode", "rpc"]
@@ -197,6 +232,13 @@ defmodule CrowdControl.Agent.Omp do
   # omp keeps stored logins (OAuth subscriptions included) in this SQLite file
   # under the agent directory, which is why relocating the directory loses them.
   @auth_store "agent.db"
+  @models_file "models.yml"
+
+  # On a tmpfs under :readonly_rootfs (Backend.Docker.HostConfig.default_tmpfs/0
+  # mounts /tmp rw), so this works in the most locked-down sandbox we create.
+  # omp relocates its whole agent base here, including the SQLite store it
+  # writes -- a read-only directory would not do.
+  @default_sandbox_agent_dir "/tmp/cc-omp-agent"
 
   @unsupported [
     mcp_config: "omp configures MCP servers through its config file",
@@ -268,6 +310,26 @@ defmodule CrowdControl.Agent.Omp do
       {:ok, map} when is_map(map) -> classify(map)
       {:ok, _other} -> {:invalid_json, line}
       {:error, _reason} -> {:invalid_json, line}
+    end
+  end
+
+  @impl true
+  @spec sandbox_files(keyword()) :: [CrowdControl.Agent.sandbox_file()]
+  def sandbox_files(opts) do
+    case shipped_provider!(opts) do
+      nil ->
+        []
+
+      {dir, spec} ->
+        # Re-rendered rather than carried over from build_command/1: the render
+        # is a pure function of the spec, and the alternative is threading
+        # mutable state through Session between provisioning and exec for no
+        # gain. The directory itself is not created explicitly -- the agent's
+        # PUT /v1/files does mkdir_p on the parent, and the protocol has no
+        # directory-mode parameter. Acceptable here and only here: a sandbox is
+        # single-tenant for one session, so there is no other uid to hide the
+        # directory from, and the file is still 0600.
+        [{Path.join(dir, @models_file), render_models_config!(spec), 0o600}]
     end
   end
 
@@ -430,6 +492,12 @@ defmodule CrowdControl.Agent.Omp do
     spec = opts[:custom_provider]
     dir = opts[:agent_dir]
 
+    # Resolved eagerly so a bad :sandbox_agent_dir raises out of
+    # build_command/1, which Session.init/1 calls *before* it provisions --
+    # the same reason :max_messages is bounds-checked there. Discovering the
+    # path was unusable at exec time means a billed sandbox already exists.
+    shipped = shipped_provider!(opts)
+
     base =
       cond do
         spec && dir ->
@@ -437,6 +505,15 @@ defmodule CrowdControl.Agent.Omp do
                 ":custom_provider and :agent_dir are mutually exclusive -- " <>
                   ":custom_provider generates an agent dir, :agent_dir supplies one. " <>
                   "Pass the result of provider_dir!/1 as :agent_dir to do both."
+
+        shipped ->
+          {sandbox_dir, normalized} = shipped
+
+          # No provider_dir!/1 call on this path: the bytes go straight from
+          # sandbox_files/1 into the sandbox, and a host temp directory omp
+          # will never open is litter, not a fallback.
+          %{@agent_dir_env => sandbox_dir}
+          |> put_provider_key(normalized)
 
         spec ->
           normalized = normalize_spec!(spec)
@@ -452,6 +529,72 @@ defmodule CrowdControl.Agent.Omp do
       end
 
     put_oauth_token(base, opts)
+  end
+
+  # `nil` for a session that renders on the host, or `{in-sandbox dir, spec}`
+  # for one whose files are shipped over the backend. build_command/1 and
+  # sandbox_files/1 both come through here, so they cannot disagree about where
+  # omp is going to look for models.yml -- an env var pointing at a directory
+  # nothing was written to is a session that silently talks to the wrong
+  # provider.
+  defp shipped_provider!(opts) do
+    case opts[:sandbox_agent_dir] do
+      value when value in [nil, false] ->
+        nil
+
+      value ->
+        spec =
+          opts[:custom_provider] ||
+            raise ArgumentError,
+                  ":sandbox_agent_dir has nothing to ship without :custom_provider -- " <>
+                    "it names the in-sandbox directory the rendered config is written to. " <>
+                    "To point omp at a directory that already exists in the sandbox, " <>
+                    "pass that path as :agent_dir instead."
+
+        {sandbox_dir!(value), shipped_spec!(spec)}
+    end
+  end
+
+  defp sandbox_dir!(true), do: @default_sandbox_agent_dir
+
+  # API.safe_path/1, not CLI.sanitize_path!/1: this path is resolved inside the
+  # sandbox, where Path.expand/1's host-side view of `~` and the cwd is simply
+  # the wrong answer, and where a `..` segment is an attempt to escape rather
+  # than something to helpfully normalize.
+  defp sandbox_dir!(path) when is_binary(path) do
+    case API.safe_path(path) do
+      {:ok, safe} ->
+        safe
+
+      {:error, {:sandboxd, {:bad_path, why}}} ->
+        raise ArgumentError, ":sandbox_agent_dir #{why}; value redacted"
+    end
+  end
+
+  defp sandbox_dir!(other),
+    do:
+      raise(
+        ArgumentError,
+        ":sandbox_agent_dir must be true or an absolute in-sandbox path, got: #{inspect(other)}"
+      )
+
+  defp shipped_spec!(spec) do
+    spec = normalize_spec!(spec)
+
+    # Refused rather than silently dropped. A symlink to the host's agent.db
+    # resolves to nothing inside a sandbox, and shipping the bytes instead is
+    # worse than useless: omp refreshes OAuth tokens in place, so the refreshed
+    # token would be stranded in the sandbox while the real store went stale --
+    # and it would hand a live subscription credential to exactly the untrusted
+    # code the sandbox exists to contain.
+    if spec[:inherit_auth] do
+      raise ArgumentError,
+            ":inherit_auth cannot cross into a sandbox -- omp's auth store is a host " <>
+              "file it refreshes in place. Pass :oauth_token to bill a subscription " <>
+              "from a sandboxed session."
+    end
+
+    spec
   end
 
   # omp resolves ANTHROPIC_OAUTH_TOKEN ahead of ANTHROPIC_API_KEY, so this is
@@ -618,7 +761,7 @@ defmodule CrowdControl.Agent.Omp do
     File.mkdir_p!(dir)
     File.chmod!(dir, 0o700)
 
-    path = Path.join(dir, "models.yml")
+    path = Path.join(dir, @models_file)
     File.write!(path, config)
     File.chmod!(path, 0o600)
 

@@ -1175,6 +1175,211 @@ That only holds while offsets stay valid, which is why:
 
 If you are tempted to add log rotation here, this is the reason not to.
 
+## Sandbox Providers
+
+A **backend** moves bytes; a **provider** owns the sandbox those bytes come out
+of. Every backend above pairs one transport with one substrate, so a new
+substrate meant writing a new transport too — and a VM has no exec API to build
+one on. `CrowdControl.Backend.Sandboxd` breaks that pairing: it speaks one HTTP
+protocol to one in-sandbox agent, and `CrowdControl.Provider` supplies the
+substrate, so adding a substrate is provisioning code and nothing else.
+
+```elixir
+CrowdControl.start_session(
+  backend:
+    {CrowdControl.Backend.Sandboxd,
+     provider: {CrowdControl.Provider.Docker, image: "crowd_control/sandbox:dev", egress: :allow}},
+  prompt: "Refactor lib/foo.ex"
+)
+```
+
+`Backend.Docker` is not deprecated and is not going anywhere: it works with any
+image that has `sh` and `tail`, while this path needs an image containing the
+agent. That is the trade.
+
+| Provider | Sandbox | Reattach | Egress blocked? |
+|----------|---------|----------|-----------------|
+| `Provider.Docker` | one container | yes | **no** — see below |
+| `Provider.Compose` | a per-session stack | yes | yes, structurally |
+| `Provider.Gce` | a Compute Engine spot VM | yes | n/a — VM-level |
+
+All three require `:req`, and a configured secret the agent token is derived
+from:
+
+```elixir
+config :crowd_control, sandboxd_secret: System.fetch_env!("CC_SANDBOXD_SECRET")
+```
+
+Use at least 32 random bytes and keep it stable across restarts. It is never
+persisted and never sent anywhere; each sandbox's token is
+`HMAC-SHA256(secret, session_key)`, recomputed on reattach from the session key
+the store already holds. Rotating it therefore fails reattach closed for every
+existing sandbox — the deliberate cost of keeping no credential at rest.
+
+### The sandboxd agent
+
+`sandboxd` is a small OTP release (nested Mix project in `sandboxd/`, four
+dependencies) that runs inside the sandbox and exposes seven routes:
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/v1/health` | readiness; the only unauthenticated route, returns `{"ok": true}` and nothing else |
+| `POST` | `/v1/exec` | `{executable, args, env}` — env in the **body**, never argv; one exec per sandbox |
+| `POST` | `/v1/stdin` | `{data: base64}` |
+| `GET` | `/v1/stream` | `?offset=N`, chunked, **0-indexed** |
+| `GET` | `/v1/status` | `{alive, exit_status, bytes}`, long-polled with `?wait_ms=` |
+| `PUT` | `/v1/files/*path` | raw bytes, `?mode=0600`; traversal refused |
+| `POST` | `/v1/shutdown` | kills the CLI; destroying the *sandbox* is the provider's job |
+
+Build an image containing it:
+
+```sh
+# minimal, for exercising the transport
+docker build --target sandbox-dev -t crowd_control/sandbox:dev .
+
+# the full image, which also carries the agent CLI
+docker build -t crowd_control:latest .
+```
+
+The release embeds its own ERTS, so it also runs on a bare VM with no Erlang
+installed — that is what the GCE provider depends on. It needs `libssl3` present
+(ERTS's crypto NIF links against the system OpenSSL) and reads its entire
+configuration from the environment: `CC_SANDBOXD_TOKEN` (required; boot fails
+without it), `CC_SANDBOXD_PORT`, `CC_SANDBOXD_BIND`, `CC_SANDBOXD_CAPTURE`.
+
+The capture file is byte-for-byte the same artifact as the Docker backend's tee
+file, so [the tee-file contract](#the-tee-file-contract) applies here unchanged
+— including the reason it is capped and never rotated.
+
+### Docker provider
+
+```elixir
+{CrowdControl.Provider.Docker,
+  image: "crowd_control/sandbox:dev",
+  egress: :allow,
+  cpus: 1.5,
+  memory: 512 * 1024 * 1024}
+```
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `:image` | — | **Required.** Must contain the sandboxd release |
+| `:egress` | — | **Required.** `:allow` or `:no_nat`; never inferred |
+| `:agent_port` | `8080` | Port the agent listens on inside the container |
+| `:capture_path` | `/var/log/cc/out.jsonl` | |
+| `:ready_timeout` | `30_000` | How long `acquire/1` waits for `GET /v1/health` |
+| `:docker_host`, `:timeout` | as `Backend.Docker` | |
+| `:agent_env` | `%{}` | Extra env for the *agent*, not the CLI |
+
+Hardening options are identical to the Docker backend's and come from the same
+module, so the two cannot drift.
+
+**This provider does not block egress, and does not claim to.** On one
+container, `Internal: true` and a published port are mutually exclusive:
+publishing requires a non-internal endpoint, and attaching one restores full
+internet access. That is measured, not assumed, and the failure is silent —
+Docker answers `201` with no warning and simply discards the binding. So
+`:egress` is required, exactly as `Backend.Docker` requires an explicit
+`:network_mode`:
+
+- `egress: :allow` — a private per-sandbox bridge, full outbound access.
+- `egress: :no_nat` — masquerade disabled. Blocks the internet, but the Docker
+  host, sibling containers and embedded DNS stay reachable. It is "no NAT", not
+  "dropped" — see [SECURITY.md](SECURITY.md#the-docker-provider).
+
+For a structural egress block *and* a reachable agent, use the Compose
+provider; it takes a second container to get both.
+
+### Compose provider
+
+A per-session stack over the Engine API. There is no `docker compose` CLI
+dependency and there never will be one — the Engine API has no compose
+endpoints, so the stack is synthesized directly.
+
+```elixir
+{CrowdControl.Provider.Compose,
+  image: "crowd_control/sandbox:dev",
+  services: [
+    %{name: "proxy", image: "cc/egress-proxy:1.2.3", egress: :allow, port: 8080}
+  ],
+  proxy_service: "proxy",
+  volumes: [%{name: "workspace"}]}
+```
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `:services` | `[]` | Sidecar specs; a spec named `:sandbox_service` *is* the sandbox |
+| `:sandbox_service` | `"sandbox"` | |
+| `:forwarder_service` / `:forwarder_image` | `"forwarder"` / `alpine/socat:1.8.1.3` | Always synthesized, never caller-supplied |
+| `:network` | `[internal: true, driver: "bridge"]` | |
+| `:volumes` | `[]` | Named `<project>-<name>`, destroyed with the stack |
+| `:ready` | `%{}` | Per-service healthchecks, gating start order |
+| `:project_name` | `cc-<session_key>` | |
+| `:proxy_service` | unset | Sidecar fronting the egress proxy |
+| `:health_timeout` | `60_000` | |
+
+Agent and hardening options are the Docker provider's, and hardening applies to
+**every** container in the stack — there are deliberately no per-service
+overrides, because a sidecar quietly weaker than the sandbox it shares a network
+with is not a useful thing to express.
+
+The sandbox sits on an `Internal: true` network with no port bindings at all: no
+default route exists, so the internet, the Docker host, sibling containers and
+embedded DNS are unreachable structurally rather than by a missing NAT rule. A
+synthesized `socat` forwarder is dual-homed onto a publishing bridge and is the
+only part of the stack the host can reach. `:egress` is required on every
+sidecar and refused on the sandbox. Services address each other by name.
+
+### GCE provider
+
+Requires the optional `:gcp_compute` dependency:
+
+```elixir
+{:gcp_compute, "~> 0.2"}
+```
+
+```elixir
+{CrowdControl.Provider.Gce,
+  project: "my-project",
+  zone: "us-central1-a",
+  sandboxd_url: "https://github.com/.../sandboxd-linux-amd64.tar.gz",
+  sandboxd_sha256: "…",
+  machine_type: "e2-standard-2",
+  spot: true}
+```
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `:project`, `:zone`, `:token_provider` | — | Or a ready `%GcpCompute.Config{}` as `:gce_config` |
+| `:sandboxd_url` | — | **Required.** Release tarball |
+| `:sandboxd_sha256` | — | **Required and never skipped** |
+| `:bootstrap_script` | unset | Shell run as root before the agent installs |
+| `:spot` | `true` | |
+| `:external_ip` | `true` | The agent stays on loopback regardless — see below |
+| `:max_run_duration` | `ready_timeout + session timeout + 5 min` | Server-side orphan backstop |
+| `:ready_timeout` | `300_000` | Boot → healthy agent |
+| `:ssh_port` | `22` | |
+| `:host_key_fp` | unset | Pin the VM's host key |
+
+The agent binds the VM's **loopback** and is reached through an OTP `:ssh`
+local-port-forward, using a per-session ed25519 key generated in memory that
+never touches disk. Port 22 is the only reachable port. `external_ip: false` is
+the hardened mode and needs same-VPC connectivity plus Cloud NAT.
+
+`max_run_duration` with `instanceTerminationAction: DELETE` is a **server-side**
+backstop: the reaper runs on the BEAM, so if the node dies mid-provision nothing
+local knows the VM exists, and a leaked spot VM bills forever. No service
+account is attached unless you ask for one — with one, the sandboxed CLI can
+mint project credentials from the metadata server.
+
+> `:ready_timeout`'s default is an **estimate, not a measurement.** The billable
+> end-to-end spike that would have measured operation-DONE → SSH-ready →
+> agent-healthy was never run. Measure it against your own image and machine
+> type before trusting it in production.
+
+See [SECURITY.md](SECURITY.md#sandbox-agent-transport) for the full posture of
+all three, including the regressions each carries relative to the others.
+
 ## CLI Options
 
 Every session picks an **agent adapter** (`CrowdControl.Agent`), which decides

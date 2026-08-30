@@ -198,6 +198,227 @@ Docker's own default capability set does, but it would hold the capability for
 the life of the session in exchange for one syscall. A short-lived init
 container holds it for milliseconds and exits instead.
 
+## Sandbox agent transport
+
+`CrowdControl.Backend.Sandboxd` drives a CLI over HTTP to `sandboxd`, an OTP
+release running *inside* the sandbox, and `CrowdControl.Provider` owns the
+substrate underneath it. It is opt-in and additive: `Backend.Docker`'s
+FIFO/`tee` path is unchanged, works with any image that has `sh` and `tail`, and
+is not deprecated.
+
+**The bearer token authenticates external callers, and grants in-sandbox code
+nothing it does not already have.** This is the single most important thing to
+understand about the design. The token is in the agent's own environment, and
+the untrusted party *is* the CLI the agent runs — it can read
+`CC_SANDBOXD_TOKEN` from `/proc/self/environ` whenever it likes. The token
+exists so that nothing *else* which can reach the agent's port can drive the
+CLI. It is not a sandbox escape control, and treating it as one would be a
+mistake.
+
+**No agent port is ever routable.** Docker and Compose publish it on
+`127.0.0.1` only; GCE binds it to the VM's loopback and reaches it through an
+SSH tunnel. `HostIp: "127.0.0.1"` is sent explicitly on every port binding,
+because omitting it makes Docker publish **two** bindings, IPv4 and IPv6, on
+every interface — a one-word omission that turns a loopback port into a public
+remote-exec endpoint.
+
+**Nothing secret is persisted.** The token is derived, never stored:
+
+    token = Base.url_encode64(:crypto.mac(:hmac, :sha256, secret, session_key), padding: false)
+
+`session_key` is already in `CrowdControl.Store`, so reattach recomputes the
+token with nothing at rest. `Store.secret_keys/0` lists `:sandboxd_secret` and
+`:gce_config` so a stray copy in caller opts is stripped anyway, and
+`Backend.Sandboxd.scrub/1` drops the endpoint **wholesale** rather than
+field-by-field, so a future field on it cannot leak by omission. Persisting the
+token instead would have made reattach trivial and put a live credential in
+DETS; deriving it is strictly better, at one documented cost: **rotating
+`:sandboxd_secret` fails reattach closed** with
+`{:error, {:sandboxd, :unauthorized}}` for every sandbox started under the old
+secret. That is the intended trade, and the integration suite asserts it.
+
+**Comparison is constant-time** (`Plug.Crypto.secure_compare/2`) and `401`
+responses have an empty body. A distinct message for "no header" versus "wrong
+token" tells an attacker which half to work on, and a byte-wise comparison leaks
+the token to anything that can time responses — which, for a loopback-published
+port, is every process on the host.
+
+**`GET /v1/health` is unauthenticated, and returns `{"ok": true}` and nothing
+else.** A provider must poll it *before* any token round trip can have
+succeeded, so it cannot require a credential. It therefore leaks nothing: no
+exec state, no byte counts, no version, no capture path. Anything that can reach
+the port learns only that something is listening.
+
+**Environment variables arrive in a request body and are never logged.** Never a
+query string, which lands in access and proxy logs. Inside the sandbox they are
+written to a `0600` file in a `0700` directory and sourced by a wrapper that
+`rm`s the file and `exec`s the CLI through `"$@"`, so nothing but the values
+themselves ever needs quoting and no secret enters argv. `ps` works inside a
+sandbox and the code running there is model-driven; the integration suite greps
+the sandbox's own `ps` output to keep this honest.
+
+**`PUT /v1/files` rejects traversal rather than normalizing it.** Both sides
+check: `Backend.Sandboxd.API.safe_path/1` client-side and the agent's router
+server-side. That is not redundancy — the client-side check is the only reason a
+caller gets a comprehensible error, and the server-side check is the only one
+that holds against a caller which is not this library. A request for
+`/v1/files/../../etc/passwd` is refused with `400`; a legitimate absolute path
+never needs `..` to express itself. The route exists solely so `Agent.Omp`'s
+`:agent_dir` obligation is satisfiable on a remote sandbox. General workspace
+push/pull remains out of scope.
+
+### The Docker provider
+
+**REGRESSION: `CrowdControl.Provider.Docker` does not block egress, and cannot.**
+This is measured, not conceded:
+
+> On one container, `Internal: true` and a published port are mutually
+> exclusive. Publishing requires at least one *non-internal* endpoint, and
+> attaching one restores full internet egress.
+
+Confirmed six independent ways against Docker 29.4.0 — internal-only,
+`NetworkMode: "none"`, two internal networks, `Internal` combined with each of
+the four `gateway_mode_ipv4` values, and publish-then-disconnect. The failure is
+**silent**: `create` answers `201` with `"Warnings": []` and
+`HostConfig.PortBindings` echoes the request verbatim, while
+`NetworkSettings.Ports` reads `{"8080/tcp": null}`. The provider therefore
+treats "requested a binding, got no usable `HostPort`" as a hard error at
+`acquire/1`, because the daemon will never say so.
+
+So `:egress` is **required and never inferred**, exactly as `Backend.Docker`
+requires an explicit `:network_mode`:
+
+- `egress: :allow` — a private per-sandbox bridge with full outbound access.
+  Correct when the sandbox is *meant* to reach an API, and honest about it.
+- `egress: :no_nat` — the same bridge with
+  `com.docker.network.bridge.enable_ip_masquerade=false`. **A weaker claim than
+  it sounds.** The internet becomes unreachable only because return traffic has
+  no SNAT; the Docker host, every container on every other Docker network, and
+  Docker's embedded DNS all stay reachable. Packets still leave with a private
+  source address, so on a network whose router knows a path back to the
+  container subnet, egress is not guaranteed to fail. It is "no NAT", not
+  "dropped".
+
+A naive "DNS fails, therefore no egress" test reports the *opposite* of the
+truth under `:no_nat` — embedded DNS keeps resolving public names. Egress was
+verified by IP literal throughout.
+
+If you need a strong egress block *and* a reachable agent, use the Compose
+provider. It takes a second container to get both.
+
+### The Compose provider
+
+`CrowdControl.Backend.Docker` refuses to infer `:network_mode` because `bridge`
+grants general outbound access and makes an egress proxy advisory rather than
+enforcing. `CrowdControl.Provider.Compose` does not need that gate, and the
+reason is structural rather than a matter of better defaults: **there is no
+`bridge` for the caller to choose.** The provider creates the sandbox's network
+itself, per session, and destroys it with the session. The sandbox is attached
+to exactly one network, `<project>-sbx`, created with `Internal: true` — no
+default route exists at all, so the internet, the Docker host, every container
+on every other Docker network, and Docker's embedded DNS forwarder are
+unreachable structurally, not by a missing NAT rule. A caller cannot name a
+wider network, because the option to name one does not exist.
+
+The proxy is therefore enforcing rather than advisory for this provider, and
+the `bridge`-defeats-the-proxy failure mode is not reachable.
+
+What *is* reachable, and must be stated:
+
+**A sidecar with `egress: :allow` is the sanctioned hole.** It is attached to
+`<project>-egress`, a plain NAT bridge, *in addition* to the internal network,
+so it can relay the internet into the sandbox. That is precisely what an egress
+proxy is for. `:egress` is required on every sidecar and has no default —
+omitting it returns `{:error, {:compose, {:egress_required, name}}}`, the same
+discipline as `{:docker, :network_mode_required}`. The sandbox itself can never
+carry `:allow`: `{:error, {:compose, :sandbox_egress_forbidden}}`. The NAT
+bridge is created only if some sidecar asks; if none does, it does not exist.
+
+**The forwarder is the blast radius.** Reaching the agent from the host requires
+a published port, and a published port requires a non-internal endpoint — the
+constraint described under the Docker provider above. So the provider puts a
+second, minimal container — `socat TCP-LISTEN:<port>,fork,reuseaddr
+TCP:<sandbox-alias>:<port>` — on both the internal network and a publishing
+bridge. That container is dual-homed and is the only part of the stack the host
+can reach. It is always synthesized, never caller-supplied: a caller-supplied
+forwarder command is exactly how a single-slot `busybox nc -e` gets back in, and
+that drops connections while a session holds a chunked stream open. `socat` with
+`fork,reuseaddr` was verified against a live daemon at 12 concurrent requests,
+12/12 served.
+
+Its publishing network, `<project>-pub`, is created with
+`com.docker.network.bridge.enable_ip_masquerade=false`, so **the forwarder has
+no internet either** (verified: TCP to `1.1.1.1:443` blocked from inside it).
+That is not configurable; it is the property that keeps the stack's claim
+strong. The documented limits of `enable_ip_masquerade=false` apply to the
+forwarder and to nothing else in the stack: it is "no NAT", not "dropped". The
+forwarder runs `socat` and no attacker-controlled code, which is why that weaker
+posture is acceptable there and would not be for the sandbox.
+
+**Credentials.** With `:proxy_service` named, the provider mints a per-session
+token, sets `ANTHROPIC_BASE_URL` to the proxy's network alias and
+`ANTHROPIC_API_KEY` to that token in the sandbox's environment via
+`CrowdControl.Backend.Credentials.apply_credentials/2`, and **removes** any real
+`:api_key` rather than overriding it. The proxy receives `CC_SESSION_TOKEN` and
+the real `ANTHROPIC_API_KEY`. A proxy declared without `egress: :allow` is
+refused with `{:error, {:compose, {:proxy_needs_egress, name}}}`, because a
+proxy that cannot reach the upstream API fails inside the sandbox as if the
+model's own request were at fault. With no `:proxy_service`, an `:api_key` is
+passed into the sandbox environment unchanged — the honest no-proxy posture.
+Neither `:api_key` nor `:session_token` survives `scrub/1` into a Store record,
+and `Provider.Compose.scrub/1` additionally strips `:env` out of every persisted
+service spec, which `Store.scrub_opts/1` cannot see into.
+
+**`network: [internal: false]`** is accepted and gives the sandbox a NAT bridge
+with full internet. It is the one option that discards everything above, so it
+exists only as an explicit, typed-out act; it is never a default and is never
+inferred.
+
+### The GCE provider
+
+`CrowdControl.Provider.Gce` runs a sandbox on a Compute Engine spot VM.
+
+**Default posture: `external_ip: true`, with the agent bound to `127.0.0.1` and
+reachable only through an SSH tunnel.** Port 22 is the only thing reachable, and
+only from whatever firewall rule the operator has. Note that `gcp_compute`'s own
+`:external_ip` default is `true`, so a provider that simply forgets this option
+ships **publicly addressable sandbox VMs** — the default is stated explicitly
+here for that reason, not because it is the most hardened choice.
+
+`external_ip: false` is the hardened mode. It requires same-VPC connectivity to
+reach port 22 — no pure-Elixir IAP tunnel client exists, verified, and
+`gcloud compute start-iap-tunnel` is not something this library will shell out
+to — plus Cloud NAT for the image and CLI fetch.
+
+**The SSH key is per-session, ephemeral, and never touches disk.** An ed25519
+keypair is generated in memory and supplied through a custom `key_cb`;
+`save_accepted_host` is disabled so nothing can write `known_hosts`. It is set as
+**instance-level** `metadata["ssh-keys"]`, never project-wide, because a
+project-wide key would apply to every VM in the project. `gcp_compute` has no
+`setMetadata` wrapper, so keys are create-time only and cannot be rotated on a
+live VM: a session that loses its key destroys and reprovisions, which is the
+right answer for a disposable spot VM.
+
+**GCE metadata is readable by in-sandbox code.** Stating it plainly rather than
+hiding it: anything in `metadata["cc-sandboxd-token"]` is readable from inside
+the VM via the metadata server. That is acceptable for exactly the reason the
+token is acceptable at all — see the top of this section — but it means metadata
+must not be used for anything the CLI is not already entitled to. In particular
+no secret is interpolated into the startup script body, and the `sandboxd`
+release fetch verifies a **mandatory** SHA-256.
+
+**REGRESSION vs Docker: a leaked VM bills forever.** The reaper is BEAM-side, so
+if the node dies mid-`acquire/1` nothing local knows the VM exists. The backstop
+is server-side and needs no BEAM: `max_run_duration` plus
+`instanceTerminationAction: DELETE`, set at create time. Label-scoped
+`list_live/1` sweeps handle the rest, and `list_live/1` paginates exhaustively
+because a truncated page would make the reaper prune *live* sandboxes.
+
+**GCE labels reject `.`**, so the Docker label keys cannot be reused:
+`crowd_control-session` and `crowd_control-owner-hash` (a SHA-256 prefix, the
+same trick `Backend.Kubernetes` uses because `nonode@nohost` is an illegal label
+value) with the raw owner in metadata.
+
 ## Egress proxy contract
 
 **No proxy ships with this library.** `CrowdControl.Backend.Docker` provides

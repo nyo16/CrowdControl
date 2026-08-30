@@ -33,6 +33,23 @@
   normally are still not restarted and still release their `:max_children`
   slot; only abnormal exits are now restarted.
 
+- **Elixir lower bound raised to `~> 1.19`, was `~> 1.18`.** The new
+  `CrowdControl.Provider.Gce` needs `:gcp_compute`, which declares
+  `elixir: "~> 1.19"`. A `Version.match?/2` guard in `mix.exs` would have kept
+  the 1.18 bound nominally alive while leaving the GCE provider untested there,
+  and an untested bound is a claim rather than a guarantee — the same principle
+  that put a lower-bound leg in CI in the first place. The CI matrix's 1.18.3
+  leg is replaced by a 1.19 leg pinned to the new floor, so the bound stays
+  tested rather than merely declared.
+
+  `:ssh` is now listed in `extra_applications`. It is an OTP application rather
+  than a Hex dependency, so it cannot be made `optional: true` the way `:req`
+  and `:kubereq` are, and naming it is the only way to get a release that
+  actually contains it. The cost, stated plainly: `:ssh` starts for every
+  consumer, including those who never touch the GCE provider. It is a small
+  supervisor tree that listens on nothing unless a daemon is explicitly
+  started.
+
 ### Added
 
 - **omp support.** [omp](https://omp.sh/) can now drive a session, alongside
@@ -167,6 +184,76 @@
   `CrowdControl.Backend.Docker` so both remote backends share one
   implementation. `Docker.apply_credentials/2` now delegates to it and its
   public behaviour is unchanged.
+- **A provider/transport split, so a new substrate is provisioning code only.**
+  `CrowdControl.Backend` already parameterized *where* it provisioned, but each
+  substrate had to bring its own byte transport too — the Docker backend's
+  FIFO/`tee` pair, the Kubernetes backend's exec stream. A VM has no exec API at
+  all, so a fourth substrate meant a fourth transport. The new
+  `CrowdControl.Provider` behaviour owns infrastructure lifecycle
+  (`acquire`/`reconnect`/`release`/`list_live`/`age_ms`/`scrub`) *underneath* a
+  single transport:
+
+  ```elixir
+  CrowdControl.run("Review this diff",
+    backend:
+      {CrowdControl.Backend.Sandboxd,
+       provider: {CrowdControl.Provider.Docker, image: "crowd_control/sandbox:dev", egress: :allow}}
+  )
+  ```
+
+  Three load-bearing contracts, all stated in `CrowdControl.Provider`'s
+  moduledoc: `acquire/1` returns only once the agent has answered
+  `GET /v1/health` (provisioning that reports success early is the single
+  largest source of flaky remote backends, and `insert_and_wait/3` on GCE waits
+  for the *operation*, never the guest); `release/1` is idempotent and treats
+  "already gone" as success; and the endpoint is **never** persisted, because a
+  published port is reassigned on every container start. The behaviour is graded
+  on admitting a Kubernetes provider as ~200 lines of provisioning code, and
+  that mapping table is written out in the moduledoc — writing it is what
+  revealed that `Provider.Endpoint` needs `headers` as well as `token`, since
+  the API server's pod proxy consumes `authorization` for its own credential.
+
+  `CrowdControl.Backend.Docker` is unchanged, undeprecated, and still works with
+  any image that has `sh` and `tail`. The new path needs an image containing the
+  agent, which is the trade it asks you to make.
+- **`CrowdControl.Backend.Sandboxd` — one HTTP transport for every substrate.**
+  Talks to `sandboxd`, an OTP release running inside the sandbox (nested app in
+  `sandboxd/`, four dependencies, its own release). The agent's capture file is
+  byte-for-byte the same artifact as the Docker backend's `tee` file, so the
+  `%{byte_offset:, buffer:}` cursor is unchanged and `start_reader/3` at offset 0
+  *is* the resume path. Offsets are 0-indexed here: `tail -c +N` is 1-indexed
+  and that `+ 1` is a documented hazard this transport simply does not have.
+  Backpressure reuses the Docker backend's proven cancel-and-re-request shape.
+- **`CrowdControl.Provider.Docker`** — one container per sandbox, agent port
+  published on `127.0.0.1`. `:egress` is **required** and has no default; see
+  Security below for why it cannot be inferred.
+- **`CrowdControl.Provider.Compose`** — a per-session stack over the Engine API
+  with no `docker compose` CLI dependency (the Engine API has no compose
+  endpoints; compose is a client-side Go plugin). Networks, volumes, ordered
+  health-gated startup, compose-compatible labels for `docker compose ls|ps`
+  interop — and deliberately *not* `config-hash`/`version`, which would make the
+  compose CLI believe it owns the stack and recreate it. Teardown order is
+  forced: containers, then networks, then named volumes explicitly, because a
+  network `DELETE` fails 403 while attached and `?v=true` removes only anonymous
+  volumes.
+- **`CrowdControl.Provider.Gce`** — a Compute Engine spot VM per sandbox via the
+  optional `{:gcp_compute, "~> 0.2"}`, reached through an OTP `:ssh` tunnel with
+  a per-session ed25519 key generated in memory that never touches disk.
+  `max_run_duration` plus `instanceTerminationAction: DELETE` is a *server-side*
+  orphan backstop that needs no BEAM, because the reaper cannot help if the node
+  dies mid-provision and a leaked spot VM bills forever.
+- **`CrowdControl.Backend.Docker.HostConfig`** — the single definition of
+  container hardening, now shared by `Backend.Docker` and `Provider.Docker`. Two
+  copies would drift, and the failure mode is silent: a sandbox that quietly
+  lost `CapDrop: ALL` looks exactly like one that did not.
+- **`:custom_provider` now works on a remote sandbox.** `CrowdControl.Agent.Omp`
+  resolves a provider's `baseUrl` from `models.yml` under its agent directory,
+  which previously had to already exist *inside* the sandbox — unsatisfiable
+  without a file-transfer channel. With `sandbox_agent_dir: true` the rendered
+  file is written into the sandbox over `PUT /v1/files` after the sandbox exists
+  and before the CLI starts, via a new optional
+  `c:CrowdControl.Agent.sandbox_files/1` callback. General workspace push/pull
+  remains out of scope.
 
 ### Fixed
 
@@ -203,6 +290,20 @@
 - **An invalid `:streaming_behavior` is rejected by `build_command/1`.** It
   used to surface only when a prompt was encoded — inside `Session.init/1` or
   `handle_call/3` — killing the session and the calling process.
+- **A crashing HTTP stream task no longer takes a session down without an
+  `:eof`.** `Req`'s `into: :self` machinery `spawn_link`s its worker to the
+  reader, so an abnormal task exit killed the reader before it could cast
+  `:eof` — and `Session` keeps the reader pid but never monitors it, so the
+  session died with no end-of-stream at all. Both readers now trap exits and
+  treat an abnormal task exit as a transport failure. Found while building
+  `Backend.Sandboxd` and back-ported to `CrowdControl.Backend.Docker`, which had
+  the identical latent bug.
+- **A mid-stream transport failure is normalized like every other failure.**
+  `Req.parse_message/2` yields `%Finch.TransportError{}` for a connection that
+  died under an open stream, while `Req.get/2`'s *return* yields
+  `%Req.TransportError{}` for a connect-phase failure. Only the second was
+  folded into the backend's error vocabulary, so the first leaked a raw struct
+  out of the backend in exactly the case most likely to reach a log line.
 
 ### Security
 
@@ -226,6 +327,62 @@
 - **A reader transport error no longer kills its session.** A mid-stream failure
   now casts `:eof` as the backend contract requires, instead of raising in a
   linked process.
+- **No agent credential is ever persisted.** `CrowdControl.Backend.Sandboxd`
+  derives each sandbox's bearer token by HMAC-SHA256 over a configured
+  `:sandboxd_secret` and the `session_key` the store already holds, so reattach
+  recomputes it with nothing at rest. `scrub/1` drops the endpoint **wholesale**
+  rather than field-by-field, so a future field on it cannot leak by omission,
+  and `Store.secret_keys/0` gains `:sandboxd_secret` and `:gce_config` (the
+  latter holds a live token-provider argument and is not a secret by name, which
+  is exactly why it needs naming). One documented cost: rotating
+  `:sandboxd_secret` fails reattach closed with `{:sandboxd, :unauthorized}` for
+  every sandbox started under the old secret. That is the intended trade against
+  a live credential in DETS, and the integration suite asserts it.
+- **The agent port is never routable, and `:egress` is never inferred.** On one
+  container, `Internal: true` and a published port are mutually exclusive —
+  publishing requires a non-internal endpoint, and attaching one restores full
+  internet egress. Confirmed six independent ways against Docker 29.4.0, and the
+  failure is *silent*: `create` answers `201` with `"Warnings": []` while
+  `NetworkSettings.Ports` reads `{"8080/tcp": null}`. So
+  `CrowdControl.Provider.Docker` requires an explicit `:egress` (`:allow` or
+  `:no_nat`) exactly as `Backend.Docker` requires an explicit `:network_mode`,
+  and it does **not** claim to block egress. `:no_nat` blocks the internet but
+  leaves the Docker host, sibling containers and embedded DNS reachable — "no
+  NAT", not "dropped" — and SECURITY.md says so rather than glossing it.
+  `HostIp: "127.0.0.1"` is sent on every binding, because omitting it publishes
+  two bindings on every interface.
+- **A per-session internal network makes the proxy footgun unreachable.**
+  `CrowdControl.Provider.Compose` puts the sandbox on an `Internal: true`
+  network with no port bindings and reaches it through a synthesized dual-homed
+  `socat` forwarder, so there is no `bridge` for a caller to choose and the
+  `bridge`-defeats-the-proxy failure mode does not exist for this provider. The
+  forwarder's own publish network disables IP masquerade, so it has no internet
+  either. Verified against a live daemon: the sandbox cannot reach `1.1.1.1`,
+  can reach its sidecar by alias, and the host can reach the agent.
+- **GCE sandboxes are reached only through an SSH tunnel.** The agent binds the
+  VM's loopback; port 22 is the only reachable port, and the per-session ed25519
+  key is generated in memory, set as *instance-level* metadata (a project-wide
+  key would apply to every VM in the project), and never written to disk.
+  Startup interpolates no secret into the script body and verifies a **mandatory**
+  SHA-256 on the release download. GCE metadata is readable by in-sandbox code,
+  which SECURITY.md states plainly rather than hiding.
+- **`PUT /v1/files` rejects path traversal rather than normalizing it**, on both
+  the client and the agent. A request for `/v1/files/../../etc/passwd` is
+  refused with `400`; a legitimate absolute path never needs `..` to express
+  itself. The route exists solely so omp's `:agent_dir` obligation is
+  satisfiable remotely.
+- **The agent's `401` has an empty body and a constant-time comparison.** A
+  distinct message for "no header" versus "wrong token" tells an attacker which
+  half to work on, and a byte-wise comparison leaks the token to anything that
+  can time responses — which, for a loopback-published port, is every process on
+  the host. `GET /v1/health` is the only unauthenticated route and returns
+  `{"ok": true}` and nothing else, because a provider must poll it before any
+  token round trip can have succeeded.
+- **The agent refuses to boot without a token.** A missing `CC_SANDBOXD_TOKEN`
+  is a hard startup failure, not a warning that degrades into an
+  unauthenticated process-exec endpoint. The release also disables Erlang
+  distribution, so it never registers with EPMD and opens no port that
+  `CC_SANDBOXD_BIND` does not govern.
 
 - **Strict env-var validation.** `CrowdControl.CLI.build_env/1` now rejects env
   keys that don't match `^[A-Za-z_][A-Za-z0-9_]*$` and values containing null

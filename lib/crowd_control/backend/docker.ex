@@ -123,7 +123,7 @@ defmodule CrowdControl.Backend.Docker do
 
   require Logger
 
-  alias CrowdControl.Backend.Docker.{API, Demux}
+  alias CrowdControl.Backend.Docker.{API, Demux, HostConfig}
   alias CrowdControl.Backend.Shell
   alias CrowdControl.Store
 
@@ -131,18 +131,6 @@ defmodule CrowdControl.Backend.Docker do
   @default_fifo "/var/run/cc.fifo"
   @default_network "none"
   @default_max_inflight 4 * 1024 * 1024
-  @default_pids_limit 512
-
-  # Only used when :readonly_rootfs is enabled. The fifo and tee live under
-  # /var/run and /var/log, so both must be writable for the entrypoint to work
-  # at all; /tmp is conventional. noexec/nosuid so these do not become a way to
-  # stage and run a binary.
-  @default_tmpfs %{
-    "/tmp" => "rw,noexec,nosuid,size=64m",
-    "/var/run" => "rw,noexec,nosuid,size=8m",
-    "/var/log" => "rw,noexec,nosuid,size=64m"
-  }
-
   defstruct [
     :container_id,
     :image,
@@ -232,46 +220,11 @@ defmodule CrowdControl.Backend.Docker do
       "sleep infinity"
   end
 
+  # Hardening lives in Backend.Docker.HostConfig, shared verbatim with
+  # Provider.Docker. Two copies of these defaults would drift, and a sandbox
+  # that silently lost CapDrop: ALL is indistinguishable from one that did not.
   defp host_config(handle) do
-    config = handle.config
-
-    %{
-      # Non-negotiable. A restarted container truncates the tee file and
-      # invalidates every persisted byte_offset. Making restart impossible is
-      # cheaper and safer than trying to detect it.
-      "RestartPolicy" => %{"Name" => "no"},
-      "NetworkMode" => network_mode(config),
-      "AutoRemove" => false,
-
-      # Hardening defaults. The code running in here is model-driven and
-      # untrusted, so the sandbox should not be weaker than the trusted
-      # container this project ships for itself. These three are safe for any
-      # image: a CLI needs no Linux capabilities, never needs to gain
-      # privileges, and has no business forking without bound. `Memory` and
-      # `NanoCpus` do NOT bound PIDs, so the fork-bomb ceiling has to be set
-      # separately.
-      "CapDrop" => config[:cap_drop] || ["ALL"],
-      "SecurityOpt" => config[:security_opt] || ["no-new-privileges:true"],
-      "PidsLimit" => Keyword.get(config, :pids_limit, @default_pids_limit)
-    }
-    |> maybe_put("NanoCpus", config[:cpus] && trunc(config[:cpus] * 1_000_000_000))
-    |> maybe_put("Memory", config[:memory])
-    |> put_readonly_rootfs(config)
-  end
-
-  # Opt-in rather than default: a read-only root filesystem breaks any image
-  # whose CLI writes outside the tmpfs mounts (npm caches, ~/.claude, and so
-  # on), and silently breaking every caller's image is not an acceptable way to
-  # ship a hardening default. When enabled, the fifo and tee paths must stay
-  # writable or the entrypoint cannot even start.
-  defp put_readonly_rootfs(host_config, config) do
-    if config[:readonly_rootfs] do
-      host_config
-      |> Map.put("ReadonlyRootfs", true)
-      |> Map.put("Tmpfs", config[:tmpfs] || @default_tmpfs)
-    else
-      host_config
-    end
+    HostConfig.build(handle.config, network_mode: network_mode(handle.config))
   end
 
   # Deliberately never infers `"bridge"`. Reaching an egress proxy does require
@@ -419,8 +372,17 @@ defmodule CrowdControl.Backend.Docker do
 
     # The reader is spawn_linked per the Backend reader contract: if it dies,
     # the session must die with it rather than go silently deaf.
+    #
+    # It also traps exits, because `Req`'s `into: :self` machinery spawn_links
+    # its own worker task to *this* process: an abnormal task exit would
+    # otherwise kill the reader before it could cast `:eof`, and Session never
+    # monitors the reader, so the session would go down with no end-of-stream
+    # at all. Measured while building Backend.Sandboxd, which has the identical
+    # exposure; the fix is the same in both.
     reader =
       spawn_link(fn ->
+        Process.flag(:trap_exit, true)
+
         reader_loop(%{
           handle: handle,
           session: session_pid,
@@ -493,6 +455,9 @@ defmodule CrowdControl.Backend.Docker do
     receive do
       {:cc_ack, bytes} ->
         state |> ack(bytes) |> consume()
+
+      {:EXIT, pid, reason} ->
+        on_exit_signal(state, pid, reason, &consume/1)
 
       message ->
         case Req.parse_message(state.resp, message) do
@@ -570,10 +535,30 @@ defmodule CrowdControl.Backend.Docker do
         else
           await_drain(state)
         end
+
+      {:EXIT, pid, reason} ->
+        on_exit_signal(state, pid, reason, &await_drain/1)
+
+      # An orphan chunk or a late :done from the cancelled request. There is no
+      # live response to parse it against, and the bytes are re-sent from
+      # `offset` when the stream reopens, so it is dropped.
+      _other ->
+        await_drain(state)
     after
       # The session went away or stopped acking; nothing left to read for.
       60_000 ->
         GenServer.cast(state.session, :eof)
+    end
+  end
+
+  # The session going away is not a failure and needs no :eof — there is nobody
+  # left to tell. Anything else exiting abnormally is Req's own stream task
+  # dying, which is a transport failure and must produce exactly one :eof.
+  defp on_exit_signal(state, pid, reason, continue) do
+    cond do
+      pid == state.session -> :ok
+      reason == :normal -> continue.(state)
+      true -> fail(state, {:stream_task_exit, reason})
     end
   end
 

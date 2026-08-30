@@ -8,7 +8,11 @@ defmodule CrowdControl.MixProject do
     [
       app: :crowd_control,
       version: @version,
-      elixir: "~> 1.18",
+      # Bumped from ~> 1.18 for :gcp_compute, which declares ~> 1.19. A
+      # Version.match?/2 guard in this file would have kept the 1.18 lower bound
+      # nominally alive while leaving the GCE provider untested there, and an
+      # untested bound is a claim rather than a guarantee.
+      elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
@@ -25,7 +29,21 @@ defmodule CrowdControl.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
+      # :ssh is an OTP application rather than a Hex dep, so it cannot be made
+      # `optional: true` the way :req and :kubereq are. Naming it here is the
+      # only way to get two things: a release that actually contains it (an
+      # undeclared OTP app is simply absent, and the failure surfaces at runtime
+      # on a customer's VM), and a compiler that can see
+      # `:ssh_client_key_api` — CrowdControl.Provider.Gce.Tunnel implements that
+      # behaviour, and its callback arities are exactly the thing that is easy to
+      # get wrong (`is_host_key/4` vs `/5`, `add_host_key/3` vs `/4`).
+      #
+      # The cost, stated plainly: :ssh now starts for every consumer, including
+      # those who never touch the GCE provider. It is a small supervisor tree
+      # that listens on nothing unless a daemon is explicitly started, which is
+      # a better trade than dropping `@behaviour` to silence five warnings and
+      # losing the arity check that S0.3 showed was needed.
+      extra_applications: [:logger, :ssh],
       mod: {CrowdControl.Application, []}
     ]
   end
@@ -88,7 +106,15 @@ defmodule CrowdControl.MixProject do
           CrowdControl.Backend,
           CrowdControl.Backend.Local,
           CrowdControl.Backend.Docker,
-          CrowdControl.Backend.Kubernetes
+          CrowdControl.Backend.Kubernetes,
+          CrowdControl.Backend.Sandboxd
+        ],
+        Providers: [
+          CrowdControl.Provider,
+          CrowdControl.Provider.Endpoint,
+          CrowdControl.Provider.Docker,
+          CrowdControl.Provider.Compose,
+          CrowdControl.Provider.Gce
         ],
         Persistence: [
           CrowdControl.Store,
@@ -105,7 +131,12 @@ defmodule CrowdControl.MixProject do
           CrowdControl.Backend.Credentials,
           CrowdControl.Backend.Docker.API,
           CrowdControl.Backend.Docker.Demux,
-          CrowdControl.Backend.Kubernetes.API
+          CrowdControl.Backend.Docker.HostConfig,
+          CrowdControl.Backend.Kubernetes.API,
+          CrowdControl.Backend.Sandboxd.API,
+          CrowdControl.Provider.Gce.API,
+          CrowdControl.Provider.Gce.Tunnel,
+          CrowdControl.Provider.Gce.Startup
         ]
       ]
     ]
@@ -126,6 +157,12 @@ defmodule CrowdControl.MixProject do
       # 0.5 and bumping it would break Docker-only users for no reason; kubereq's
       # own constraint does the lifting for anyone who opts in.
       {:kubereq, "~> 0.4.4", optional: true},
+      # Optional, and only CrowdControl.Provider.Gce needs it. Verified against
+      # the current mix.lock: this adds **zero** new transitive runtime deps —
+      # req, jason, nimble_options and telemetry are all already pinned, and
+      # goth is optional inside gcp_compute too. It is also the reason the
+      # Elixir lower bound moved to ~> 1.19.
+      {:gcp_compute, "~> 0.2", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:stream_data, "~> 1.1", only: :test},
       {:excoveralls, "~> 0.18", only: :test},

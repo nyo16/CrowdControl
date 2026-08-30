@@ -58,6 +58,50 @@ defmodule CrowdControl.Agent do
   @doc "Decodes one line of CLI stdout into a tagged message."
   @callback decode_line(binary()) :: CrowdControl.Protocol.message()
 
+  @typedoc """
+  One file an adapter needs inside the sandbox: an absolute in-sandbox path,
+  its bytes, and its octal mode.
+  """
+  @type sandbox_file :: {Path.t(), iodata(), non_neg_integer()}
+
+  @doc """
+  Files this adapter needs written *inside* the sandbox before its CLI starts.
+
+  Optional; an adapter that does not implement it stages nothing, which is why
+  `CrowdControl.Agent.ClaudeCode` needs no change.
+
+  A CLI that reads configuration from disk — `CrowdControl.Agent.Omp` resolving
+  a custom provider's `baseUrl` out of `models.yml` — has a problem no argv or
+  environment variable solves on a remote substrate: the file has to exist on
+  the *sandbox's* filesystem, and a host temp directory is not visible there.
+  Rendering is the adapter's job; writing is the backend's, since only the
+  backend knows how bytes cross into its substrate.
+
+  Must be pure and deterministic: it is called once per exec, after
+  `c:CrowdControl.Backend.provision/1` (there is no sandbox to write to before
+  that) and again on nothing else. Refuse a malformed option in
+  `c:build_command/1` instead, which runs before a sandbox has been created
+  and billed.
+  """
+  @callback sandbox_files(keyword()) :: [sandbox_file()]
+
+  @optional_callbacks sandbox_files: 1
+
+  @doc """
+  The sandbox files `module` needs, or `[]` when it declares none.
+
+  Probed rather than required, so an adapter opts in by defining
+  `c:sandbox_files/1` and every other adapter is unaffected.
+  """
+  @spec sandbox_files(module(), keyword()) :: [sandbox_file()]
+  def sandbox_files(module, opts) when is_atom(module) and is_list(opts) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :sandbox_files, 1) do
+      module.sandbox_files(opts)
+    else
+      []
+    end
+  end
+
   @aliases %{
     claude: CrowdControl.Agent.ClaudeCode,
     claude_code: CrowdControl.Agent.ClaudeCode,

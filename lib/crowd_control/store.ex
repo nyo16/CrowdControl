@@ -180,9 +180,28 @@ defmodule CrowdControl.Store do
 
   @doc """
   Credential-bearing option keys, stripped before anything is persisted.
+
+  `:sandboxd_secret` is here even though it is normally read from application
+  config rather than passed in opts: a caller *may* pass it, and a stray copy in
+  a persisted record would defeat the entire point of deriving the agent token
+  instead of storing it.
+
+  `:gce_config` holds a `%GcpCompute.Config{}`, which carries a live
+  token-provider argument. It is not a secret by name, which is exactly why it
+  needs naming here.
   """
   @spec secret_keys() :: [atom()]
-  def secret_keys, do: [:api_key, :session_token, :env, :proxy_token, :auth_token]
+  def secret_keys do
+    [
+      :api_key,
+      :session_token,
+      :env,
+      :proxy_token,
+      :auth_token,
+      :sandboxd_secret,
+      :gce_config
+    ]
+  end
 
   @doc """
   Remove credentials from an options keyword list.
