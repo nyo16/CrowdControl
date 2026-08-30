@@ -1044,13 +1044,13 @@ CrowdControl.start_session(
 
 | Option | Default | Notes |
 |--------|---------|-------|
-| `:image` | — | **Required.** Needs the CLI and `sh` on `PATH` |
+| `:image` | — | **Required.** Needs the CLI plus `sh`, `tail`, `tee` and `head` on `PATH` — busybox and coreutils both suffice |
 | `:namespace` | kubeconfig context's namespace, else `"default"` | |
 | `:kubeconfig` | `Kubereq.Kubeconfig.Default` | A `%Kubereq.Kubeconfig{}`, a pipeline module, or `{module, opts}`. The default covers both a developer's `~/.kube/config` and an in-cluster ServiceAccount |
 | `:network` | — | `:deny_all` \| `{:policy, name}` \| `:unrestricted`. **Required** when `:proxy_url`/`:api_url` is set — see below |
 | `:network_probe` | `true` | `false` skips the `:deny_all` enforcement probe, for callers who already know their CNI enforces |
 | `:network_probe_image` | `"busybox:1.36"` | Image the enforcement probe runs |
-| `:network_probe_url` | `"http://1.1.1.1"` | Egress target the probe attempts |
+| `:network_probe_url` | unset | Probe *internet* egress instead of the default, which is a TCP connect to the API server's ClusterIP. The default needs no DNS and no internet, so a security decision does not depend on external reachability — see [SECURITY.md](SECURITY.md) |
 | `:cpus` | unset | Fractional, e.g. `1.5` |
 | `:memory` | unset | Bytes |
 | `:tee_path` | `/var/log/cc/out.jsonl` | Where output is recorded |

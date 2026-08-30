@@ -59,18 +59,24 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
     test "an explicit :network gets past the gate" do
       # Fails later on an unreachable API server, which is the point — the
       # network check is no longer what stops it.
-      capture_log(fn ->
-        result =
-          Kubernetes.provision(
-            image: "busybox",
-            proxy_url: "http://p:8080",
-            network: :unrestricted,
-            kubeconfig: kubeconfig("https://127.0.0.1:1")
-          )
+      log =
+        capture_log(fn ->
+          result =
+            Kubernetes.provision(
+              image: "busybox",
+              proxy_url: "http://p:8080",
+              network: :unrestricted,
+              kubeconfig: kubeconfig("https://127.0.0.1:1")
+            )
 
-        assert {:error, {:k8s, reason}} = result
-        refute reason == :network_policy_required
-      end)
+          assert {:error, {:k8s, reason}} = result
+          refute reason == :network_policy_required
+        end)
+
+      # Same discipline as the reader test: a discarded capture is where a secret
+      # or a 2 KB struct dump hides while the test looks green.
+      refute log =~ "cert:"
+      refute log =~ "transport_opts"
     end
   end
 
@@ -95,12 +101,32 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
       container = container(Kubernetes.pod_manifest(handle()))
 
       assert container["name"] == "cc"
-      assert container["command"] == ["/bin/sh", "-c", "sleep infinity"]
       assert container["securityContext"]["allowPrivilegeEscalation"] == false
       assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
 
       refute Map.has_key?(container["securityContext"]["capabilities"], "add"),
              "the sandbox holds a capability for the life of the session; the init container holds MKNOD for milliseconds instead"
+    end
+
+    test "PID 1 is not the CLI, but it does exit with it" do
+      # Two properties, and both matter.
+      #
+      # PID 1 must not BE the CLI: the tee file has to outlive any individual
+      # exec, and the CLI is started later by a detaching exec.
+      #
+      # PID 1 must still NOTICE the CLI. It used to be `sleep infinity`, which
+      # made a dead CLI invisible — the CLI is a grandchild after `setsid`, so
+      # the container stayed Running, `tail -f` never ended, no `:eof` was cast,
+      # and the session waited forever while the Pod billed forever.
+      [shell, flag, script] = container(Kubernetes.pod_manifest(handle()))["command"]
+
+      assert [shell, flag] == ["/bin/sh", "-c"]
+      refute script =~ "sleep infinity", "PID 1 cannot observe the CLI if it just sleeps"
+
+      # Waits for the launcher's status file, then adopts its value, so the Pod
+      # reaches a terminal phase with the CLI's own exit code.
+      assert script =~ "cc.status"
+      assert script =~ ~r/exit\s+"\$code"/
     end
 
     test "the init container is the only thing that ever holds MKNOD" do
@@ -532,18 +558,470 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
       test_pid = self()
       relay = spawn(fn -> relay_loop(test_pid) end)
 
-      capture_log(fn ->
-        assert {:ok, reader} = Kubernetes.start_reader(handle, relay, Backend.new_cursor())
-        assert_receive {:cast, :eof}, 5_000
+      log =
+        capture_log(fn ->
+          assert {:ok, reader} = Kubernetes.start_reader(handle, relay, Backend.new_cursor())
+          assert_receive {:cast, :eof}, 5_000
 
-        # The reader is done, so a :normal exit is expected. Any other reason is
-        # what travels through the link and kills a non-trapping session, which
-        # is the whole hazard this test defends.
-        assert_receive {:EXIT, ^reader, exit_reason}, 1_000
+          # The reader is done, so a :normal exit is expected. Any other reason is
+          # what travels through the link and kills a non-trapping session, which
+          # is the whole hazard this test defends.
+          assert_receive {:EXIT, ^reader, exit_reason}, 1_000
 
-        assert exit_reason == :normal,
-               "the reader died with #{inspect(exit_reason)}; that reason propagates through the spawn_link and takes the session with it"
-      end)
+          assert exit_reason == :normal,
+                 "the reader died with #{inspect(exit_reason)}; that reason propagates through the spawn_link and takes the session with it"
+        end)
+
+      # The capture used to be discarded, and this is precisely where the 2 KB
+      # blob came from: this test provoked the `MatchError` on every run of the
+      # default suite, printed the whole `%Req.Request{}` — client certificate
+      # DER, apiserver URL, connect options — and asserted nothing about it. An
+      # unasserted `capture_log` is worse than no capture: it hides the evidence
+      # while looking like coverage.
+      refute log =~ "cert:", "TLS client-certificate material reached the log"
+      refute log =~ "Req.Request", "the whole request struct reached the log"
+      refute log =~ "transport_opts"
+
+      # And it still says what happened. `econnrefused` is the reason worth
+      # keeping; everything else in that 2 KB was noise.
+      assert log =~ "Kubernetes reader",
+             "the give-up was silent, so nobody could tell why the session ended"
+
+      assert log =~ "econnrefused" or log =~ "upgrade_failed",
+             "the log named neither the transport failure nor the upgrade status"
+    end
+
+    test "a non-trapping caller of open_exec/5 gets an error and stays alive" do
+      # The hazard `guard` cannot reach. `Kubereq.PodExec.start_link/1` links to
+      # whoever starts it, so on a failed upgrade the child's abnormal exit
+      # arrives as a *link signal*: a caller that does not trap is killed before
+      # any rescue runs, and `catch :exit` never sees it. Every in-tree caller
+      # happened to trap, so nothing noticed — this is the test that would have.
+      config = [kubeconfig: kubeconfig("https://127.0.0.1:1")]
+      parent = self()
+
+      caller =
+        spawn(fn ->
+          # Deliberately NOT trapping exits. That is the whole point.
+          result = API.open_exec(config, "cc-nope", ["/bin/sh"], self(), container: "cc")
+          send(parent, {:result, result})
+
+          # Answering after the failure is the proof of survival: a killed caller
+          # cannot reply, and a merely-slow one fails the refute_receive below.
+          receive do
+            {:ping, from} -> send(from, :pong)
+          end
+        end)
+
+      mon = Process.monitor(caller)
+
+      assert_receive {:result, {:error, reason}}, 5_000
+
+      # And the reason is the normalized one, not 2 KB of Req.Request.
+      dumped = inspect(reason)
+      refute dumped =~ "cert"
+      refute dumped =~ "Req.Request"
+
+      # No DOWN from the link signal: this is the assertion that used to fail.
+      refute_receive {:DOWN, ^mon, :process, ^caller, _}, 100
+
+      # And it is responsive rather than merely un-exited. A killed process
+      # cannot answer, so the reply is the survival proof; the caller returns
+      # normally straight afterwards, which is why the refute comes first.
+      send(caller, {:ping, self()})
+      assert_receive :pong, 1_000
+    end
+  end
+
+  describe "the reader stays responsive inside a backoff window (blocker: a deaf reader)" do
+    # `Process.sleep/1` used to sit here, which made the reader deaf for up to
+    # 3.1 s cumulative across five reconnect attempts — to acks, and worse, to its
+    # own session shutting down. Both halves need a test because the obvious fix
+    # for one (pass the window to `after` on every recursion) breaks the other.
+
+    test "a session shutting down takes its reader with it, without waiting out the window" do
+      parent = self()
+      deadline = System.monotonic_time(:millisecond) + 60_000
+
+      waiter =
+        spawn(fn ->
+          Process.flag(:trap_exit, true)
+          Kubernetes.wait_until(%{parent: parent, inflight: 0, last_stderr: nil}, deadline)
+          send(parent, :window_elapsed)
+        end)
+
+      mon = Process.monitor(waiter)
+      send(waiter, {:EXIT, parent, :shutdown})
+
+      assert_receive {:DOWN, ^mon, :process, ^waiter, :shutdown}, 1_000
+      refute_received :window_elapsed
+    end
+
+    test "a steady ack stream does not defer the reconnect forever" do
+      # The bug this pins is subtle: passing the remaining window to `after` on
+      # every recursion restarts it each time a message arrives, so a session
+      # acking steadily during backoff would postpone the reconnect indefinitely —
+      # the reader would never reopen the stream while its consumer was healthy.
+      parent = self()
+      window = 300
+      deadline = System.monotonic_time(:millisecond) + window
+
+      waiter =
+        spawn(fn ->
+          state =
+            Kubernetes.wait_until(
+              %{parent: parent, inflight: 500, last_stderr: nil},
+              deadline
+            )
+
+          send(parent, {:returned, System.monotonic_time(:millisecond), state})
+        end)
+
+      # Acks every 20 ms for well past the window: 15+ messages, any one of which
+      # would have restarted a per-message timeout.
+      for _ <- 1..25 do
+        send(waiter, {:cc_ack, 10})
+        Process.sleep(20)
+      end
+
+      assert_receive {:returned, at, state}, 2_000
+
+      assert at <= deadline + 100,
+             "the window was extended by #{at - deadline}ms of acks; a healthy consumer would starve the reconnect"
+
+      # And the acks were not merely ignored while waiting: backpressure accounting
+      # has to keep working through a backoff or the resume decision is wrong.
+      assert state.inflight < 500, "acks arriving during backoff were dropped"
+    end
+
+    test "the container's last words survive a backoff window" do
+      # stderr arriving from the dying channel is exactly what explains the
+      # failure, and it arrives *during* the wait. Losing it here would leave the
+      # give-up reason opaque, which is the failure mode G1 is about.
+      parent = self()
+      deadline = System.monotonic_time(:millisecond) + 150
+
+      waiter =
+        spawn(fn ->
+          state =
+            Kubernetes.wait_until(%{parent: parent, inflight: 0, last_stderr: nil}, deadline)
+
+          send(parent, {:returned, state})
+        end)
+
+      send(waiter, {:stderr, "tail: can't open '/var/log/cc/out.jsonl'\n"})
+
+      assert_receive {:returned, state}, 2_000
+      assert state.last_stderr =~ "tail: can't open"
+    end
+  end
+
+  describe "liveness is not re-asked inside one reconnect burst (blocker: five requests per blip)" do
+    test "the memo is bounded by a deadline, not by the number of failures" do
+      # `reconnect_or_eof/2` consults liveness once per failed attempt, so one
+      # blip asked the API server five times in about three seconds. The memo
+      # collapses the burst; it deliberately does NOT collapse steady-state idle
+      # polling, which is one request per session per 60 s and cannot be cached
+      # away because one Pod carries exactly one reader.
+      #
+      # Asserted through the counting adapter: a second call inside the TTL must
+      # issue no request at all.
+      test_pid = self()
+
+      adapter = fn req ->
+        send(test_pid, :liveness_request)
+        {req, Req.Response.new(status: 200, body: running_pod("cc-" <> @key))}
+      end
+
+      handle = handle(kubeconfig: kubeconfig("https://k8s.test"), req_adapter: adapter)
+      state = %{handle: handle, liveness: nil, liveness_at: nil}
+
+      assert {:running, state} = Kubernetes.memoized_liveness(state)
+      assert_received :liveness_request
+
+      assert {:running, _state} = Kubernetes.memoized_liveness(state)
+
+      refute_received :liveness_request,
+                      "the same burst asked the API server twice; five attempts would be five requests"
+    end
+
+    test "an expired memo is re-asked, so a Pod that really went away is noticed" do
+      test_pid = self()
+
+      adapter = fn req ->
+        send(test_pid, :liveness_request)
+        {req, Req.Response.new(status: 200, body: running_pod("cc-" <> @key))}
+      end
+
+      handle = handle(kubeconfig: kubeconfig("https://k8s.test"), req_adapter: adapter)
+
+      # Stamped a full second in the past: outside any sane TTL.
+      stale = %{
+        handle: handle,
+        liveness: :terminal,
+        liveness_at: System.monotonic_time(:millisecond) - 60_000
+      }
+
+      assert {:running, _state} = Kubernetes.memoized_liveness(stale)
+
+      assert_received :liveness_request,
+                      "a stale answer was reused; a terminal memo would strand the session forever"
+    end
+  end
+
+  describe "a WithClauseError is bounded too (blocker: a socket struct in a log line)" do
+    test "a mid-enumeration else_clause never inspects the connection struct" do
+      # `Kubereq.Connect.create_stream/4` can raise the WithClauseError itself,
+      # during Enum evaluation of the stream rather than inside `init/1`. Nothing
+      # wraps it into a MatchError then, so the MatchError clause does not apply
+      # and the fallback used to length-cap `Exception.message/1` — a character
+      # count, applied to an inspected `%Mint.HTTP1{}` that holds the socket and,
+      # through it, the connection's transport options.
+      conn = %{__struct__: Mint.HTTP1, socket: :fake_port, private: %{secret: "sk-real-key"}}
+      cause = %{__struct__: Mint.WebSocket.UpgradeFailureError, status_code: 403}
+
+      reason = API.exception_reason(%WithClauseError{term: {conn, cause}})
+
+      # Resolved into the vocabulary, not inspected at all.
+      assert reason == {:upgrade_failed, 403}
+
+      dumped = inspect(reason)
+      refute dumped =~ "Mint.HTTP1"
+      refute dumped =~ "sk-real-key"
+    end
+
+    test "an unrecognized else_clause term is bounded structurally, not by length" do
+      secret = String.duplicate("sk-real-", 200)
+      term = {:else_clause, %{"deep" => %{"nested" => secret}}}
+
+      assert {:exception, {:else_clause, dumped}} =
+               API.exception_reason(%WithClauseError{term: term})
+
+      refute dumped =~ "sk-real-"
+      assert byte_size(dumped) <= 200
+    end
+  end
+
+  describe "the credential write is self-terminating and guarded (blocker: a silent failure)" do
+    test "the read is bounded by byte count, never by stdin EOF" do
+      # `cat >` ends only on stdin EOF, and the only way to signal that is to
+      # close the websocket — which makes the API server tear the exec down
+      # before it writes the channel-3 status. Measured on v1.35.6+orb1: with a
+      # client-side close the frames are [:connected, {:close, 1000, ""}] and
+      # channel 3 never arrives at all, so a write to an unwritable path returned
+      # `:ok` and the CLI then started with no credentials.
+      command = Kubernetes.env_write_command(handle(), 42)
+
+      assert command =~ "head -c 42"
+
+      refute command =~ "cat >",
+             "a read that ends on stdin EOF makes every failed credential write report success"
+    end
+
+    test "the already-started guard runs before anything is written" do
+      command = Kubernetes.env_write_command(handle(), 42)
+
+      [guard, write] = String.split(command, "umask 077;", parts: 2)
+
+      assert guard =~ "exit 99"
+      assert guard =~ "cc.launcher"
+      assert guard =~ "cc.status"
+
+      assert write =~ "head -c",
+             "the write must come after the guard: a refused second exec/4 that re-planted the credential file would leave the secret on disk, because only the launcher unlinks it"
+    end
+
+    test "the file is 0600 from the instant it exists" do
+      assert Kubernetes.env_write_command(handle(), 1) =~ "umask 077"
+    end
+  end
+
+  describe "the secret channel pins its container (blocker: the env file lands in the wrong one)" do
+    test "every exec that carries the credential names the container explicitly" do
+      # `exec_stdin/5` is the one exec that writes the provider key, and it was
+      # the one exec that did not pin `:container`. On a Pod with more than one
+      # container the API server picks, so the credential could be written into a
+      # container the CLI never reads. The sandbox Pod happens to have exactly one
+      # plus an already-exited init container, so this worked by luck.
+      params = API.exec_params(["/bin/sh", "-c", "cat > /var/run/cc.env"], container: "cc")
+
+      assert params[:container] == "cc"
+      assert params[:stdin] == false, "stdin defaults off; the caller opts in"
+    end
+
+    test "the container is omitted rather than guessed when unnamed" do
+      # Sending `container: nil` would be a request for a container named "nil".
+      refute Keyword.has_key?(API.exec_params(["/bin/sh"], []), :container)
+    end
+
+    test "stderr is off unless asked for, which is why channel 2 was dead code" do
+      # Measured: with stderr off the API server never opens channel 2, so every
+      # `{:stderr, _}` clause downstream is unreachable. The reader asks for it
+      # precisely because that is the only thing that explains a failing read.
+      refute API.exec_params(["/bin/sh"], [])[:stderr]
+      assert API.exec_params(["/bin/sh"], stderr: true)[:stderr]
+    end
+  end
+
+  describe "a rebuilt handle keeps the paths its offset refers to (blocker: resume reads the wrong file)" do
+    test "the sandbox paths are persisted on the Pod" do
+      # Custom paths, so the assertion cannot pass by matching the defaults.
+      custom = %{
+        handle()
+        | tee_path: "/custom/out.jsonl",
+          fifo_path: "/custom/in.fifo",
+          env_path: "/custom/cc.env"
+      }
+
+      annotations = Kubernetes.pod_manifest(custom) |> get_in(["metadata", "annotations"])
+
+      assert annotations["crowd_control.tee_path"] == "/custom/out.jsonl"
+      assert annotations["crowd_control.fifo_path"] == "/custom/in.fifo"
+      assert annotations["crowd_control.env_path"] == "/custom/cc.env"
+    end
+
+    test "list_live/1 reads the paths from the Pod, not from the caller's opts" do
+      # The bug: `handle_from_pod/3` took the paths from whichever process asked,
+      # and `Reaper.reattach_all/3` then overwrote the stored handle with that. A
+      # session provisioned with a custom `:tee_path` therefore resumed against
+      # the DEFAULT path — a file that does not exist — carrying a byte offset
+      # measured in a different file entirely.
+      pod = %{
+        "metadata" => %{
+          "name" => "cc-" <> @key,
+          "namespace" => "ns1",
+          "labels" => %{"crowd_control.session" => @key},
+          "annotations" => %{
+            "crowd_control.owner" => "node-a",
+            "crowd_control.tee_path" => "/custom/out.jsonl",
+            "crowd_control.fifo_path" => "/custom/in.fifo",
+            "crowd_control.env_path" => "/custom/cc.env"
+          }
+        },
+        "status" => %{"phase" => "Running"},
+        "spec" => %{"containers" => [%{"image" => "busybox:1.36"}]}
+      }
+
+      # Deliberately hostile opts: a reaper's config, naming different paths.
+      opts =
+        adapter_config([pod_list([pod])]) ++
+          [
+            owner: "node-a",
+            tee_path: "/reaper/wrong.jsonl",
+            fifo_path: "/reaper/wrong.fifo",
+            env_path: "/reaper/wrong.env"
+          ]
+
+      assert {:ok, [rebuilt]} = Kubernetes.list_live(opts)
+
+      assert rebuilt.tee_path == "/custom/out.jsonl"
+      assert rebuilt.fifo_path == "/custom/in.fifo"
+      assert rebuilt.env_path == "/custom/cc.env"
+    end
+
+    test "a Pod from before the annotations existed still resolves" do
+      # Rolling upgrade: Pods already running when this shipped carry no path
+      # annotations, and they must not resume against nil.
+      pod = %{
+        "metadata" => %{
+          "name" => "cc-" <> @key,
+          "namespace" => "ns1",
+          "labels" => %{"crowd_control.session" => @key},
+          "annotations" => %{"crowd_control.owner" => "node-a"}
+        },
+        "status" => %{"phase" => "Running"},
+        "spec" => %{"containers" => [%{"image" => "busybox:1.36"}]}
+      }
+
+      opts = adapter_config([pod_list([pod])]) ++ [owner: "node-a"]
+
+      assert {:ok, [rebuilt]} = Kubernetes.list_live(opts)
+      assert rebuilt.tee_path == "/var/log/cc/out.jsonl"
+    end
+  end
+
+  describe "the enforcement probe's own logic (blocker: a false 'enforced' ships a sandbox with no boundary)" do
+    # This decision was live-only, and the live test asserts a *cached negative*
+    # while the probe runs at most once per VM — so the three interesting
+    # outcomes were never exercised. It flaked in the dangerous direction twice
+    # before being separated out here.
+
+    test "a fetch that succeeds despite the deny-all means nothing is enforcing" do
+      assert Kubernetes.probe_verdict(%{phase: "Succeeded", ran?: true}, nil) == {:ok, false}
+    end
+
+    test "blocked plus a successful control is the only path to 'enforced'" do
+      assert Kubernetes.probe_verdict(
+               %{phase: "Failed", ran?: true},
+               %{phase: "Succeeded", ran?: true}
+             ) == {:ok, true}
+    end
+
+    test "a control that could not reach the target proves nothing about policy" do
+      # Refusing here is the whole point: the alternative is reporting "enforced"
+      # because the network happened to be broken.
+      assert Kubernetes.probe_verdict(
+               %{phase: "Failed", ran?: true},
+               %{phase: "Failed", ran?: true}
+             ) ==
+               {:error, {:k8s, {:network_probe_inconclusive, :control_failed}}}
+    end
+
+    test "a probe whose container never ran is inconclusive, not enforced" do
+      # A Pod that fails to schedule or cannot pull its image also reports phase
+      # Failed. Reading that as "policy stopped it" is how the probe reported
+      # enforcement on a cluster with no policy controller at all — a slow image
+      # pull was enough.
+      assert Kubernetes.probe_verdict(%{phase: "Failed", ran?: false}, nil) ==
+               {:error, {:k8s, {:network_probe_inconclusive, :probe_never_ran}}}
+    end
+
+    test "an inconclusive verdict is never mistaken for a negative" do
+      # `:ok` would provision, `{:ok, false}` would refuse with a clear reason,
+      # and inconclusive must do neither — it is not cached, so the next call
+      # re-probes rather than making one flaky minute permanent.
+      for control <- [%{phase: "Failed", ran?: true}, nil] do
+        assert {:error, {:k8s, {:network_probe_inconclusive, _}}} =
+                 Kubernetes.probe_verdict(%{phase: "Failed", ran?: false}, control)
+      end
+    end
+
+    test "the probe Pod carries the labels its own sweep selects on" do
+      # The probe cleans up in an `after` block, which does not run when the
+      # process is *killed* — an ExUnit timeout, a supervisor shutdown. The
+      # objects carry no owner hash, so nothing else could ever match them and
+      # they leaked permanently. The next probe sweeps them, and these labels are
+      # what makes that possible.
+      manifest = Kubernetes.probe_manifest("cc-netpol-probe-abc", "ns1", [])
+      labels = get_in(manifest, ["metadata", "labels"])
+
+      assert labels["crowd_control.probe_sweep"] == "true",
+             "without a constant-valued label the sweep cannot select probes at all"
+
+      assert labels["crowd_control.probe"] == "cc-netpol-probe-abc",
+             "the probe's own NetworkPolicy selects this, so it must stay unique"
+
+      assert {age, ""} = Integer.parse(labels["crowd_control.created_at"])
+
+      assert age > 0,
+             "the sweep needs an age to tell an abandoned probe from one in flight on another node"
+    end
+
+    test "the default probe target needs neither DNS nor the internet" do
+      # It used to `wget http://1.1.1.1`, which made a security decision depend on
+      # external reachability: one dropped packet inside the 5s window failed the
+      # guarded run, and a failed guarded run reads as "policy stopped it".
+      command = Kubernetes.probe_manifest("p", "ns1", []) |> probe_command()
+
+      assert command =~ "KUBERNETES_SERVICE_HOST"
+      refute command =~ "1.1.1.1"
+      refute command =~ "wget"
+    end
+
+    test "an explicit URL is still honoured for callers who want internet egress proven" do
+      manifest = Kubernetes.probe_manifest("p", "ns1", network_probe_url: "http://example.test")
+
+      assert probe_command(manifest) =~ "example.test"
     end
   end
 
@@ -757,6 +1235,11 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
 
   defp container(manifest), do: manifest |> get_in(["spec", "containers"]) |> hd()
   defp init_container(manifest), do: manifest |> get_in(["spec", "initContainers"]) |> hd()
+
+  # The probe's egress attempt is its PID 1, so the last element of `command` is
+  # the script whose exit status is the whole answer.
+  defp probe_command(manifest),
+    do: manifest |> container() |> Map.fetch!("command") |> List.last()
 
   defp status_body(message), do: %{"kind" => "Status", "message" => message}
 

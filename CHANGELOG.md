@@ -255,8 +255,65 @@
   `c:CrowdControl.Agent.sandbox_files/1` callback. General workspace push/pull
   remains out of scope.
 
+### Changed
+
+- **A Kubernetes `write/2` that times out now returns
+  `{:error, {:k8s, :write_indeterminate}}`** rather than `{:k8s, :exec_timeout}`.
+  The exec task is killed brutally and the Mint socket dies with it, but the API
+  server may already have run the `printf` — so the prompt may or may not be in
+  the FIFO. Reported as a plain timeout, the obvious response is to retry, which
+  delivers the same prompt twice. Naming the uncertainty lets a caller decide.
+- **`CrowdControl.Backend.Kubernetes.API.exec_stdin/5` takes an options list**
+  (was `exec_stdin/4`), so the caller pins `:container`.
+
 ### Fixed
 
+- **A crashed CLI no longer hangs a Kubernetes session forever.** The sandbox
+  container's PID 1 was `sleep infinity`, and `setsid` makes the CLI a
+  grandchild of it, so nothing in the container noticed the CLI die: the Pod
+  stayed `Running`, `tail -f` never ended, no `:eof` reached the session, and the
+  Pod billed indefinitely. PID 1 now waits for the status the launch pipeline
+  writes *after* `tee` drains and exits with the CLI's own code, so
+  `Backend.Kubernetes.await_exit/2` reports `137` for a SIGKILLed CLI instead of
+  never returning. A launcher killed before it can report (an OOM kill of the
+  process group) is detected through its pid file rather than waited on forever.
+- **`CrowdControl.Backend.Kubernetes.API.open_exec/5` no longer kills a caller
+  that does not trap exits.** `Kubereq.PodExec.start_link/1` links to whoever
+  starts it and stops with the transport error as its reason, and a link signal
+  is not something a `rescue`/`catch :exit` can intercept — so a routine
+  websocket blip killed the caller outright. The channel is now started by a
+  dedicated trapping owner that holds the only link, and a channel death arrives
+  as an `{:exec_down, pid, reason}` message. The owner monitors the consumer, so
+  a channel cannot outlive the process it delivers to.
+- **A failed write of the Kubernetes credential file is no longer reported as
+  success.** `exec_stdin` returned `:ok` on the first close frame and discarded
+  websocket channel 3 entirely, so a write that could not create the file looked
+  fine and the CLI then started with no credentials and failed later, elsewhere,
+  for a reason that named none of this. The channel-3 `Status` is now decoded
+  with the same `exec_status/1` the other exec paths use.
+- **The Kubernetes credential file is written to a named container.** Every other
+  exec pinned `:container`; this one did not, so on a multi-container Pod the API
+  server chose where the secret landed. It worked only because the sandbox Pod
+  has one container plus an already-exited init container.
+- **`Backend.Kubernetes.exec/4` refuses a second call** with
+  `{:error, {:k8s, :already_started}}`, matching `Backend.Sandboxd`. `tee` opens
+  the tee file `O_TRUNC`, so a second launch silently truncated it and every
+  persisted byte offset then pointed into a different file — no error, just a
+  session replaying or skipping output. The guard runs before the credential file
+  is written, so a refused call cannot re-plant a secret that only the launcher
+  unlinks.
+- **A reattached Kubernetes session resumes against the file its offset was
+  measured in.** A handle rebuilt by `list_live/1` took `:tee_path`,
+  `:fifo_path` and `:env_path` from the *caller's* options — a reaper's, usually
+  — so a session provisioned with custom paths resumed against the defaults,
+  reading a file that does not exist. The paths are now persisted as Pod
+  annotations and rebuilt from there; Pods created before this change fall back
+  to the caller's options as before.
+- **The Kubernetes reader asks the API server once per reconnect burst, not once
+  per attempt.** One blip produced five `GET /pods/{name}` calls in about three
+  seconds. Steady-state idle polling is unchanged and deliberately uncached: one
+  Pod carries exactly one reader, so there is nothing for a shared cache to
+  collapse.
 - **`Session.send_prompt/2` no longer rejects a prompt after the first result.**
   A `{:result, _, _}` ends a *turn*, not the process: both
   `claude --input-format stream-json` and `omp --mode rpc` keep reading stdin
@@ -307,6 +364,28 @@
 
 ### Security
 
+- **The Kubernetes `:deny_all` enforcement probe no longer reports a boundary
+  that is not there.** It fetched `http://1.1.1.1`, which made a security
+  decision depend on internet reachability: one dropped packet inside the 5 s
+  window failed the guarded run, and a failed guarded run was read as "the policy
+  stopped it". Observed reporting enforcement on a cluster with no policy
+  controller at all, which ships a sandbox believing it has a network boundary it
+  does not have. The probe now performs a TCP connect to the API server's
+  ClusterIP — no DNS, no TLS, no internet — and reports enforcement only when the
+  guarded container actually **ran** and an identical fetch **succeeded** without
+  the policy in place. Anything else is inconclusive, and inconclusive is never
+  cached and never treated as enforcement. `:network_probe_url` still selects an
+  internet target for callers who specifically want that proven blocked.
+- **Abandoned probe objects no longer accumulate on the cluster.** The probe
+  cleans up in an `after` block, which does not run when the process is *killed*
+  — an ExUnit timeout, a supervisor shutdown — and the objects carry no owner
+  hash, so nothing else could ever match them. Each probe now sweeps abandoned
+  ones older than five minutes, so a killed run self-heals.
+- **A `WithClauseError` from the websocket stack is bounded structurally.**
+  `Kubereq.Connect.create_stream/4` can raise it during `Enum` evaluation, where
+  nothing wraps it into the `MatchError` the normalizer already handled — leaving
+  a length-capped `Exception.message/1` of an inspected `%Mint.HTTP1{}`, which
+  holds the socket and, transitively, the connection's transport options.
 - **Sandbox containers are hardened by default.** `CapDrop: ALL`,
   `no-new-privileges`, and `PidsLimit: 512`. The PID ceiling is independent of
   `:memory`/`:cpus`, neither of which bounds process count, so without it a fork

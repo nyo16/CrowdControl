@@ -183,10 +183,41 @@ a deny-all policy attempting egress) and refuses to provision with
 `{:error, {:k8s, :network_policy_not_enforced}}` when egress succeeds. Set
 `network_probe: false` only if you already know your CNI enforces.
 
+**The probe's own failure mode, and why it is now a two-Pod test.** A single
+blocked fetch conflates "the policy stopped it" with "it failed for some other
+reason", and that direction of error is the dangerous one: a false *enforced*
+ships a sandbox believing it has a boundary it does not have. This was not
+hypothetical — the probe fetched `http://1.1.1.1` with a 5 s timeout, and it
+reported enforcement on a cluster with no policy controller at all, because one
+slow image pull was enough.
+
+Two independent conditions must now both hold before enforcement is believed:
+
+- the guarded container actually **ran** and exited non-zero. A Pod that never
+  started — unschedulable, `ImagePullBackOff` — also reports phase `Failed`, and
+  reading that as "blocked by policy" is exactly the false positive above; and
+- the **same** attempt **succeeds** with no policy in place. That rules out a
+  broken cluster network, an unreachable target, and a client that fails for its
+  own reasons.
+
+Anything else is `{:error, {:k8s, {:network_probe_inconclusive, reason}}}`, which
+is never cached and never treated as enforcement — one flaky minute must not
+become a permanent wrong answer.
+
+The default target is a TCP connect to the API server's ClusterIP
+(`$KUBERNETES_SERVICE_HOST`), which needs no DNS, no TLS and no internet: a
+security decision should not depend on external reachability. `:network_probe_url`
+selects an internet target for callers who specifically want *that* proven
+blocked, and it is the less deterministic choice.
+
+On a cluster that enforces nothing the guarded fetch simply succeeds, which is
+conclusive on its own — so the common case still costs one Pod, not two.
+
 **RBAC the backend needs.** In its `:namespace`, and nothing wider:
 
     pods            create, get, list, delete
     pods/exec       create
+    pods/log        get                     # diagnostics on a failed provision
     networkpolicies create, get, delete     # only under network: :deny_all
 
 **One place this backend is stricter than Docker.** The sandbox container keeps

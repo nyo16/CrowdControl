@@ -12,6 +12,8 @@ defmodule CrowdControl.Backend.KubernetesTest do
   # someone adds later look like a spurious Pod death.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias CrowdControl.Backend
   alias CrowdControl.Backend.Kubernetes
   alias CrowdControl.Backend.Kubernetes.API
@@ -21,8 +23,37 @@ defmodule CrowdControl.Backend.KubernetesTest do
   @image "busybox:1.36"
   @container "cc"
 
+  # An image reference that cannot resolve, so no container ever starts. A pull
+  # failure is reported within seconds and never retried into Running, which
+  # makes it the cheapest deterministic "Pod that never runs".
+  @unpullable_image "nope/nope:doesnotexist"
+
   # A stand-in for the real CLI: echoes each stdin line back as a JSON line.
   @echo_cli ["-c", ~S|while IFS= read -r l; do printf '{"echo":"%s"}\n' "$l"; done|]
+
+  # Sweep leftovers from a previous run, once per module and before anything
+  # provisions.
+  #
+  # Two classes of object outlive a killed run and no owner-scoped selector can
+  # reach either. The enforcement probe creates `cc-netpol-probe-<hex>` and
+  # `cc-netpol-ctl-<hex>` Pods plus a NetworkPolicy of the same name; it removes
+  # them in an `after` block, which does not run when the process is *killed* --
+  # and ExUnit kills the test process on a timeout -- and it labels them
+  # `crowd_control.probe` with no owner hash, so destroy_all/1's selector can
+  # never match them. The managed deny-all policy leaks for a different reason:
+  # destroy/1's delete_managed_policy/1 is gated on the *caller's*
+  # config[:network], so a handle rebuilt without it deletes the Pod and leaves
+  # `<pod>-deny-all` behind.
+  #
+  # Deliberately not a per-test on_exit: the probe reads the phases of the Pods
+  # it just created, so a sweep running while a probe is in flight would delete
+  # them out from under it. Module setup is the one point at which no probe of
+  # this suite can be running, so a killed run self-heals on the next one rather
+  # than being cleaned mid-flight.
+  setup_all do
+    sweep_residue()
+    :ok
+  end
 
   setup do
     owner = "cc-test-#{:crypto.strong_rand_bytes(6) |> Base.encode16(case: :lower)}"
@@ -43,12 +74,70 @@ defmodule CrowdControl.Backend.KubernetesTest do
     ]
   end
 
+  # A label-selector delete that ignores phase, and deliberately NOT
+  # Kubernetes.list_live/1: list_live/1 filters `phase == "Running"`, so a Pod
+  # that failed mid-test is invisible to cleanup *forever*. That is not a
+  # hypothetical -- two Pods sat on this cluster for 33 days before an audit
+  # found them, one `Error` and one `ContainerStatusUnknown`, both left by tests
+  # that clean up through here. API.list_all/4 does not filter by phase; keep it
+  # that way.
   defp destroy_all(owner) do
-    case Kubernetes.list_live(owner: owner) do
-      {:ok, handles} -> Enum.each(handles, &Kubernetes.destroy/1)
-      _ -> :ok
+    selectors = [{"crowd_control.owner_hash", Kubernetes.owner_label(owner)}]
+
+    case API.list_all([], nil, label_selectors: selectors) do
+      {:ok, pods} -> Enum.each(pods, &destroy_by_name(object_name(&1)))
+      {:error, _} -> :ok
     end
   end
+
+  # Deleting the Pod directly rather than through Kubernetes.destroy/1 skips
+  # delete_managed_policy/1, so the paired policy is named explicitly. A Pod
+  # without one answers 404, which is the expected case and not worth reporting.
+  defp destroy_by_name(name) do
+    API.delete_pod([], name)
+    API.delete_network_policy([], name <> "-deny-all")
+  end
+
+  defp sweep_residue do
+    Enum.each(leftover_probe_pods(), &API.delete_pod([], &1))
+    Enum.each(leftover_policies(), &API.delete_network_policy([], &1))
+  rescue
+    # Fail open and quiet. Cleanup that raises turns an unrelated test failure
+    # into a confusing one, and leftover residue is a cost, not a wrong answer.
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  # By name prefix rather than by the `crowd_control.probe` label: the names are
+  # what the probe derives its policy name from, so a change to the labels
+  # cannot make this silently stop matching.
+  defp leftover_probe_pods do
+    case API.list_all([]) do
+      {:ok, pods} ->
+        pods |> Enum.map(&object_name/1) |> Enum.filter(&String.starts_with?(&1, "cc-netpol-"))
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  # API has no NetworkPolicy list -- nothing in lib/ needs one -- so the resource
+  # is named here. Every policy this project creates is `cc-`-prefixed: the
+  # probe's is the probe Pod's name, the managed one is `<pod>-deny-all`.
+  defp leftover_policies do
+    req = API.client([], api_version: "networking.k8s.io/v1", kind: "NetworkPolicy")
+
+    case API.normalize(Kubereq.list(req, API.namespace([]), params: [limit: 500])) do
+      {:ok, %{"items" => items}} ->
+        items |> Enum.map(&object_name/1) |> Enum.filter(&String.starts_with?(&1, "cc-"))
+
+      _ ->
+        []
+    end
+  end
+
+  defp object_name(object), do: get_in(object, ["metadata", "name"])
 
   # GenServer.cast/2 to a plain pid arrives as {:"$gen_cast", msg}; relay them
   # back to the test process so assert_receive can be used.
@@ -122,7 +211,11 @@ defmodule CrowdControl.Backend.KubernetesTest do
     test "requires an :image and surfaces an unreachable cluster as a normalized error" do
       assert {:error, {:k8s, :image_required}} = Kubernetes.provision(owner: "x")
 
-      assert {:error, {:k8s, _}} =
+      # Pinned to the exact reason, not `{:k8s, _}`. That looser match is
+      # satisfied by every reason in the vocabulary, so it stayed green for months
+      # while the reason it "checked" was a 2 KB dump of a %Req.Request{} carrying
+      # client-certificate material. A test that cannot fail is not coverage.
+      assert {:error, {:k8s, {:transport, :econnrefused}}} =
                Kubernetes.provision(
                  image: @image,
                  owner: "cc-test-unreachable",
@@ -204,6 +297,69 @@ defmodule CrowdControl.Backend.KubernetesTest do
 
       Kubernetes.destroy(handle)
     end
+
+    test "a second exec/4 is refused and leaves the tee file and credential file alone",
+         %{opts: opts} do
+      # `tee` opens the tee file `O_TRUNC`, so a second launch silently truncated
+      # it — after which every persisted byte offset pointed into a different
+      # file and the session replayed or skipped output with no error anywhere.
+      {:ok, handle} = Kubernetes.provision(opts)
+      {:ok, handle} = Kubernetes.exec(handle, "/bin/sh", @echo_cli, %{})
+      Process.sleep(500)
+
+      :ok = Kubernetes.write(handle, "accumulated\n")
+      Process.sleep(500)
+
+      # Guards the comparison below against a vacuous pass: with an empty tee
+      # file, a truncation is indistinguishable from doing nothing.
+      before = sh(handle, "cat #{handle.tee_path}")
+
+      assert before =~ "accumulated",
+             "nothing accumulated in the tee file, so a truncation would be invisible"
+
+      assert {:error, {:k8s, :already_started}} =
+               Kubernetes.exec(handle, "/bin/sh", @echo_cli, %{})
+
+      # The refusal is not the damage this prevents. This is: the bytes a
+      # persisted cursor refers to are still there, byte for byte.
+      assert sh(handle, "cat #{handle.tee_path}") == before
+
+      # And the guard runs *before* the credential write, not after. Only the
+      # launcher unlinks that file, so a refused exec that re-planted it would
+      # leave the provider key readable inside the sandbox for the rest of the
+      # session.
+      env = sh(handle, "ls #{handle.env_path} >/dev/null 2>&1 && echo PRESENT || echo GONE")
+      assert env =~ "GONE", "a refused exec re-planted the credential file"
+
+      Kubernetes.destroy(handle)
+    end
+
+    test "a write/2 that outruns its budget is indeterminate, not a plain timeout",
+         %{opts: opts} do
+      {:ok, handle} = Kubernetes.provision(opts)
+      {:ok, handle} = Kubernetes.exec(handle, "/bin/sh", @echo_cli, %{})
+      Process.sleep(500)
+
+      # 1 ms cannot cover a TLS handshake plus a websocket upgrade, so the
+      # timeout happens on every run rather than racing.
+      starved = %{handle | config: Keyword.put(handle.config, :exec_timeout, 1)}
+
+      # Deliberately not `{:k8s, :exec_timeout}`. `bounded/2` brutal-kills the
+      # exec task and the Mint socket dies with it, but the API server may
+      # already have run the `printf` — so the prompt may or may not be in the
+      # FIFO. Reported as a generic timeout, the obvious response is a retry,
+      # which delivers the prompt twice.
+      assert {:error, {:k8s, :write_indeterminate}} = Kubernetes.write(starved, "maybe\n")
+
+      # No assertion about whether "maybe" landed: that is precisely the unknown
+      # the reason names. What must still hold is that the budget is what failed
+      # and not the sandbox.
+      assert :ok = Kubernetes.write(handle, "certain\n")
+      Process.sleep(500)
+      assert sh(handle, "cat #{handle.tee_path}") =~ "certain"
+
+      Kubernetes.destroy(handle)
+    end
   end
 
   describe "start_reader/3 — live streaming" do
@@ -217,12 +373,122 @@ defmodule CrowdControl.Backend.KubernetesTest do
 
       :ok = Kubernetes.write(handle, "hello\n")
 
-      # The exec channel opens with a zero-byte stdout frame, which the reader
-      # drops: the FIRST cast a session sees must already carry output, or
-      # "the reader produced data" is untrue at the moment a caller waits on it.
+      # `refute first == ""` used to stand here, described as proof that the
+      # reader drops a zero-byte opening frame. Measured on v1.35.6+orb1 across
+      # stdin true/false and silent and immediate commands: this apiserver sends
+      # **no** such frame, so the refute could never fail. The clause it claimed
+      # to defend is cheap insurance, not a load-bearing filter, and no test
+      # should claim to depend on it.
+      #
+      # What is worth asserting is the actual contract: the first cast a session
+      # sees carries the round-tripped prompt, byte for byte.
       assert_receive {:cast, {:stdout_data, first}}, 15_000
-      refute first == "", "an empty opening frame reached the session"
-      assert first =~ "hello"
+
+      assert first == ~s({"echo":"hello"}\n),
+             "the first cast must be the CLI's answer, not a framing artefact"
+
+      Kubernetes.destroy(handle)
+    end
+
+    test "a killed CLI ends the session and the Pod, rather than hanging both forever",
+         %{opts: opts} do
+      # The defect this pins: PID 1 was `sleep infinity`, and the CLI is a
+      # grandchild after `setsid`, so nothing in the container noticed it die.
+      # The container stayed Running, `tail -f` never ended, no `:eof` was ever
+      # cast, and the session waited forever while the Pod billed forever. A
+      # crashed CLI is the single most likely failure in production.
+      {:ok, handle} = Kubernetes.provision(opts)
+      {:ok, handle} = Kubernetes.exec(handle, "/bin/sh", @echo_cli, %{})
+      Process.sleep(500)
+
+      {:ok, _reader} = Kubernetes.start_reader(handle, relay(), Backend.new_cursor())
+
+      :ok = Kubernetes.write(handle, "hello\n")
+      assert_receive {:cast, {:stdout_data, first}}, 15_000
+      assert first =~ "hello", "the session must be genuinely live before it is killed"
+      assert Kubernetes.alive?(handle)
+
+      # SIGKILL, not SIGTERM: the CLI gets no chance to tidy up, which is the
+      # worst case.
+      #
+      # Two things about this pattern, both learned the hard way. `[I]FS` keeps it
+      # from matching this very command's own argv. Excluding `cc.env` keeps it
+      # from matching the *launcher* shells, whose argv embeds the CLI's script
+      # text verbatim — killing those instead takes out the process that reports
+      # the status, which is a different failure (covered by the next test).
+      sh(
+        handle,
+        "kill -9 $(ps -o pid,args | grep '[I]FS= read' | grep -v cc.env | awk '{print $1}')"
+      )
+
+      # Every one of these was broken before, and each is a different half of it.
+      assert_receive {:cast, :eof}, 30_000
+
+      assert eventually(fn -> not Kubernetes.alive?(handle) end, 30_000),
+             "the Pod outlived its CLI and keeps billing"
+
+      # 137 = 128 + SIGKILL. The launcher captures the CLI's status and PID 1
+      # adopts it, so the Pod's exit code is the CLI's rather than a fiction.
+      assert {:ok, 137} = Kubernetes.await_exit(handle, 30_000)
+
+      Kubernetes.destroy(handle)
+    end
+
+    test "a launcher killed before it can report a status still ends the session",
+         %{opts: opts} do
+      # The status file is the launcher's job, so killing the launcher is the one
+      # way to guarantee it never arrives. PID 1 waiting on that file alone would
+      # hang exactly as it did before — the same bug, one level up. This is the
+      # OOM-killed-process-group case, and it was found by a test whose kill
+      # pattern matched too much.
+      {:ok, handle} = Kubernetes.provision(opts)
+      {:ok, handle} = Kubernetes.exec(handle, "/bin/sh", @echo_cli, %{})
+      Process.sleep(500)
+
+      {:ok, _reader} = Kubernetes.start_reader(handle, relay(), Backend.new_cursor())
+      :ok = Kubernetes.write(handle, "hello\n")
+      assert_receive {:cast, {:stdout_data, _}}, 15_000
+
+      # Everything the CLI's script text appears in, launcher shells included:
+      # the whole process group except PID 1, killed without warning.
+      sh(handle, "kill -9 $(ps -o pid,args | grep '[I]FS= read' | awk '{print $1}')")
+
+      assert_receive {:cast, :eof}, 30_000
+
+      assert eventually(fn -> not Kubernetes.alive?(handle) end, 30_000),
+             "PID 1 waited forever for a status no surviving process could write"
+
+      # 1, not 137: the CLI's real status died with the launcher, and inventing a
+      # specific code would be a lie. "Something went wrong" is the honest answer.
+      assert {:ok, 1} = Kubernetes.await_exit(handle, 30_000)
+
+      Kubernetes.destroy(handle)
+    end
+
+    test "a dead consumer takes its exec channel with it", %{opts: opts} do
+      # `API.open_exec/5` keeps the link inside its own owner process, so nothing
+      # else would notice a reader that died — the channel would sit open against
+      # the API server for as long as the owner lived. The owner monitors the
+      # consumer for exactly this reason, and only a real channel can prove it.
+      {:ok, handle} = Kubernetes.provision(opts)
+
+      consumer = spawn(fn -> Process.sleep(:infinity) end)
+
+      assert {:ok, channel} =
+               API.open_exec(
+                 handle.config,
+                 handle.pod_name,
+                 ["tail", "-f", "/dev/null"],
+                 consumer,
+                 container: @container
+               )
+
+      assert Process.alive?(channel)
+
+      Process.exit(consumer, :kill)
+
+      assert eventually(fn -> not Process.alive?(channel) end, 5_000),
+             "the exec channel outlived the process it was delivering to"
 
       Kubernetes.destroy(handle)
     end
@@ -334,7 +600,28 @@ defmodule CrowdControl.Backend.KubernetesTest do
 
       # Drop the reader's channel out from under it. Killing `tail` is what the
       # API server sees as the exec ending, which is exactly a transport blip.
-      sh(handle, "kill -9 $(pidof tail) 2>/dev/null; echo killed")
+      #
+      # The provocation is asserted rather than assumed. This used to be
+      # `kill -9 $(pidof tail) 2>/dev/null; echo killed` — which kills nothing at
+      # all when `pidof` matches nothing, while `echo` kept the exec's status at
+      # 0. The test then passed identically whether or not a channel was ever
+      # dropped, so it defended nothing on the run that mattered.
+      tail_pid = handle |> sh("pidof tail | awk '{print $1}'") |> String.trim()
+
+      assert tail_pid != "",
+             "no `tail` was running, so no channel was dropped and the reconnect below is untested"
+
+      sh(handle, "kill -9 #{tail_pid}")
+
+      assert eventually(
+               fn ->
+                 handle
+                 |> sh("kill -0 #{tail_pid} 2>/dev/null && echo alive || echo gone")
+                 |> String.trim() == "gone"
+               end,
+               5_000
+             ),
+             "the reader's `tail` survived the kill, so the channel never dropped"
 
       # Reconnect backoff starts at 100ms; appending immediately also proves the
       # resume reads from the file rather than from a live pipe.
@@ -362,6 +649,37 @@ defmodule CrowdControl.Backend.KubernetesTest do
                )
              end),
              "reattach still resolved a destroyed Pod"
+    end
+  end
+
+  describe "reader failure reasons" do
+    test "giving up names the container's own error, not just the transport", %{opts: opts} do
+      # Deliberately no write_tee/2. The init container creates /var/log/cc but
+      # not out.jsonl, so `tail -c +1 -f` exits 1 at once with
+      # "tail: can't open '<path>': No such file or directory" on channel 2 —
+      # and that line exists only because open_stream/1 asks for `stderr: true`.
+      # With `exec_params/2`'s default of false the kubelet never opens channel 2
+      # at all and the reader's `{:stderr, _}` clause is dead code, which is what
+      # this test would notice.
+      {:ok, handle} = Kubernetes.provision(opts)
+
+      log =
+        capture_log(fn ->
+          {:ok, _reader} = Kubernetes.start_reader(handle, relay(), Backend.new_cursor())
+
+          # Five failed opens with jittered 100/200/400/800/1600 ms backoff, so
+          # this settles in about three seconds.
+          assert_receive {:cast, :eof}, 30_000
+        end)
+
+      assert log =~ "giving up", "the reader ended the session without saying why"
+
+      assert log =~ "tail: can't open",
+             "the give-up reason carried no container diagnostics: #{log}"
+
+      assert log =~ handle.tee_path, "the give-up reason did not name the file it could not read"
+
+      Kubernetes.destroy(handle)
     end
   end
 
@@ -452,7 +770,12 @@ defmodule CrowdControl.Backend.KubernetesTest do
 
       # Guards the refute below against a silently empty stdout, which would
       # make it pass without ever having looked at a process list.
-      assert ps =~ "sleep infinity", "ps produced nothing to inspect"
+      #
+      # The sentinel is the CLI itself, not PID 1's command: PID 1 used to be
+      # `sleep infinity` and that string was the guard, which coupled a security
+      # assertion to an unrelated implementation detail. The CLI is what this
+      # test is about, and it is running by construction here.
+      assert ps =~ "ps -o args" or ps =~ "/bin/sh", "ps produced nothing to inspect"
       refute ps =~ "sk-should-not-show", "secret leaked into the sandbox's argv"
 
       Kubernetes.destroy(handle)
@@ -505,6 +828,40 @@ defmodule CrowdControl.Backend.KubernetesTest do
 
       Kubernetes.destroy(handle)
     end
+
+    test "an env-file write that cannot create the file is an error, not a launched CLI",
+         %{opts: opts} do
+      # This is the one exec whose failure used to be invisible: `await_close/1`
+      # returned :ok on the first close frame and discarded channel 3, so a write
+      # that could not create the file looked fine and the CLI started with no
+      # credentials — failing later, somewhere else, for a reason that named none
+      # of this.
+      {:ok, handle} = Kubernetes.provision(opts)
+
+      # Assert the provocation before relying on it. `write_env_file/2` bounds
+      # the read with `head -c <bytes>` rather than `cat` (which would need a
+      # stdin EOF, and closing the socket to deliver one races the channel-3
+      # status), so this mirrors the real command: a redirect into a directory
+      # that does not exist is a genuine non-zero exit, and 1 is the code
+      # busybox `sh` reports for it.
+      assert sh(handle, "head -c 5 > /no-such-dir/cc.env </dev/null; echo code=$?") =~ "code=1"
+
+      unwritable = %{handle | env_path: "/no-such-dir/cc.env"}
+
+      assert {:error, {:k8s, {:exit_status, 1}}} =
+               Kubernetes.exec(unwritable, "/bin/sh", @echo_cli, %{})
+
+      # Nothing was launched either. The launcher publishes its pid before it
+      # does anything else, so the absence of that file is proof the pipeline
+      # never ran — a failed credential write must not leave a CLI running
+      # without credentials.
+      launcher =
+        sh(handle, "ls /var/run/cc.launcher >/dev/null 2>&1 && echo PRESENT || echo GONE")
+
+      assert launcher =~ "GONE", "the CLI was launched despite having no credential file"
+
+      Kubernetes.destroy(handle)
+    end
   end
 
   describe "await_exit/2" do
@@ -537,17 +894,154 @@ defmodule CrowdControl.Backend.KubernetesTest do
     end
   end
 
+  describe "exec exit codes over v4.channel.k8s.io" do
+    test "a non-zero command is an error rather than a started session", %{opts: opts} do
+      {:ok, handle} = Kubernetes.provision(opts)
+
+      assert {:ok, "ok"} =
+               API.exec_once(handle.config, handle.pod_name, ["/bin/sh", "-c", "printf ok"],
+                 container: @container
+               )
+
+      # `{:exit_status, 7}` rather than `{:exec_failed, _}` is itself the
+      # assertion that `v4.channel.k8s.io` was negotiated: under v1 channel 3
+      # carries runtime-specific English -- "Error executing in Docker Container:
+      # 7" on this node, "command terminated with exit code 7" on containerd --
+      # and the code is not portably extractable from it. Channel 3 arrives
+      # regardless of the `stderr` parameter, so nothing extra is asked for here.
+      assert {:error, {:k8s, {:exit_status, 7}}} =
+               API.exec_once(
+                 handle.config,
+                 handle.pod_name,
+                 ["/bin/sh", "-c", "printf out; exit 7"],
+                 container: @container
+               )
+
+      # The same contract through the backend rather than through API. A FIFO
+      # path that does not exist makes the container's `printf` fail, and
+      # `collect_exec/1` used to drop channel 3 -- so write/2 read `{:ok, ""}` as
+      # a delivered prompt.
+      lost = %{handle | fifo_path: "/no-such-dir/cc.fifo"}
+      assert {:error, {:k8s, {:exit_status, 1}}} = Kubernetes.write(lost, "lost\n")
+
+      Kubernetes.destroy(handle)
+    end
+  end
+
+  describe "API.logs/3 — the diagnostic channel" do
+    test "reports silence, output, :previous and a container that never started apart",
+         %{owner: owner} do
+      # Case 1, both halves, on one container: "nothing to say" and "here are
+      # the bytes" must be distinguishable, because this is the channel a
+      # provisioning failure is diagnosed through. The container waits for a
+      # file, so the silent window is not a race.
+      #
+      # `log_params/1` pins `follow: false`, which is what makes either fetch
+      # return at all: kubereq's real default is `follow: true`, and in follow
+      # mode the first frame is a zero-byte `{:stdout, ""}` and the stream never
+      # ends -- the call would come back as `:exec_timeout` from bounded/2.
+      running =
+        owner
+        |> base_opts()
+        |> planted_handle(@image)
+        |> plant_pod(
+          &put_command(&1, [
+            "/bin/sh",
+            "-c",
+            "while [ ! -f /tmp/go ]; do sleep 0.2; done; echo hello-logs; sleep 300"
+          ])
+        )
+
+      assert eventually(fn -> pod_phase(running) == "Running" end, 60_000)
+
+      # An empty body, not an error. With `follow: false` the API server writes
+      # the body and drops the connection, which kubereq surfaces as an abnormal
+      # `%Mint.TransportError{reason: :closed}` exit -- so reading that as a
+      # failure made "the container said nothing" indistinguishable from "the
+      # fetch failed", in the one call whose entire job is diagnosis.
+      assert {:ok, ""} = API.logs(running.config, running.pod_name, container: @container)
+
+      sh(running, "touch /tmp/go")
+
+      assert eventually(
+               fn ->
+                 API.logs(running.config, running.pod_name, container: @container) ==
+                   {:ok, "hello-logs\n"}
+               end,
+               20_000
+             ),
+             "the container's output never came back byte-exact"
+
+      Kubernetes.destroy(running)
+
+      # Case 2: `:previous`. A *terminated* container's logs are still readable
+      # while the Pod exists -- that is the provisioning-failure case this
+      # channel exists for -- while under `restartPolicy: Never` there is no
+      # previous instance at all, and the API server refuses the upgrade with
+      # 400 rather than serving an empty body. Distinct from case 1's `{:ok, ""}`
+      # on purpose: "no such container" is not "the container said nothing".
+      # The pair is also what pins the parameter to the wire -- drop `:previous`
+      # and both calls return the same bytes.
+      dead =
+        owner
+        |> base_opts()
+        |> planted_handle(@image)
+        |> plant_pod(&put_command(&1, ["/bin/sh", "-c", "echo dying-words; exit 3"]))
+
+      assert eventually(fn -> pod_phase(dead) == "Failed" end, 60_000)
+      assert {:ok, "dying-words\n"} = API.logs(dead.config, dead.pod_name, container: @container)
+
+      assert {:error, {:k8s, {:upgrade_failed, 400}}} =
+               API.logs(dead.config, dead.pod_name, container: @container, previous: true)
+
+      Kubernetes.destroy(dead)
+
+      # Case 3: a container that never started. There is nothing to read and the
+      # API server says so with 400 rather than an empty body, so the Pod's own
+      # waiting message is the only source that explains anything. The init
+      # container shares the sandbox image, so the pull failure lands in
+      # `initContainerStatuses`.
+      bad = owner |> base_opts() |> planted_handle(@unpullable_image) |> plant_pod(& &1)
+
+      assert eventually(fn -> pull_failure(bad) end, 90_000),
+             "the image pull never failed, so the 400 below would prove nothing"
+
+      assert {:error, {:k8s, {:upgrade_failed, 400}}} =
+               API.logs(bad.config, bad.pod_name, container: @container)
+
+      Kubernetes.destroy(bad)
+
+      # ...and the fallback itself, through the only path that reaches it:
+      # provision/1 diagnoses before it rolls the Pod back, precisely because
+      # afterwards there is nothing left to ask.
+      log =
+        capture_log(fn ->
+          assert {:error, {:k8s, {:pod_not_ready, reason}}} =
+                   Kubernetes.provision(Keyword.put(base_opts(owner), :image, @unpullable_image))
+
+          assert reason in ["ErrImagePull", "ImagePullBackOff"]
+        end)
+
+      assert log =~ "container is waiting:",
+             "logs answered 400 and nothing fell back to the waiting message: #{log}"
+
+      assert log =~ "nope/nope", "the waiting message did not name the image that could not pull"
+    end
+  end
+
   # --- helpers ---
 
-  # A Pod built from the real manifest but whose sandbox container exits with
-  # `code`, so `await_exit/2` has a terminated containerStatus to read.
-  defp exiting_pod(opts, code) do
+  # The handle provision/1 would build for `opts`, without creating anything.
+  # The Pods below cannot come from provision/1: it fixes the sandbox
+  # container's command, and it rolls back any Pod that never reaches Running --
+  # which is exactly the Pod a log test needs to read.
+  defp planted_handle(opts, image) do
     {:ok, pod_name} = Kubernetes.pod_name(opts[:session_key])
 
-    handle = %Kubernetes{
+    %Kubernetes{
       pod_name: pod_name,
       namespace: API.namespace(opts),
-      image: @image,
+      image: image,
       tee_path: "/var/log/cc/out.jsonl",
       fifo_path: "/var/run/cc.fifo",
       env_path: "/var/run/cc.env",
@@ -555,16 +1049,55 @@ defmodule CrowdControl.Backend.KubernetesTest do
       owner: opts[:owner],
       config: opts
     }
+  end
 
-    manifest =
-      handle
-      |> Kubernetes.pod_manifest()
-      |> update_in(["spec", "containers"], fn [container] ->
-        [Map.put(container, "command", ["/bin/sh", "-c", "exit #{code}"])]
-      end)
-
-    {:ok, _} = API.create_pod(opts, manifest)
+  # Built from the real manifest, so the owner label destroy_all/1 selects on is
+  # the real one -- a planted Pod that dies mid-test is still reachable by
+  # cleanup.
+  defp plant_pod(handle, transform) do
+    {:ok, _pod} = API.create_pod(handle.config, transform.(Kubernetes.pod_manifest(handle)))
     handle
+  end
+
+  defp put_command(manifest, command) do
+    update_in(manifest, ["spec", "containers"], fn [container] ->
+      [Map.put(container, "command", command)]
+    end)
+  end
+
+  # A Pod whose sandbox container exits with `code`, so `await_exit/2` has a
+  # terminated containerStatus to read.
+  defp exiting_pod(opts, code) do
+    opts
+    |> planted_handle(@image)
+    |> plant_pod(&put_command(&1, ["/bin/sh", "-c", "exit #{code}"]))
+  end
+
+  defp pod_phase(handle) do
+    case API.get_pod(handle.config, handle.pod_name) do
+      {:ok, pod} -> get_in(pod, ["status", "phase"])
+      {:error, _reason} -> nil
+    end
+  end
+
+  # ErrImagePull first, then ImagePullBackOff once the kubelet starts backing
+  # off; either means no container will ever start. Both lists, init first, for
+  # the same reason the backend reads both: the init container shares the
+  # sandbox image, so an unpullable image fails there while `containerStatuses`
+  # is still absent.
+  defp pull_failure(handle) do
+    with {:ok, pod} <- API.get_pod(handle.config, handle.pod_name),
+         %{"reason" => reason, "message" => message} <- waiting_state(pod) do
+      reason in ["ErrImagePull", "ImagePullBackOff"] and message != ""
+    else
+      _ -> false
+    end
+  end
+
+  defp waiting_state(pod) do
+    ["initContainerStatuses", "containerStatuses"]
+    |> Enum.flat_map(&(pod |> get_in(["status", &1]) |> List.wrap()))
+    |> Enum.find_value(&get_in(&1, ["state", "waiting"]))
   end
 
   # Forwards stdout to the test and acks it back to the reader, so the

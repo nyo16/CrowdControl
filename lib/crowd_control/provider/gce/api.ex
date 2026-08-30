@@ -14,7 +14,7 @@ defmodule CrowdControl.Provider.Gce.API do
   ## Vocabulary
 
     * `{:gce, {:not_found, message}}` — HTTP 404, wherever it surfaced.
-      `CrowdControl.Provider.Gce.release/1` treats it as success, which is what
+      `Gce.release/1` treats it as success, which is what
       makes teardown idempotent.
     * `{:gce, {:http_status, status, message}}` — any other non-2xx.
     * `{:gce, {:transport, message}}` — the request never got an answer.
@@ -84,7 +84,7 @@ defmodule CrowdControl.Provider.Gce.API do
   @doc """
   Raise unless the optional `:gcp_compute` dependency is available.
 
-  Called from `CrowdControl.Provider.Gce.acquire/1` only, so that merely
+  Called from `Gce.acquire/1` only, so that merely
   loading this module — as `CrowdControl.Reaper` does when it walks configured
   backends — never raises.
   """
@@ -195,7 +195,7 @@ defmodule CrowdControl.Provider.Gce.API do
   Delete an instance and wait for the operation, treating 404 as success.
 
   Already-gone is the desired end state, which is what makes
-  `CrowdControl.Provider.Gce.release/1` idempotent across the several teardown
+  `Gce.release/1` idempotent across the several teardown
   paths that call it.
   """
   @spec delete_and_wait(config(), String.t(), keyword()) :: :ok | {:error, term()}

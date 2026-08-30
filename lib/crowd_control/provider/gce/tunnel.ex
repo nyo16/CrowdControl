@@ -31,7 +31,7 @@ defmodule CrowdControl.Provider.Gce.Tunnel do
       collapses everything into `"Key exchange failed"` or `"Unable to connect
       using the available authentication methods"`. The only way out is for the
       callback to report to the calling process, which is what
-      `CrowdControl.Provider.Gce.Tunnel.KeyCb` does.
+      `KeyCb` does.
 
   ## The keypair is derived, not random
 
