@@ -481,6 +481,44 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
     end
   end
 
+  describe "pod log fetches are bounded (blocker: a diagnostic that never returns)" do
+    test "follow is always false and cannot be overridden" do
+      # Kubereq's own docs: follow: true "keeps the connection alive which blocks
+      # the current process". A log fetch here runs on a teardown path, so
+      # following would turn a diagnostic into a hang. Not merged from opts.
+      assert API.log_params([])[:follow] == false
+      assert API.log_params(follow: true)[:follow] == false
+      assert API.log_params(tail_lines: 5)[:follow] == false
+    end
+
+    test "bounded by lines and by bytes, so a chatty container cannot flood a report" do
+      params = API.log_params([])
+
+      assert is_integer(params[:tailLines]) and params[:tailLines] > 0
+      assert is_integer(params[:limitBytes]) and params[:limitBytes] > 0
+    end
+
+    test "both bounds are overridable, since a caller may want more or less" do
+      params = API.log_params(tail_lines: 5, limit_bytes: 1_024)
+
+      assert params[:tailLines] == 5
+      assert params[:limitBytes] == 1_024
+    end
+
+    test "previous is off by default and requestable" do
+      # The previous container's logs are the ones that matter for a
+      # CrashLoopBackOff, where the current container has produced nothing
+      # precisely because the interesting run already ended.
+      refute API.log_params([])[:previous]
+      assert API.log_params(previous: true)[:previous]
+    end
+
+    test "the container is pinned only when named" do
+      refute Keyword.has_key?(API.log_params([]), :container)
+      assert API.log_params(container: "cc")[:container] == "cc"
+    end
+  end
+
   describe "reader resilience (blocker: transport error killed the session)" do
     test "an unreachable API server casts :eof instead of crashing the caller" do
       # Kubereq.PodExec.start_link/1 raises MatchError on a failed upgrade AND

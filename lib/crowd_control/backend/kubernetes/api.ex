@@ -410,15 +410,7 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   """
   @spec logs(config(), String.t(), keyword()) :: {:ok, binary()} | {:error, term()}
   def logs(config, pod_name, opts \\ []) do
-    params =
-      [
-        # Never overridable. See above.
-        follow: false,
-        tailLines: Keyword.get(opts, :tail_lines, @default_log_lines),
-        limitBytes: Keyword.get(opts, :limit_bytes, @default_log_bytes),
-        previous: Keyword.get(opts, :previous, false)
-      ]
-      |> maybe_container(opts[:container])
+    params = log_params(opts)
 
     bounded(config, fn ->
       # PodLogs links to its caller and raises MatchError on a rejected upgrade.
@@ -440,6 +432,24 @@ defmodule CrowdControl.Backend.Kubernetes.API do
         collect_logs(pid, [])
       end
     end)
+  end
+
+  @doc false
+  # Public so the bounds are assertable without a cluster. `Kubereq.PodLogs`
+  # cannot be reached through the `:req_adapter` seam — kubereq overwrites the
+  # adapter on the websocket path — so the params are the only part of this that
+  # is unit-testable, and they are the part that matters: `follow: false` is what
+  # stops a diagnostic from blocking forever.
+  @spec log_params(keyword()) :: keyword()
+  def log_params(opts) do
+    [
+      # Never overridable, and not merged from opts. See logs/3.
+      follow: false,
+      tailLines: Keyword.get(opts, :tail_lines, @default_log_lines),
+      limitBytes: Keyword.get(opts, :limit_bytes, @default_log_bytes),
+      previous: Keyword.get(opts, :previous, false)
+    ]
+    |> maybe_container(opts[:container])
   end
 
   # PodLogs sends `{:stdout, binary}` per frame, then usually
