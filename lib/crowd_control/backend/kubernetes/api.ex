@@ -204,8 +204,8 @@ defmodule CrowdControl.Backend.Kubernetes.API do
     # test seam too: a stubbed 5xx that silently retries makes the hermetic test
     # behave unlike the code it exists to exercise.
     [receive_timeout: timeout(config), retry: false]
-    |> maybe_put_adapter(config[:req_adapter])
     |> Req.new()
+    |> CrowdControl.ReqAdapter.put(config[:req_adapter])
     |> Kubereq.attach([kubeconfig: kubeconfig(config)] ++ resource)
   end
 
@@ -285,9 +285,6 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   end
 
   defp parse_exit_code(_code), do: nil
-
-  defp maybe_put_adapter(opts, nil), do: opts
-  defp maybe_put_adapter(opts, adapter), do: [{:adapter, adapter} | opts]
 
   @doc """
   The loaded kubeconfig for `config`.
@@ -724,11 +721,30 @@ defmodule CrowdControl.Backend.Kubernetes.API do
 
   defp do_exec_stdin(config, pod_name, command, payload, opts) do
     with {:ok, pid} <- open_exec(config, pod_name, command, self(), [stdin: true] ++ opts) do
+      # A *binary* frame, not `Kubereq.PodExec.send_stdin/2`, which builds
+      # `{:text, <<0, data>>}`. Channel 0 is a byte channel — the exec protocol
+      # prefixes a channel byte and forwards the rest verbatim — while RFC 6455
+      # requires a text frame's payload to be valid UTF-8 and permits a peer to
+      # fail the connection on anything else.
+      #
+      # Measured before assuming: sending `<<"prefix-", 0xFF, 0xFE, "-suffix">>`
+      # through both opcodes against v1.35.6+orb1 delivered all 16 bytes intact
+      # either way, with a `Success` on channel 3. So this apiserver does not
+      # enforce the UTF-8 rule and the defect is **latent, not live** — the
+      # exposure is an intermediary that does enforce it (a proxy, a load
+      # balancer, a stricter websocket stack), where the symptom would be an
+      # unexplained close on the credential write.
+      #
+      # There is deliberately no regression test: every server reachable from
+      # here accepts both opcodes, so a behavioural test would be one that cannot
+      # fail, and asserting on source text is not a test. The correct opcode costs
+      # nothing, so it is simply used.
+      #
       # Not matched on `:ok`: a command that has already exited — which is what a
       # failed redirect looks like — makes this write land on a socket the server
       # is tearing down, and that is a status to be read from channel 3, not a
       # crash.
-      _ = Kubereq.PodExec.send_stdin(pid, IO.iodata_to_binary(payload))
+      _ = send_stdin_binary(pid, IO.iodata_to_binary(payload))
 
       # No `PodExec.close/1` before this: see the moduledoc above. The command
       # ends itself, so the status arrives first and the close frame follows.
@@ -736,6 +752,20 @@ defmodule CrowdControl.Backend.Kubernetes.API do
       _ = close_exec(pid)
       status
     end
+  end
+
+  @doc false
+  # Exposed so the opcode is assertable against the fake API server: the wire is
+  # the only place the difference between a text and a binary frame is visible.
+  #
+  # `Kubereq.Connect.send_frame/2` rather than `PodExec.send_stdin/2` because the
+  # latter hard-codes `:text`. It is the same function `send_stdin/2` itself calls,
+  # so this is not reaching past the library into something private to it — but if
+  # a future kubereq removes it, this raises `UndefinedFunctionError` at the call
+  # site rather than silently reverting to a protocol violation.
+  @spec send_stdin_binary(pid(), binary()) :: :ok
+  def send_stdin_binary(pid, data) when is_binary(data) do
+    Kubereq.Connect.send_frame(pid, {:binary, <<0, data::binary>>})
   end
 
   # The one exec whose failure used to be invisible.

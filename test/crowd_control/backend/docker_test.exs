@@ -508,6 +508,40 @@ defmodule CrowdControl.Backend.DockerTest do
 
       Docker.destroy(handle)
     end
+
+    test "a second exec/4 is refused and leaves the tee file alone", %{opts: opts} do
+      # `tee` opens the tee file O_TRUNC, so a second exec/4 silently truncated it
+      # and every persisted byte offset then pointed into a different file — no
+      # error, just a session replaying or skipping output. The damage, not the
+      # return value, is what this asserts.
+      {:ok, handle} = Docker.provision(opts)
+      {:ok, handle} = Docker.exec(handle, "/bin/sh", @echo_cli, %{})
+      Process.sleep(500)
+
+      :ok = Docker.write(handle, "accumulated\n")
+
+      assert eventually(fn ->
+               run(handle, ["/bin/cat", handle.tee_path]) =~ "accumulated"
+             end),
+             "nothing accumulated, so a truncation could not be observed"
+
+      before = run(handle, ["/bin/cat", handle.tee_path])
+
+      assert {:error, {:docker, :already_started}} =
+               Docker.exec(handle, "/bin/sh", @echo_cli, %{})
+
+      assert run(handle, ["/bin/cat", handle.tee_path]) == before,
+             "the tee file changed, which is the corruption the refusal exists to prevent"
+
+      # And the refusal is not a local flag: it asks the container, so a handle
+      # rebuilt on another node refuses too.
+      {:ok, [rebuilt]} = Docker.list_live(opts)
+
+      assert {:error, {:docker, :already_started}} =
+               Docker.exec(rebuilt, "/bin/sh", @echo_cli, %{})
+
+      Docker.destroy(handle)
+    end
   end
 
   # --- helpers ---

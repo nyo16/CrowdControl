@@ -333,6 +333,33 @@
 
 ### Fixed
 
+- **`CrowdControl.Backend.Docker`'s exec/4 refuses a second call** with
+  `{:error, {:docker, :already_started}}`, matching `Backend.Kubernetes` and
+  `Backend.Sandboxd`. `tee` opens the tee file `O_TRUNC`, so a second launch
+  silently truncated it and every persisted byte offset then pointed into a
+  different file — no error, just a session replaying or skipping output.
+
+  The check asks the *container*, not the handle: a handle rebuilt by
+  `list_live/1` on another node knows nothing about a previous exec, and the
+  launcher and status files are the only durable record. It cannot ride along
+  inside the launch command the way the Kubernetes one does, because Docker's exec
+  is detached and its exit code is never observable — so it costs one extra round
+  trip, once per session. It fails *closed*: refusing wrongly is a clear error on
+  a retryable path, while allowing wrongly corrupts every cursor silently.
+- **The Kubernetes credential write uses a binary websocket frame.**
+  `Kubereq.PodExec.send_stdin/2` builds `{:text, <<0, data>>}`, but channel 0 is a
+  byte channel and RFC 6455 requires a text frame's payload to be valid UTF-8,
+  permitting a peer to fail the connection on anything else.
+
+  Measured rather than assumed: pushing `<<"prefix-", 0xFF, 0xFE, "-suffix">>`
+  through both opcodes against v1.35.6+orb1 delivered all 16 bytes intact either
+  way, so this apiserver does not enforce the rule and the defect was **latent,
+  not live**. The exposure is an intermediary that does enforce it, where the
+  symptom would be an unexplained close on the credential write. The correct
+  opcode costs nothing, so it is now used; there is deliberately no regression
+  test, because every server reachable from here accepts both and such a test
+  could not fail.
+
 - **A crashed CLI no longer hangs a Docker session forever, either.** The same
   defect as the Kubernetes one below, in the same shape, found by asking whether
   that one had a twin rather than by a report — and `Backend.Docker` is the

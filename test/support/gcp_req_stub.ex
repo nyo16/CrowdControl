@@ -31,6 +31,20 @@ defmodule CrowdControl.GcpReqStub do
   @base_path "/compute/v1"
   @base_url "http://gcp.invalid#{@base_path}"
 
+  # Per-test state rides in a request header, and this module *is* the adapter.
+  #
+  # `gcp_compute` merges `config.req_options` straight into the `Req` call, so a
+  # stub cannot register an option of its own on the way in — `Req.new/1`
+  # rejects an unregistered key — and `Req` 0.7 deprecated a *function*
+  # `:adapter`, which would warn from inside the dependency on every stubbed
+  # request. So the one thing the adapter needs, the pid of the agent holding
+  # this stub's router and recorded requests, travels as a header: the only
+  # per-request carrier the dependency neither sets nor overwrites (it sets
+  # `:auth`, and `Req.merge/2` *merges* headers rather than replacing them).
+  # The adapter runs in whatever process made the call, so nothing here may be
+  # resolved from `self()`.
+  @stub_header "x-cc-req-stub"
+
   @spec project() :: String.t()
   def project, do: @project
 
@@ -50,16 +64,12 @@ defmodule CrowdControl.GcpReqStub do
 
   `opts` override the config (`:project`, `:zone`, …). `:req_options` is merged
   into the stub's own rather than replacing it, so the adapter cannot be lost by
-  accident.
+  accident — but `:adapter` and `:headers` belong to the stub, and a caller that
+  sets either takes the stub out of the request.
   """
   @spec new(fun(), keyword()) :: {struct(), pid()}
   def new(router, opts \\ []) when is_function(router, 1) do
-    {:ok, recorder} = Agent.start_link(fn -> [] end)
-
-    adapter = fn request ->
-      Agent.update(recorder, &[request | &1])
-      respond(request, router)
-    end
+    {:ok, recorder} = Agent.start_link(fn -> %{router: router, requests: []} end)
 
     {extra_req_options, opts} = Keyword.pop(opts, :req_options, [])
 
@@ -74,7 +84,15 @@ defmodule CrowdControl.GcpReqStub do
             # default :safe_transient turns a stubbed 503 into 1s + 2s + 4s of
             # sleeping, and makes a hermetic test behave unlike the code it
             # exists to exercise.
-            req_options: Keyword.merge([retry: false, adapter: adapter], extra_req_options)
+            req_options:
+              Keyword.merge(
+                [
+                  retry: false,
+                  adapter: __MODULE__,
+                  headers: [{@stub_header, encode(recorder)}]
+                ],
+                extra_req_options
+              )
           ],
           opts
         )
@@ -83,9 +101,26 @@ defmodule CrowdControl.GcpReqStub do
     {config, recorder}
   end
 
+  @doc false
+  @spec run(struct()) :: {struct(), struct()}
+  def run(request) do
+    case Req.Request.get_header(request, @stub_header) do
+      [recorder] ->
+        router =
+          Agent.get_and_update(decode(recorder), fn state ->
+            {state.router, %{state | requests: [request | state.requests]}}
+          end)
+
+        respond(request, router)
+
+      [] ->
+        raise "GcpReqStub reached without its #{@stub_header} header: #{request.url}"
+    end
+  end
+
   @doc "Every recorded request, oldest first."
   @spec requests(pid()) :: [struct()]
-  def requests(recorder), do: Agent.get(recorder, &Enum.reverse(&1))
+  def requests(recorder), do: Agent.get(recorder, &Enum.reverse(&1.requests))
 
   @doc "Every recorded `{method, path}`, oldest first."
   @spec calls(pid()) :: [{atom(), String.t()}]
@@ -198,6 +233,11 @@ defmodule CrowdControl.GcpReqStub do
   end
 
   # --- private ---
+
+  # The recorder pid as a header value, and back. Both halves live here, so
+  # `list_to_pid/1` is only ever fed something this module wrote.
+  defp encode(pid), do: pid |> :erlang.pid_to_list() |> List.to_string()
+  defp decode(value), do: value |> String.to_charlist() |> :erlang.list_to_pid()
 
   # A router returns `{status, body}`, or an exception to signal a transport
   # failure -- which is how Req reports one: the exception replaces the

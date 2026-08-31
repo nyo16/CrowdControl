@@ -170,6 +170,7 @@ defmodule CrowdControl.Provider.Compose do
   alias CrowdControl.Provider
   alias CrowdControl.Provider.Docker
   alias CrowdControl.Provider.Endpoint
+  alias CrowdControl.ReqAdapter
   alias CrowdControl.Store
 
   @default_agent_port 8080
@@ -731,15 +732,8 @@ defmodule CrowdControl.Provider.Compose do
     %Endpoint{
       base_url: "http://127.0.0.1:#{host_port}",
       token: Provider.token(handle.session_key),
-      req_options: req_options(handle)
+      req_options: ReqAdapter.req_options(handle.config[:req_adapter])
     }
-  end
-
-  defp req_options(handle) do
-    case handle.config[:req_adapter] do
-      nil -> []
-      adapter -> [adapter: adapter]
-    end
   end
 
   defp ready_timeout(handle), do: handle.config[:ready_timeout] || @default_ready_timeout

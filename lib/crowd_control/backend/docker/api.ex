@@ -23,6 +23,8 @@ defmodule CrowdControl.Backend.Docker.API do
   # Req is genuinely missing.
   @compile {:no_warn_undefined, Req}
 
+  alias CrowdControl.ReqAdapter
+
   @default_host "unix:///var/run/docker.sock"
   @default_timeout 30_000
 
@@ -68,6 +70,7 @@ defmodule CrowdControl.Backend.Docker.API do
       base
       |> Keyword.merge(decode_body: true)
       |> Keyword.merge(opts)
+      |> ReqAdapter.new()
       |> Req.request()
       |> normalize()
     end
@@ -84,7 +87,7 @@ defmodule CrowdControl.Backend.Docker.API do
           {:ok, Req.Response.t()} | {:error, term()}
   def stream(config, method, path, opts \\ []) do
     with {:ok, base} <- base_options(config, method, path) do
-      result = base |> Keyword.merge(opts) |> Req.request()
+      result = base |> Keyword.merge(opts) |> ReqAdapter.new() |> Req.request()
 
       case result do
         {:ok, %{status: status} = resp} when status in 200..299 ->
@@ -102,7 +105,9 @@ defmodule CrowdControl.Backend.Docker.API do
   # `:req_adapter` is a test seam, threaded in exactly as
   # CrowdControl.Backend.Kubernetes.API does it: a hermetic test supplies a
   # function that answers Engine API calls, and needs no daemon, no container,
-  # and no socket. Nothing in production sets it.
+  # and no socket. Nothing in production sets it. It stays a function this far
+  # and becomes a module adapter in `ReqAdapter.new/1` above — see
+  # CrowdControl.ReqAdapter.
   defp base_options(config, method, path) do
     with {:ok, transport} <- transport(host(config)) do
       options =
@@ -113,10 +118,7 @@ defmodule CrowdControl.Backend.Docker.API do
           retry: false
         )
 
-      case config[:req_adapter] do
-        nil -> {:ok, options}
-        adapter -> {:ok, Keyword.put(options, :adapter, adapter)}
-      end
+      {:ok, Keyword.merge(options, ReqAdapter.req_options(config[:req_adapter]))}
     end
   end
 

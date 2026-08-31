@@ -195,6 +195,7 @@ defmodule CrowdControl.Provider.Gce do
   alias CrowdControl.Provider.Gce.API
   alias CrowdControl.Provider.Gce.Startup
   alias CrowdControl.Provider.Gce.Tunnel
+  alias CrowdControl.ReqAdapter
   alias CrowdControl.Store
 
   @session_label "crowd_control-session"
@@ -581,18 +582,11 @@ defmodule CrowdControl.Provider.Gce do
     %Endpoint{
       base_url: "http://127.0.0.1:#{local_port}",
       token: Provider.token(handle.session_key),
-      req_options: req_options(handle),
+      req_options: ReqAdapter.req_options(handle.config[:req_adapter]),
       # The tunnel's lifetime is the endpoint's, which is what makes it the
       # endpoint's business and never the persisted handle's.
       transport: handle.tunnel
     }
-  end
-
-  defp req_options(handle) do
-    case handle.config[:req_adapter] do
-      nil -> []
-      adapter -> [adapter: adapter]
-    end
   end
 
   defp tunnel_opts(handle, deadline) do

@@ -293,12 +293,25 @@ defmodule CrowdControl.Backend.Docker do
 
   # --- exec ---
 
+  # `tee` opens the tee file `O_TRUNC`, so a second `exec/4` silently truncates
+  # it — after which `tail -c +N` restarts from a new byte 0 and *every* persisted
+  # cursor points at the wrong place. No error, just a session replaying or
+  # skipping output. `Backend.Kubernetes` and `Backend.Sandboxd` both refuse, so
+  # refusing here makes all three agree.
+  #
+  # The check asks the *container*, not the handle: a handle rebuilt by
+  # `list_live/1` on another node knows nothing about a previous exec, and the
+  # launcher and status files are the only durable record. Unlike Kubernetes,
+  # this cannot ride along inside the launch command — the exec is detached, so
+  # its exit code is never observable — hence one extra round trip, once per
+  # session, on a path that has just made several.
   @impl true
   def exec(%__MODULE__{container_id: id} = handle, executable, args, env) when is_binary(id) do
     command = cli_command(handle, executable, args)
     env = apply_credentials(env, handle.config)
 
-    with {:ok, exec_id} <-
+    with :ok <- refuse_second_exec(handle),
+         {:ok, exec_id} <-
            create_exec(handle, ["/bin/sh", "-c", command], attach: false, env: env),
          :ok <- start_exec_detached(handle, exec_id) do
       {:ok, handle}
@@ -306,6 +319,43 @@ defmodule CrowdControl.Backend.Docker do
   end
 
   def exec(%__MODULE__{}, _executable, _args, _env), do: {:error, :not_provisioned}
+
+  # Fail *closed*: an unanswerable probe refuses the exec.
+  #
+  # The two failures are not symmetric. Refusing wrongly is a clear error on a
+  # path the caller can retry, and the daemon has just answered a create and a
+  # start, so a blip exactly here is unlikely. Allowing wrongly truncates the tee
+  # file and silently corrupts every persisted cursor, with no error at all. The
+  # recoverable failure wins.
+  defp refuse_second_exec(handle) do
+    script =
+      "if [ -e #{Shell.escape(launcher_pid_path(handle))} ] || " <>
+        "[ -e #{Shell.escape(status_path(handle))} ]; then echo cc-started; fi"
+
+    case run_attached(handle, ["/bin/sh", "-c", script]) do
+      {:ok, output} ->
+        if String.contains?(output, "cc-started"),
+          do: {:error, {:docker, :already_started}},
+          else: :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # An attached exec, run to completion, demuxed. The only place in this module
+  # that needs a command's *output* rather than its side effect.
+  defp run_attached(handle, cmd) do
+    with {:ok, exec_id} <- create_exec(handle, cmd, attach: true),
+         {:ok, raw} <-
+           API.request(handle.config, :post, "/exec/#{exec_id}/start",
+             json: %{"Detach" => false, "Tty" => false},
+             decode_body: false
+           ) do
+      {payloads, _demux} = Demux.feed(Demux.new(), raw)
+      {:ok, IO.iodata_to_binary(payloads)}
+    end
+  end
 
   # `exec 3<> fifo` holds a read-write fd open for the life of the pipeline, so
   # no writer detaching is ever observable as EOF by the CLI. Verified: the

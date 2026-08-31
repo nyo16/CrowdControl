@@ -36,7 +36,8 @@ defmodule CrowdControl.Backend.Sandboxd.API do
   Transport configuration, including `:adapter`, rides in
   `endpoint.req_options` and is merged into the `Req` call. A hermetic test
   builds an endpoint with `req_options: [adapter: fn req -> ... end]` and needs
-  no daemon, no container, and no socket.
+  no daemon, no container, and no socket. `CrowdControl.ReqAdapter` is what
+  makes a *function* legal there under `Req` 0.7, which deprecated it.
 
   Retries are off. `Req`'s default `retry: :safe_transient` turns one refused
   connection into 1s + 2s + 4s of backoff, and every caller here treats
@@ -51,6 +52,7 @@ defmodule CrowdControl.Backend.Sandboxd.API do
   @compile {:no_warn_undefined, [Req, Finch.TransportError, Mint.TransportError]}
 
   alias CrowdControl.Provider.Endpoint
+  alias CrowdControl.ReqAdapter
 
   @default_timeout 30_000
   @health_poll_interval 100
@@ -210,6 +212,7 @@ defmodule CrowdControl.Backend.Sandboxd.API do
         into: :self,
         timeout: @stream_idle_timeout
       )
+      |> ReqAdapter.new()
       |> Req.request()
 
     case result do
@@ -288,6 +291,7 @@ defmodule CrowdControl.Backend.Sandboxd.API do
   defp request(endpoint, method, path, opts) do
     endpoint
     |> req_options(method, path, opts)
+    |> ReqAdapter.new()
     |> Req.request()
     |> normalize()
   end
