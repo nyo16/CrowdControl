@@ -296,7 +296,6 @@
   Also verified in the same run: `scheduling.maxRunDuration` plus
   `instanceTerminationAction: DELETE` really does remove the instance. A VM with
   a 600s budget was deleted by GCE at +594s, with nothing local involved.
-
 - **Dependency floors raised: `req ~> 0.7`, `kubereq ~> 0.4.5`,
   `gcp_compute ~> 0.3`.** These three move together and cannot be separated:
   `gcp_compute` 0.3.0 requires `req ~> 0.7` (for the `:decoders` hook — 0.6 had
@@ -333,6 +332,21 @@
   (was `exec_stdin/4`), so the caller pins `:container`.
 
 ### Fixed
+
+- **A crashed CLI no longer hangs a Docker session forever, either.** The same
+  defect as the Kubernetes one below, in the same shape, found by asking whether
+  that one had a twin rather than by a report — and `Backend.Docker` is the
+  default remote backend, so this was the more exposed of the two. Its PID 1 was
+  `sleep infinity` and the CLI is started by a *detached* exec, so PID 1 never
+  spawned it and could not reap it. Measured on a live daemon before the fix: kill
+  the CLI and `alive?/1` still answered `true`, `await_exit/2` answered `:timeout`
+  forever, no `:eof` ever reached the session, and the container billed on.
+
+  PID 1 now waits for a status the launch pipeline writes after `tee` drains and
+  exits with the CLI's own code — `await_exit/2` reports `137` for a SIGKILLed CLI
+  instead of never returning — and a launcher killed before it can report is
+  detected through its pid file rather than waited on forever. Both paths have
+  live tests.
 
 - **`CrowdControl.Provider.Gce.API.list_all/3` actually paginates.** It passed
   `:maxResults` and `:pageToken`; the library's option is `:max_results` and

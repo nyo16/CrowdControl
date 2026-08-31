@@ -435,6 +435,79 @@ defmodule CrowdControl.Backend.DockerTest do
 
       assert eventually(fn -> Docker.await_exit(handle, 1_000) == {:ok, nil} end)
     end
+
+    test "a killed CLI ends the session and the container, not just the CLI", %{opts: opts} do
+      # This backend had the same hole as Backend.Kubernetes, and it was found by
+      # asking whether that one had a twin rather than by a report. PID 1 was
+      # `sleep infinity` and the CLI is started by a *detached* exec, so PID 1
+      # never spawned it and could not reap it. Measured before the fix: kill the
+      # CLI and `alive?/1` still answered true, `await_exit/2` answered `:timeout`
+      # forever, no `:eof` reached the session, and the container billed on.
+      {:ok, handle} = Docker.provision(opts)
+      {:ok, handle} = Docker.exec(handle, "/bin/sh", @echo_cli, %{})
+      Process.sleep(500)
+
+      {:ok, _reader} = Docker.start_reader(handle, relay(), Backend.new_cursor())
+      :ok = Docker.write(handle, "hello\n")
+
+      assert_receive {:cast, {:stdout_data, first}}, 15_000
+      assert first =~ "hello", "the session must be genuinely live before it is killed"
+      assert Docker.alive?(handle)
+
+      # Only the CLI. `[I]FS` keeps the pattern off this very command, and
+      # excluding `cc.launcher` keeps it off the launcher shells — whose argv
+      # embeds the CLI's script text verbatim. Killing those is a different
+      # failure, covered by the next test.
+      run(handle, [
+        "/bin/sh",
+        "-c",
+        "kill -9 $(ps -o pid,args | grep '[I]FS= read' | grep -v cc.launcher | awk '{print $1}')"
+      ])
+
+      assert_receive {:cast, :eof}, 30_000
+
+      assert eventually(fn -> not Docker.alive?(handle) end, 30_000),
+             "the container outlived its CLI and keeps billing"
+
+      # 137 = 128 + SIGKILL. The launcher captures the CLI's own status after
+      # `tee` drains and PID 1 adopts it, so the container's exit code is the
+      # CLI's rather than a fiction.
+      assert {:ok, 137} = Docker.await_exit(handle, 30_000)
+
+      Docker.destroy(handle)
+    end
+
+    test "a launcher killed before it can report still ends the session", %{opts: opts} do
+      # The status file is the launcher's job, so killing the launcher guarantees
+      # it never arrives. PID 1 waiting on that file alone would hang exactly as
+      # before — the same bug one level up. This is the OOM-killed-process-group
+      # case.
+      {:ok, handle} = Docker.provision(opts)
+      {:ok, handle} = Docker.exec(handle, "/bin/sh", @echo_cli, %{})
+      Process.sleep(500)
+
+      {:ok, _reader} = Docker.start_reader(handle, relay(), Backend.new_cursor())
+      :ok = Docker.write(handle, "hello\n")
+      assert_receive {:cast, {:stdout_data, _}}, 15_000
+
+      # Everything the CLI's script text appears in, launcher shells included.
+      run(handle, [
+        "/bin/sh",
+        "-c",
+        "kill -9 $(ps -o pid,args | grep '[I]FS= read' | awk '{print $1}')"
+      ])
+
+      assert_receive {:cast, :eof}, 30_000
+
+      assert eventually(fn -> not Docker.alive?(handle) end, 30_000),
+             "PID 1 waited forever for a status no surviving process could write"
+
+      # 1, not 137: the CLI's real status died with the launcher, and inventing a
+      # specific code would be a lie.
+      assert {:ok, 1} = Docker.await_exit(handle, 30_000)
+
+      Docker.destroy(handle)
+    end
   end
 
   # --- helpers ---

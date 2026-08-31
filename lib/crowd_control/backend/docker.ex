@@ -14,10 +14,14 @@ defmodule CrowdControl.Backend.Docker do
   directions through the filesystem:
 
       provision  POST /containers/create
-                 entrypoint: mkfifo <fifo> && mkdir -p <teedir> && sleep infinity
+                 entrypoint: mkfifo <fifo> && mkdir -p <teedir>
+                             && wait for <status>, then exit with it
 
       exec       POST /containers/{id}/exec  (started detached)
-                 sh -c 'exec 3<> <fifo>; <cli> ... <&3 | tee <teefile>'
+                 sh -c 'echo $$ > <launcher>; exec 3<> <fifo>;
+                        { <cli> ... <&3; echo $? > <status>.partial; }
+                          | tee <teefile>;
+                        mv -f <status>.partial <status>'
 
       write      POST /containers/{id}/exec  (started detached)
                  sh -c 'printf %s <escaped> >> <fifo>'
@@ -31,7 +35,7 @@ defmodule CrowdControl.Backend.Docker do
   `Content-Type: application/vnd.docker.raw-stream`, which `Req` streams
   happily. No `101 Upgrade`, no raw socket handling, no `Mint.WebSocket`.
 
-  Two details are load-bearing and were both established empirically:
+  Three details are load-bearing and were all established empirically:
 
     * **The FIFO is held open read-write** (`exec 3<> <fifo>`). A plain
       `< <fifo>` redirect sees EOF the moment the first writer detaches, which
@@ -39,6 +43,17 @@ defmodule CrowdControl.Backend.Docker do
       every session would be lost.
     * **`tail -c +N` is 1-indexed**, hence `byte_offset + 1`. Off by one here
       duplicates a byte per resume, which corrupts the JSON line stream.
+    * **PID 1 relays the CLI's exit status**, and is not the CLI itself. The CLI
+      is started later by a *detached* exec, so PID 1 never spawned it and cannot
+      reap it; while PID 1 was `sleep infinity` a killed CLI left the container
+      `Running`, `alive?/1` answering `true`, `await_exit/2` answering `:timeout`
+      forever, and `tail -f` never ending — so no `:eof` reached the session and
+      the container billed on. The launcher writes the CLI's own status *after*
+      `tee` drains, never before, or PID 1 could exit while bytes were still
+      buffered and truncate the tail of the session. A launcher killed before it
+      can report is detected through its pid file, because that hang is the same
+      bug one level up. Identical in shape to `CrowdControl.Backend.Kubernetes`,
+      and found by asking whether that defect had a twin.
 
   ## Live and resume are the same code path
 
@@ -212,12 +227,37 @@ defmodule CrowdControl.Backend.Docker do
     end
   end
 
+  # PID 1 creates the FIFO, then waits for the CLI's status and exits with it.
+  #
+  # It was `sleep infinity`, which made a dead CLI invisible: the CLI is started
+  # later by a *detached* exec, so PID 1 never spawned it and cannot reap it.
+  # Measured on a live daemon — kill the CLI and `alive?/1` answered `true`,
+  # `await_exit/2` answered `:timeout` forever, `tail -f` never ended so no `:eof`
+  # reached the session, and the container billed on. Identical in shape to the
+  # `Backend.Kubernetes` defect, found by asking whether that one had a twin.
+  #
+  # PID 1 cannot *be* the CLI: the tee file has to outlive any individual exec,
+  # and `exec/4` runs after the container is already up.
+  #
+  # The second condition is what keeps this from being the same bug one level up:
+  # the status file is the launcher's job, so anything that kills the launcher
+  # before it reports — an OOM kill of the process group — would leave PID 1
+  # waiting on a file nobody will ever write. `/proc/<pid>` rather than `kill -0`
+  # needs no signal permission and no opinion about the image's builtins.
   defp entrypoint_script(handle) do
     tee_dir = Path.dirname(handle.tee_path)
+    status = Shell.escape(status_path(handle))
+    launcher = Shell.escape(launcher_pid_path(handle))
 
     "mkfifo -m 600 #{Shell.escape(handle.fifo_path)} && " <>
       "mkdir -p #{Shell.escape(tee_dir)} && " <>
-      "sleep infinity"
+      "while [ ! -e #{status} ]; do " <>
+      "if [ -e #{launcher} ] && [ ! -d \"/proc/$(cat #{launcher} 2>/dev/null)\" ]; then " <>
+      "echo 1 > #{status}; break; fi; " <>
+      "sleep 1; done; " <>
+      "code=$(cat #{status} 2>/dev/null); " <>
+      "case \"$code\" in ''|*[!0-9]*) code=1;; esac; " <>
+      "exit \"$code\""
   end
 
   # Hardening lives in Backend.Docker.HostConfig, shared verbatim with
@@ -277,12 +317,37 @@ defmodule CrowdControl.Backend.Docker do
   # (see create_exec/3), which is the remote equivalent of Backend.Local's
   # env-file indirection. docker_test.exs greps the container's `ps` output to
   # keep this honest.
+  #
+  # The status relay is the same shape as `Backend.Kubernetes`, and for the same
+  # reason: this exec is detached, so the container's PID 1 is the only thing that
+  # can notice the CLI die, and it cannot see a process it did not spawn. Measured
+  # before the fix: kill the CLI and `alive?/1` still answered `true`,
+  # `await_exit/2` answered `:timeout` forever, no `:eof` ever reached the
+  # session, and the container billed on.
+  #
+  #   * `echo $$ > launcher` first, so PID 1 can tell "not started yet" from
+  #     "gone without reporting" — an OOM kill of the process group leaves no
+  #     status behind, and waiting on a file nobody will write is the same hang.
+  #   * `{ CLI; echo $? > staging; }` captures the CLI's own status. `$?` after a
+  #     bare pipeline is `tee`'s, which is 0 even when the CLI died.
+  #   * the `mv` runs only after the pipeline drains, so PID 1 cannot exit while
+  #     `tee` still holds buffered bytes and truncate the tail of the session.
   defp cli_command(handle, executable, args) do
     argv = Enum.map_join([executable | args], " ", &Shell.escape/1)
+    status = Shell.escape(status_path(handle))
+    staging = Shell.escape(status_path(handle) <> ".partial")
+    launcher = Shell.escape(launcher_pid_path(handle))
 
-    "exec 3<> #{Shell.escape(handle.fifo_path)}; " <>
-      "#{argv} <&3 | tee #{Shell.escape(handle.tee_path)}"
+    "echo $$ > #{launcher}; " <>
+      "exec 3<> #{Shell.escape(handle.fifo_path)}; " <>
+      "{ #{argv} <&3; echo $? > #{staging}; } | tee #{Shell.escape(handle.tee_path)}; " <>
+      "mv -f #{staging} #{status}"
   end
+
+  # Beside the FIFO, so both live in a directory the entrypoint already created
+  # and that is writable under `:readonly_rootfs`'s tmpfs mounts.
+  defp status_path(handle), do: Path.join(Path.dirname(handle.fifo_path), "cc.status")
+  defp launcher_pid_path(handle), do: Path.join(Path.dirname(handle.fifo_path), "cc.launcher")
 
   @doc """
   Rewrite the CLI's credential env for egress-proxy mode.
