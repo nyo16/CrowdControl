@@ -231,12 +231,18 @@ defmodule CrowdControl.Provider.Gce.API do
   end
 
   defp paginate(config, filter, opts, token, page, acc) do
+    # Snake_case, and `gcp_compute` 0.3.0 now rejects anything it does not know
+    # rather than passing it through to the wire. That is the better contract: the
+    # camelCase spellings this used to send (`:maxResults`, `:pageToken`) were
+    # silently forwarded as unrecognised query params, so the page size and the
+    # page token had no effect at all — every call fetched the API server's
+    # default first page, and pagination was a loop that could never advance.
     query =
       opts
       |> Keyword.take([:zone])
-      |> Keyword.put(:maxResults, @page_size)
+      |> Keyword.put(:max_results, @page_size)
       |> put_unless_nil(:filter, filter)
-      |> put_unless_nil(:pageToken, token)
+      |> put_unless_nil(:page_token, token)
 
     case GcpCompute.Instances.list_page(config, query) do
       {:ok, %{items: items, next_page_token: next}} when is_binary(next) and next != "" ->

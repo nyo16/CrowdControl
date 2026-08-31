@@ -591,12 +591,19 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
              "the log named neither the transport failure nor the upgrade status"
     end
 
-    test "a non-trapping caller of open_exec/5 gets an error and stays alive" do
+    test "a non-trapping caller survives the channel dying under it" do
       # The hazard `guard` cannot reach. `Kubereq.PodExec.start_link/1` links to
-      # whoever starts it, so on a failed upgrade the child's abnormal exit
-      # arrives as a *link signal*: a caller that does not trap is killed before
-      # any rescue runs, and `catch :exit` never sees it. Every in-tree caller
-      # happened to trap, so nothing noticed — this is the test that would have.
+      # whoever starts it and its connection process stops with the transport
+      # error as its reason, so the failure arrives as a *link signal*: a caller
+      # that does not trap is killed outright, before any rescue runs, and
+      # `catch :exit` never sees it. Every in-tree caller happened to trap, so
+      # nothing noticed.
+      #
+      # Since kubereq 0.4.5 the upgrade is attempted after `start_link/1`
+      # returns, so the failure is asynchronous — which makes the link hazard
+      # *worse*, not better: the caller is holding an `{:ok, pid}` it believes in
+      # when the signal arrives. The owner process in `open_exec/5` is what keeps
+      # that signal off the caller either way, and this is the test for it.
       config = [kubeconfig: kubeconfig("https://127.0.0.1:1")]
       parent = self()
 
@@ -606,8 +613,13 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
           result = API.open_exec(config, "cc-nope", ["/bin/sh"], self(), container: "cc")
           send(parent, {:result, result})
 
-          # Answering after the failure is the proof of survival: a killed caller
-          # cannot reply, and a merely-slow one fails the refute_receive below.
+          # Forward whatever the channel reports, then stay alive and answerable.
+          receive do
+            {:exec_down, _pid, reason} -> send(parent, {:down, reason})
+          after
+            5_000 -> send(parent, {:down, :nothing_arrived})
+          end
+
           receive do
             {:ping, from} -> send(from, :pong)
           end
@@ -615,19 +627,16 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
 
       mon = Process.monitor(caller)
 
-      assert_receive {:result, {:error, reason}}, 5_000
+      # The channel opens optimistically now; the rejection comes later.
+      assert_receive {:result, {:ok, channel}}, 5_000
+      assert is_pid(channel)
 
-      # And the reason is the normalized one, not 2 KB of Req.Request.
-      dumped = inspect(reason)
-      refute dumped =~ "cert"
-      refute dumped =~ "Req.Request"
+      # And it is normalized on the way through, not a raw Mint struct.
+      assert_receive {:down, {:k8s, {:transport, :econnrefused}}}, 10_000
 
-      # No DOWN from the link signal: this is the assertion that used to fail.
+      # The whole point: that death did not travel to the caller.
       refute_receive {:DOWN, ^mon, :process, ^caller, _}, 100
 
-      # And it is responsive rather than merely un-exited. A killed process
-      # cannot answer, so the reply is the survival proof; the caller returns
-      # normally straight afterwards, which is why the refute comes first.
       send(caller, {:ping, self()})
       assert_receive :pong, 1_000
     end

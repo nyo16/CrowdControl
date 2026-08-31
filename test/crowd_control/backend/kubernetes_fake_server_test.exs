@@ -23,35 +23,46 @@ defmodule CrowdControl.Backend.KubernetesFakeServerTest do
   @failure ~s({"metadata":{},"status":"Failure","message":"command terminated with non-zero exit code: Error executing in Docker Container: 7","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"7"}]}})
   @success ~s({"metadata":{},"status":"Success"})
 
-  describe "a failed upgrade is normalized by open_exec itself (blocker: a normalizer nothing calls)" do
-    # No `capture_log/1` in this block, deliberately: measured, `open_exec/5`
-    # logs nothing at all on a rejected upgrade. The 2 KB line the normalization
-    # exists to prevent was emitted by the *reader*, one layer up, so capturing
-    # here would silence nothing and assert nothing.
+  describe "a failed upgrade is normalized (blocker: a raw struct in the failure reason)" do
+    # The upgrade is no longer attempted before `open_exec/5` returns.
+    #
+    # kubereq 0.4.5 changed the model: its Req adapter answers a synthetic `101`
+    # and casts the real request to the connection process, so `start_link/1`
+    # returns `{:ok, pid}` while the handshake is still in flight and a rejected
+    # upgrade cannot surface as a return value at all. Measured: `open_exec/5`
+    # returns `{:ok, pid}`, the consumer is told `:connected` — which is now
+    # evidence of nothing — and only then does the connection process die
+    # carrying `%Mint.WebSocket.UpgradeFailureError{}`.
+    #
+    # So these tests assert the *asynchronous* contract, which is the only one
+    # the dependency now offers. It reaches the consumer as
+    # `{:exec_down, pid, reason}` because `open_exec/5` owns the link — the same
+    # mechanism that stops a channel death from killing a non-trapping caller.
     #
     # 404: the Pod, container or subresource was not there. 400: a container
     # name the Pod does not have. 403: a subprotocol the apiserver refuses.
     # All three measured live; 400 must not collapse into the 404 bucket.
     for status <- [404, 400, 403] do
-      test "HTTP #{status} becomes {:upgrade_failed, #{status}} and carries no TLS material" do
+      test "HTTP #{status} arrives as {:upgrade_failed, #{status}} and carries no TLS material" do
         status = unquote(status)
 
         server =
           start_supervised!({K8sFakeServer, scripts: [[status: status]], user: :client_cert})
 
-        result = API.open_exec(K8sFakeServer.config(server), "cc-x", ["true"], self())
+        assert {:ok, channel} =
+                 API.open_exec(K8sFakeServer.config(server), "cc-x", ["true"], self())
 
-        # Equality, not a pattern: `{:error, {:k8s, _}}` is satisfied by every
-        # reason in the vocabulary, including the 2 KB MatchError blob this
-        # normalization exists to stop.
-        assert result == {:error, {:k8s, {:upgrade_failed, status}}}
+        # Equality, not a pattern: `{:k8s, _}` is satisfied by every reason in
+        # the vocabulary, including the raw struct this normalization exists to
+        # replace.
+        assert_receive {:exec_down, ^channel, reason}, 5_000
+        assert reason == {:k8s, {:upgrade_failed, status}}
 
         # `user: :client_cert` means the kubeconfig really does carry a client
-        # certificate, so the DER is in the `%Req.Request{}` that the raw
-        # upgrade error nests — inspecting that term wholesale is what put
-        # `cert: <<48, 130, ...>>` into a log line.
-        refute inspect(result) =~ "cert"
-        refute inspect(result) =~ "Req.Request"
+        # certificate, so the DER is reachable from the raw error term — passing
+        # that through is what put `cert: <<48, 130, ...>>` into a log line.
+        refute inspect(reason) =~ "cert"
+        refute inspect(reason) =~ "Req.Request"
       end
     end
 
@@ -61,15 +72,17 @@ defmodule CrowdControl.Backend.KubernetesFakeServerTest do
       server =
         start_supervised!({K8sFakeServer, scripts: [[status: 404]], user: %{"token" => token}})
 
-      result = API.open_exec(K8sFakeServer.config(server), "cc-x", ["true"], self())
+      assert {:ok, channel} =
+               API.open_exec(K8sFakeServer.config(server), "cc-x", ["true"], self())
 
-      assert result == {:error, {:k8s, {:upgrade_failed, 404}}}
+      assert_receive {:exec_down, ^channel, reason}, 5_000
+      assert reason == {:k8s, {:upgrade_failed, 404}}
 
       # Req's Inspect impl redacts the `authorization` header and the `:auth`
       # option, but passes every other option through untouched — so
       # `req.options.kubeconfig.current_user["token"]` prints in full. That is
       # the in-cluster ServiceAccount posture, i.e. production.
-      refute inspect(result) =~ "SECRET"
+      refute inspect(reason) =~ "SECRET"
 
       # And the refutation is about normalization, not about a kubeconfig that
       # never carried a token in the first place.
@@ -101,12 +114,18 @@ defmodule CrowdControl.Backend.KubernetesFakeServerTest do
                  container: "sandbox"
                )
 
-      assert_receive :connected
-      assert_receive {:stdout, "out-1"}
-      assert_receive {:stderr, "err-1"}
-      assert_receive {:error, @success}
-      assert_receive {:close, 1000, ""}
-      assert_receive {:exec_down, ^exec, :normal}
+      # Explicit timeouts, not the 100 ms default. The listener holds scripted
+      # frames back by a settling window (so they cannot be swallowed as body
+      # parts of the 101 — see the module doc), and that window plus TLS setup
+      # under a loaded async suite exceeds 100 ms often enough to flake. The
+      # property under test is that the frames arrive in order, not that they
+      # arrive within a tenth of a second.
+      assert_receive :connected, 2_000
+      assert_receive {:stdout, "out-1"}, 2_000
+      assert_receive {:stderr, "err-1"}, 2_000
+      assert_receive {:error, @success}, 2_000
+      assert_receive {:close, 1000, ""}, 2_000
+      assert_receive {:exec_down, ^exec, :normal}, 2_000
 
       # The exec parameters are query params, so the request head is where
       # `stderr: true` becomes observable. Without it the kubelet makes channel
@@ -159,15 +178,19 @@ defmodule CrowdControl.Backend.KubernetesFakeServerTest do
   describe "a mid-stream drop (blocker: a channel death that kills its caller)" do
     test "an abrupt close arrives as {:exec_down, pid, transport error}" do
       server =
-        start_supervised!(
-          {K8sFakeServer,
-           scripts: [
-             [
-               frames: [{:stdout, "before-drop"}, {:sleep, 50}],
-               finish: :abort
-             ]
-           ]}
-        )
+        start_supervised!({K8sFakeServer,
+         scripts: [
+           [
+             # 300 ms, not 50. `finish: :abort` is an abortive close, and an RST
+             # discards whatever is still sitting unread in the peer's receive
+             # buffer — so a frame written just before it can vanish, and did
+             # once the client's read timing changed under kubereq 0.4.5. The
+             # gap has to be wide enough that "the frame was delivered" is not
+             # a race. It is loopback: 300 ms is enormous.
+             frames: [{:stdout, "before-drop"}, {:sleep, 300}],
+             finish: :abort
+           ]
+         ]})
 
       # `Connect.format_status/1` calls a `format_status/1` that `PodExec` does
       # not define, so every abnormal channel exit logs a crash report. Captured
@@ -178,16 +201,24 @@ defmodule CrowdControl.Backend.KubernetesFakeServerTest do
           assert {:ok, exec} =
                    API.open_exec(K8sFakeServer.config(server), "cc-x", ["tail"], self())
 
-          assert_receive :connected
-          assert_receive {:stdout, "before-drop"}
-          assert_receive {:exec_down, ^exec, reason}, 2_000
+          # Note this is no longer evidence of an established channel: since
+          # kubereq 0.4.5 it is sent before the upgrade is attempted.
+          assert_receive :connected, 2_000
+
+          assert_receive {:stdout, "before-drop"}, 2_000
+          assert_receive {:exec_down, ^exec, reason}, 3_000
           reason
         end)
 
-      assert reason == %Mint.TransportError{reason: :closed}
+      # Normalized by `open_exec/5`'s owner, not the raw Mint struct: one
+      # vocabulary regardless of which kubereq reported it, and regardless of
+      # whether it arrived synchronously or asynchronously.
+      assert reason == {:k8s, {:transport, :closed}}
 
       # The crash report names the transport failure and nothing else: no
       # request struct, and therefore no client certificate and no kubeconfig.
+      # `CrowdControl.LogRedactor` is what holds that second line true — kubereq
+      # 0.4.5 puts the whole cast, request included, in its last-message report.
       assert log =~ "Mint.TransportError"
       refute log =~ "Req.Request"
 
@@ -206,10 +237,10 @@ defmodule CrowdControl.Backend.KubernetesFakeServerTest do
       assert {:ok, exec} =
                API.open_exec(K8sFakeServer.config(server), "cc-x", ["tail"], self())
 
-      assert_receive :connected
-      assert_receive {:stdout, "line"}
-      assert_receive {:close, 1000, ""}
-      assert_receive {:exec_down, ^exec, :normal}
+      assert_receive :connected, 2_000
+      assert_receive {:stdout, "line"}, 2_000
+      assert_receive {:close, 1000, ""}, 2_000
+      assert_receive {:exec_down, ^exec, :normal}, 2_000
       refute_received {:EXIT, _pid, _reason}
     end
   end

@@ -148,21 +148,30 @@ defmodule CrowdControl.MixProject do
       # Optional: only CrowdControl.Backend.Docker needs it, and the library's
       # one-runtime-dep footprint is worth protecting. Unconditional in :test so
       # CI always exercises the Docker backend's pure paths.
+      #
+      # `~> 0.5` is `>= 0.5.0 and < 1.0.0`, so it already admits the 0.7 that
+      # kubereq and gcp_compute now require. Docker works across all of them, and
+      # narrowing it would break Docker-only users for no reason.
       {:req, "~> 0.5", optional: true},
       # Optional for the same reason as :req, and behind the same trade: only
-      # CrowdControl.Backend.Kubernetes needs it. kubereq requires `req ~> 0.6.0`,
-      # and mix.lock already pins req 0.6.3, mint 1.9.3 and yaml_elixir 2.12.2, so
-      # the only genuinely new transitive deps are :mint_web_socket and :pluggable.
-      # The :req constraint below stays at "~> 0.5" on purpose — Docker works on
-      # 0.5 and bumping it would break Docker-only users for no reason; kubereq's
-      # own constraint does the lifting for anyone who opts in.
-      {:kubereq, "~> 0.4.4", optional: true},
-      # Optional, and only CrowdControl.Provider.Gce needs it. Verified against
-      # the current mix.lock: this adds **zero** new transitive runtime deps —
-      # req, jason, nimble_options and telemetry are all already pinned, and
-      # goth is optional inside gcp_compute too. It is also the reason the
-      # Elixir lower bound moved to ~> 1.19.
-      {:gcp_compute, "~> 0.2", optional: true},
+      # CrowdControl.Backend.Kubernetes needs it. 0.4.5 is a floor, not a
+      # preference: 0.4.4 pins `req ~> 0.6.0`, which cannot coexist with
+      # gcp_compute's `req ~> 0.7`.
+      #
+      # 0.4.5 also changed the exec/log model — its Req adapter answers a
+      # synthetic 101 and casts the real request to the connection process, so a
+      # rejected upgrade is reported *asynchronously* and its crash report
+      # carries the whole %Req.Request{}. Both consequences are handled:
+      # CrowdControl.Backend.Kubernetes.API normalizes the async failure, and
+      # CrowdControl.LogRedactor keeps the kubeconfig out of the log.
+      {:kubereq, "~> 0.4.5", optional: true},
+      # Optional, and only CrowdControl.Provider.Gce needs it. 0.3.0 is a floor:
+      # 0.2.0 could not complete a single launch against real GCP (every bodyless
+      # POST was rejected 411 for want of a Content-Length), and it is the release
+      # that requires `req ~> 0.7` for the `:decoders` hook. goth stays optional
+      # inside it, so this still adds no runtime dep the tree lacks. It is also
+      # the reason the Elixir lower bound moved to ~> 1.19.
+      {:gcp_compute, "~> 0.3", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:stream_data, "~> 1.1", only: :test},
       {:excoveralls, "~> 0.18", only: :test},

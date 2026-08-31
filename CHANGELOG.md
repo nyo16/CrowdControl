@@ -257,6 +257,32 @@
 
 ### Changed
 
+- **Dependency floors raised: `req ~> 0.7`, `kubereq ~> 0.4.5`,
+  `gcp_compute ~> 0.3`.** These three move together and cannot be separated:
+  `gcp_compute` 0.3.0 requires `req ~> 0.7` (for the `:decoders` hook — 0.6 had
+  only the now-deprecated `:decode_json`), and `kubereq` 0.4.4 pins
+  `req ~> 0.6.0`, so taking one forces the others. The `:req` constraint here is
+  unchanged at `~> 0.5`, which already admits 0.7. Resolving the tree also pulled
+  mint 1.9.0 → 1.9.3 and hpax 1.0.3 → 1.0.4, clearing five security advisories.
+
+  `gcp_compute` 0.2.0 could not complete a single launch against real GCP: every
+  bodyless `POST` was rejected `411 Length Required`, which is
+  `zoneOperations.wait`, which is how both `insert_and_wait/3` and
+  `delete_and_wait/3` finish. 0.3.0 fixes it. **The GCE provider now passes its
+  integration suite against real infrastructure** — three tests that had never
+  executed before.
+- **A rejected Kubernetes exec/log upgrade is now reported asynchronously.**
+  `kubereq` 0.4.5 changed the model: its Req adapter answers a synthetic `101`
+  and casts the real request to a connection process, so `open_exec/5` returns
+  `{:ok, pid}` while the handshake is still in flight and a 404/400/403 cannot
+  surface as a return value. It arrives instead as
+  `{:exec_down, pid, {:k8s, {:upgrade_failed, status}}}` — normalized into the
+  same vocabulary as before, so a consumer does not have to know which kubereq
+  reported it, or whether it was synchronous. The reader already treated a
+  channel death as a stream drop, so resume behaviour is unchanged.
+
+  One consequence worth knowing: `:connected` is now delivered *before* the
+  upgrade is attempted, so it is no longer evidence that a channel exists.
 - **A Kubernetes `write/2` that times out now returns
   `{:error, {:k8s, :write_indeterminate}}`** rather than `{:k8s, :exec_timeout}`.
   The exec task is killed brutally and the Mint socket dies with it, but the API
@@ -268,6 +294,14 @@
 
 ### Fixed
 
+- **`CrowdControl.Provider.Gce.API.list_all/3` actually paginates.** It passed
+  `:maxResults` and `:pageToken`; the library's option is `:max_results` and
+  `:page_token`. 0.2.0 forwarded unrecognised options to the wire untouched, so
+  both were ignored: every call fetched the API server's default first page and
+  the page token never advanced. A project with more sandboxes than one page
+  would have reported the rest as gone — and `CrowdControl.Reaper` deletes the
+  store record of a sandbox it cannot see. 0.3.0 rejects unknown options, which
+  is how this surfaced.
 - **A crashed CLI no longer hangs a Kubernetes session forever.** The sandbox
   container's PID 1 was `sleep infinity`, and `setsid` makes the CLI a
   grandchild of it, so nothing in the container noticed the CLI die: the Pod
@@ -364,6 +398,28 @@
 
 ### Security
 
+- **No kubeconfig in a crash report.** `kubereq` 0.4.5 casts the whole
+  `%Req.Request{}` to its connection process, so when a websocket upgrade is
+  rejected — a routine event: a Pod reaped mid-session answers 404 — OTP's crash
+  report printed that request as the process's last message. Measured: with a
+  certificate kubeconfig that is `cert: <<48, 130, …>>` in a ~2 KB `:error` line;
+  with a **token** kubeconfig, which is the in-cluster ServiceAccount posture,
+  `Req` redacts the `authorization` header but prints
+  `options.kubeconfig.current_user["token"]` in full.
+
+  `CrowdControl.LogRedactor` is a `:logger` primary filter, installed at
+  application start, that replaces the request term, the process state and the
+  client info with `:redacted_by_crowd_control`. It fires only for reports that
+  actually carry a `%Req.Request{}` or a Kubereq.Connect state, so no other
+  library's crash reports are touched, and it never drops an event — the reason,
+  the process name and the stacktrace survive, because an invisible crash is a
+  worse bargain than a redacted one. Opt out with
+  `config :crowd_control, redact_logs: false`. Verified on a live cluster.
+- **A pod-log failure no longer carries the response headers into its error
+  term.** `PodLogs` fails asynchronously under kubereq 0.4.5 too, so an inspected
+  `%Mint.WebSocket.UpgradeFailureError{}` — status *and* every response header —
+  became the error reason. It is now the same `{:upgrade_failed, status}` the exec
+  path reports.
 - **The Kubernetes `:deny_all` enforcement probe no longer reports a boundary
   that is not there.** It fetched `http://1.1.1.1`, which made a security
   decision depend on internet reachability: one dropped packet inside the 5 s

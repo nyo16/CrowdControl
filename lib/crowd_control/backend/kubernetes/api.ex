@@ -517,8 +517,15 @@ defmodule CrowdControl.Backend.Kubernetes.API do
       {:EXIT, ^pid, %{__struct__: Mint.TransportError, reason: :closed}} ->
         {:ok, finish_logs(acc)}
 
+      # Same vocabulary as the exec path. `PodLogs` fails asynchronously too
+      # since kubereq 0.4.5, so what lands here is a bare
+      # `%Mint.WebSocket.UpgradeFailureError{}` — inspecting it put the status
+      # *and the response headers* into the error term, when the status alone is
+      # the part a caller can act on. A `previous: true` fetch against a
+      # container that never started answers 400, and that is a real answer:
+      # "there is no previous run", not "the fetch broke".
       {:EXIT, ^pid, reason} ->
-        {:error, {:k8s, {:logs_closed, summarize(inspect(reason))}}}
+        {:error, exit_reason(reason)}
 
       _other ->
         collect_logs(pid, acc)
@@ -847,7 +854,7 @@ defmodule CrowdControl.Backend.Kubernetes.API do
 
     receive do
       {:EXIT, ^exec, reason} ->
-        send(into, {:exec_down, exec, reason})
+        send(into, {:exec_down, exec, exit_reason(reason)})
 
       {:DOWN, ^mon, :process, ^into, _reason} ->
         # Nobody left to deliver frames to. Closing is what keeps a dead reader
@@ -855,6 +862,25 @@ defmodule CrowdControl.Backend.Kubernetes.API do
         close_exec(exec)
     end
   end
+
+  # Since kubereq 0.4.5 the upgrade is attempted *after* `start_link/1` returns:
+  # its adapter answers a synthetic `101` and casts the real request to the
+  # connection process, so a rejected upgrade can no longer surface as a return
+  # value. It arrives here instead, as that process's exit reason — a bare
+  # `%Mint.WebSocket.UpgradeFailureError{}` or a transport struct.
+  #
+  # Translating it here rather than at the consumer keeps one error vocabulary:
+  # `{:upgrade_failed, 404}` means the same thing whether it was learned
+  # synchronously from an older kubereq or asynchronously from this one, and no
+  # consumer has to know which.
+  defp exit_reason(:normal), do: :normal
+  defp exit_reason(:shutdown), do: :normal
+
+  # `cause_reason/1` already names every struct this can be — including an
+  # unrecognised one, which it reports by module rather than by inspecting it.
+  defp exit_reason(reason) when is_struct(reason), do: {:k8s, cause_reason(reason)}
+
+  defp exit_reason(reason), do: {:k8s, {:exec_closed, bounded_inspect(reason)}}
 
   @doc false
   # Public so the parameter table is assertable without an API server. It cannot

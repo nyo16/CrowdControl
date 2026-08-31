@@ -229,6 +229,39 @@ Docker's own default capability set does, but it would hold the capability for
 the life of the session in exchange for one syscall. A short-lived init
 container holds it for milliseconds and exits instead.
 
+**A dependency puts the kubeconfig in a crash report, and we redact it.**
+`kubereq` 0.4.5 establishes an exec/log websocket by having its Req adapter
+answer a synthetic `101` and **cast** the real request to a connection process.
+When the upgrade is then rejected — a Pod reaped mid-session answers 404, a wrong
+container name 400, an unsupported subprotocol 403 — that process stops
+abnormally, and OTP's crash report includes its last message: the cast, carrying
+the whole `%Req.Request{}`.
+
+That struct holds the kubeconfig. Measured against a live cluster:
+
+- with a **certificate** kubeconfig, `:connect_options` carries
+  `cert: <<48, 130, …>>` — client-certificate DER, in a ~2 KB `:error` line;
+- with a **token** kubeconfig — the in-cluster ServiceAccount posture, i.e.
+  production — `Req`'s `Inspect` implementation redacts the `authorization`
+  header, but `options.kubeconfig.current_user["token"]` prints **in full**.
+
+A failed upgrade is an ordinary event, so this is a credential reaching the log
+on a normal day. `CrowdControl.LogRedactor` is a `:logger` primary filter,
+installed at application start, that replaces the request term, the process state
+and the client info with `:redacted_by_crowd_control` — and *only* for reports
+that actually carry a `%Req.Request{}` or a Kubereq.Connect state, so other
+libraries' crash reports pass through untouched. It never drops an event: the
+reason, the process name and the stacktrace survive, because suppressing a crash
+report would trade a credential leak for an invisible failure.
+
+Verified on a live cluster: the report now reads
+`Last message: :redacted_by_crowd_control`.
+
+Opt out with `config :crowd_control, redact_logs: false` if you install your own
+filter. The return path is separately bounded — see
+`CrowdControl.Backend.Kubernetes.API`'s exception_reason/1, which keeps the same
+material out of the error *term*.
+
 ## Sandbox agent transport
 
 `CrowdControl.Backend.Sandboxd` drives a CLI over HTTP to `sandboxd`, an OTP
