@@ -165,6 +165,28 @@ defmodule CrowdControl.Provider.GceUnitTest do
       assert script =~ "libncurses6"
     end
 
+    test "the artifact fetch follows redirects, and the metadata fetch does not" do
+      # Found by pointing the integration suite at this project's *own* published
+      # release. A GitHub release asset answers 302 and redirects to
+      # objects.githubusercontent.com, so `curl -fsS` without -L treated the
+      # redirect as a failure: the bootstrap died and `acquire/1` reported a health
+      # timeout on a VM that was already billing. The documented URL could never
+      # have worked.
+      #
+      # Safe here specifically because the checksum above is mandatory: a redirect
+      # to somewhere else produces a mismatch and the agent is never installed.
+      script = render()
+      # The command spans a shell line-continuation, so the match has to cross it.
+      assert script =~ ~r/curl -fsSL[\s\S]{0,200}'#{Regex.escape(@url)}'/,
+             "the release fetch must follow redirects; a GitHub release asset is a 302"
+
+      # The opposite requirement, one line down: the metadata server never
+      # redirects, and following a redirect from it would turn a link-local
+      # credential fetch into a request at somewhere else's choosing.
+      assert script =~ "curl -fsS -H 'Metadata-Flavor: Google'"
+      refute script =~ "curl -fsSL -H 'Metadata-Flavor: Google'"
+    end
+
     test "rejects a URL that could break out of its shell quoting" do
       assert {:error, {:gce, {:bad_sandboxd_url, _}}} =
                Startup.render(

@@ -204,10 +204,21 @@ defmodule CrowdControl.Provider.Gce.Startup do
     #
     # Verified, not trusted: a mismatch exits non-zero here, before anything is
     # extracted, and `set -e` means the agent is never installed at all.
+    #
+    # `-L` is load-bearing, not defensive. A GitHub release asset — which is what
+    # this project's own `sandboxd-v*` channel publishes, and what the docs tell
+    # you to pass — answers `302` and redirects to `objects.githubusercontent.com`.
+    # Without it `curl -fsS` treats the redirect as a failure, the bootstrap dies,
+    # and `acquire/1` reports a health timeout on a VM that is already billing.
+    # Measured: the documented URL fails without this flag and succeeds with it.
+    #
+    # Following a redirect to another host is safe *here* specifically because the
+    # checksum below is mandatory and never skipped: a redirect to an attacker's
+    # host produces a mismatch and the agent is never installed.
     archive_dir="$(mktemp -d)"
     archive="$archive_dir/sandboxd.tar.gz"
 
-    curl -fsS --retry 5 --retry-connrefused --retry-delay 2 --max-time 600 \\
+    curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 --max-time 600 \\
       -o "$archive" '#{url}'
 
     if ! printf '%s  %s\\n' '#{sha256}' "$archive" | sha256sum -c - >/dev/null; then

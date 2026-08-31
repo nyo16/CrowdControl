@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.1.1 — 2026-08-31
+
+Two defects in 0.1.0, both found by smoke-testing the *published* release rather
+than the repo — neither was reachable from inside this checkout. Tag `v0.1.1` to
+ship them; if you tag something else, change this heading, because CI rewrites
+the version in `mix.exs` from the tag but not this file.
+
+### Fixed
+
+- **The GCE startup script now follows redirects when fetching the agent
+  tarball.** `curl -fsS` without `-L` treats a redirect as a failure, and a
+  GitHub release asset — which is exactly what this project's own `sandboxd-v*`
+  channel publishes, and what the README and `examples/gce_spot_vm.exs` tell you
+  to pass as `:sandboxd_url` — answers `302` and redirects to
+  `objects.githubusercontent.com`. So the documented URL could never have worked:
+  the bootstrap died, and `acquire/1` surfaced it as a health timeout on a VM that
+  was already billing.
+
+  Measured both ways against real GCP: the integration suite fails 1/3 with the
+  published URL before the fix and passes 3/3 after it. Following a redirect to
+  another host is safe here specifically because `:sandboxd_sha256` is mandatory
+  and never skipped — a redirect anywhere else produces a mismatch and the agent
+  is never installed. The metadata-server fetch deliberately does **not** follow
+  redirects, and a test now pins both halves.
+- **No compile warning for projects that do not use the Kubernetes backend.**
+  Kubereq.Connect was missing from `CrowdControl.Backend.Kubernetes.API`'s
+  `@compile {:no_warn_undefined, …}` list, so every consumer without the optional
+  `:kubereq` dependency — most of them — saw
+  `Kubereq.Connect.send_frame/2 is undefined` while compiling. Invisible in this
+  repo, where kubereq is always present; caught by installing 0.1.0 into a fresh
+  project.
+
 ## 0.1.0 — 2026-08-31
 
 First published release. The version matches `@version` in `mix.exs`; if you tag

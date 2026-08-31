@@ -40,13 +40,19 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   # CrowdControl.Backend.Kubernetes.provision/1 raises a clear message at
   # runtime if kubereq is genuinely missing.
   @compile {:no_warn_undefined,
-            [
-              Kubereq,
-              Kubereq.Kubeconfig,
-              Kubereq.Kubeconfig.Default,
-              Kubereq.PodExec,
-              Kubereq.PodLogs
-            ]}
+   [
+     Kubereq,
+     # `Kubereq.Connect` is here for `send_stdin_binary/2`. Its absence was
+     # invisible in this repo, where kubereq is always present, and only
+     # showed up when 0.1.0 was installed into a project that does not use
+     # the Kubernetes backend — which is most of them. Every module this
+     # file names must be listed, not just the ones with a public API.
+     Kubereq.Connect,
+     Kubereq.Kubeconfig,
+     Kubereq.Kubeconfig.Default,
+     Kubereq.PodExec,
+     Kubereq.PodLogs
+   ]}
 
   @default_timeout 30_000
   @default_exec_timeout 15_000
