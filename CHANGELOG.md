@@ -5,9 +5,7 @@
 ## 0.1.1 — 2026-08-31
 
 Two defects in 0.1.0, both found by smoke-testing the *published* release rather
-than the repo — neither was reachable from inside this checkout. Tag `v0.1.1` to
-ship them; if you tag something else, change this heading, because CI rewrites
-the version in `mix.exs` from the tag but not this file.
+than the repo — neither was reachable from inside this checkout.
 
 ### Fixed
 

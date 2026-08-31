@@ -59,7 +59,7 @@ graph LR
 ```elixir
 def deps do
   [
-    {:crowd_control, "~> 0.1.0"}
+    {:crowd_control, "~> 0.1.1"}
   ]
 end
 ```
