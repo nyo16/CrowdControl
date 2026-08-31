@@ -52,6 +52,14 @@
 
 ### Added
 
+- **GCE provisioning telemetry.** `CrowdControl.Provider.Gce`'s acquire/1 is minutes
+  long and was opaque; it now emits `[:crowd_control, :gce, :phase]` with
+  `%{duration_ms: n}` and `%{phase: :insert | :running | :ssh | :health, result:
+  :ok | :error, instance_name: _, zone: _}`. Failures are emitted too, because
+  "it timed out" is not actionable while "`:ssh` timed out" names the firewall
+  rule. This is also how `:ready_timeout` stops being guesswork: the moduledoc
+  tells callers to tune it for their own image, and now they can measure it.
+
 - **omp support.** [omp](https://omp.sh/) can now drive a session, alongside
   Claude Code and Open Code. Select it with `agent: :omp` (or just
   `executable: "omp"`, which infers the adapter):
@@ -256,6 +264,25 @@
   remains out of scope.
 
 ### Changed
+
+- **`CrowdControl.Provider.Gce`'s `:ready_timeout` default is `180_000`, was
+  `300_000` — and it is now measured rather than reasoned.** On a spot `e2-small`
+  in `us-central1-a` with no bootstrap script and the release tarball in a
+  same-region bucket: 8.9s for the insert operation to reach DONE, 0.0s more to
+  RUNNING-with-an-address, 23.8s for sshd to accept and forward, 7.3s for the
+  agent to answer `GET /v1/health`. That is **31.1s** inside the window
+  `:ready_timeout` actually bounds, and **39.9s** end to end.
+
+  The new default is ~6x the measured requirement, sized for a bootstrap script
+  that installs a CLI rather than for the bare case. Lowering it also tightens
+  `:max_run_duration`, whose floor is derived from it — so the orphan backstop is
+  no longer inflated by an over-cautious readiness window. The moduledoc, README
+  and `examples/gce_spot_vm.exs` carry the measurement instead of a caveat saying
+  it was never taken.
+
+  Also verified in the same run: `scheduling.maxRunDuration` plus
+  `instanceTerminationAction: DELETE` really does remove the instance. A VM with
+  a 600s budget was deleted by GCE at +594s, with nothing local involved.
 
 - **Dependency floors raised: `req ~> 0.7`, `kubereq ~> 0.4.5`,
   `gcp_compute ~> 0.3`.** These three move together and cannot be separated:

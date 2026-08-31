@@ -198,9 +198,11 @@ defmodule CrowdControl.Provider.GceTest do
       sandboxd_url: env!("CC_GCE_SANDBOXD_URL"),
       sandboxd_sha256: env!("CC_GCE_SANDBOXD_SHA256"),
       machine_type: System.get_env("CC_GCE_MACHINE_TYPE", "e2-small"),
-      # Longer than the unmeasured default, because a cold apt-get on a
-      # freshly-booted spot VM is the slowest thing in this file.
-      ready_timeout: 480_000
+      # Measured: 31s is the real requirement for this exact shape (no bootstrap
+      # script, tarball in a same-region bucket), and 39.9s end to end. Kept well
+      # above that rather than at the default, because a spot VM can be scheduled
+      # onto a busy host and this suite failing for that reason would be noise.
+      ready_timeout: 240_000
     ]
     |> put_env_opt(:subnetwork, "CC_GCE_SUBNETWORK")
     |> put_tags()

@@ -61,16 +61,47 @@ defmodule CrowdControl.Provider.Gce do
   `:max_run_duration` therefore has no "off": a caller who wants a long-lived
   sandbox passes a large number.
 
-  ## `:ready_timeout` is an estimate, not a measurement
+  ## `:ready_timeout`, measured
 
-  It defaults to `300_000` ms and **that number is unmeasured**. The spike
-  that was to measure the boot → guest-SSH-ready → agent-healthy latencies
-  needed billable GCP credentials and could not be run, so the default is
-  reasoned from what the startup script does: Debian boot, `apt-get install`,
-  the caller's `:bootstrap_script` (a `node` plus CLI install is easily two
-  minutes), the release download, and `sandboxd` start. Treat it as a starting
-  point: raise it for a heavy bootstrap, and lower it considerably for a
-  prebuilt image. No behaviour in this module depends on the specific value.
+  Measured on a real spot `e2-small` in `us-central1-a`, no `:bootstrap_script`,
+  release tarball in a same-region bucket:
+
+  | phase | telemetry `:phase` | time |
+  |---|---|---|
+  | insert accepted, operation DONE | `:insert` | 8.9s |
+  | RUNNING with an address | `:running` | 0.0s |
+  | sshd accepts, authenticates, forwards | `:ssh` | 23.8s |
+  | agent answers `GET /v1/health` | `:health` | 7.3s |
+  | **`acquire/1` end to end** | | **39.9s** |
+
+  `:ready_timeout` bounds the last three — it starts once the insert operation is
+  DONE — so the measured requirement is **31.1s**. The default is `180_000`, about
+  six times that, because the number this has to survive is not the one above: it
+  is the same boot with a `:bootstrap_script` that installs a CLI. `:running`
+  costing nothing is worth noticing — by the time the operation reports DONE the
+  guest is already RUNNING with an address, so nearly all of the wait is the guest
+  finishing its own boot, `apt-get`, and the release download.
+
+  Raise it for a heavy bootstrap; lower it for a prebuilt image, where 60s is
+  ample. Attach to `[:crowd_control, :gce, :phase]` and measure your own image
+  rather than guessing — that is what the events are for. No behaviour in this
+  module depends on the specific value, but `:max_run_duration`'s floor is derived
+  from it, so an inflated `:ready_timeout` inflates the orphan backstop too.
+
+  ## Telemetry
+
+  `acquire/1` emits one event per phase, on success and on failure:
+
+      [:crowd_control, :gce, :phase]
+      measurements: %{duration_ms: non_neg_integer()}
+      metadata:     %{phase: :insert | :running | :ssh | :health,
+                      result: :ok | :error,
+                      instance_name: String.t(),
+                      zone: String.t()}
+
+  A failing phase is emitted with `result: :error`, which is the one a caller
+  most needs: "it timed out" is not actionable, "`:ssh` timed out after 180s"
+  names the firewall rule.
 
   ## What is persisted, and what reattach needs
 
@@ -138,7 +169,8 @@ defmodule CrowdControl.Provider.Gce do
 
   Timing and transport:
 
-    * `:ready_timeout` — boot → healthy agent, default `300_000`
+    * `:ready_timeout` — operation DONE → healthy agent, default `180_000`;
+      measured requirement is 31s for a sandbox with no bootstrap script
     * `:insert_timeout`, `:delete_timeout` — operation polls, default `300_000`
     * `:agent_port` — default `8080`, `:capture_path` — default
       `/var/log/cc/out.jsonl`
@@ -173,7 +205,9 @@ defmodule CrowdControl.Provider.Gce do
   @owner_metadata_key "cc-owner"
 
   @default_agent_port 8080
-  @default_ready_timeout 300_000
+  # ~6x the measured 31.1s, sized for a bootstrap script that installs a CLI
+  # rather than for the bare case. See the moduledoc's measurement table.
+  @default_ready_timeout 180_000
   @default_operation_timeout 300_000
 
   @status_poll_interval 2_000
@@ -254,7 +288,9 @@ defmodule CrowdControl.Provider.Gce do
   # holding a local listener open. Each step hands the *updated* handle to the
   # next, and rollback is called from the scope that knows what exists.
   defp start(handle, config, spec) do
-    case API.insert_and_wait(config, spec, timeout: insert_timeout(handle), zone: handle.zone) do
+    case phase(handle, :insert, fn ->
+           API.insert_and_wait(config, spec, timeout: insert_timeout(handle), zone: handle.zone)
+         end) do
       {:ok, instance} ->
         await_running(handle, config, instance)
 
@@ -271,7 +307,7 @@ defmodule CrowdControl.Provider.Gce do
   defp await_running(handle, config, instance) do
     deadline = System.monotonic_time(:millisecond) + ready_timeout(handle)
 
-    case poll_host(handle, config, instance, deadline) do
+    case phase(handle, :running, fn -> poll_host(handle, config, instance, deadline) end) do
       {:ok, host} -> open_tunnel(handle, config, host, deadline)
       {:error, reason} -> rollback(handle, config, reason)
     end
@@ -318,7 +354,9 @@ defmodule CrowdControl.Provider.Gce do
   end
 
   defp open_tunnel(handle, config, host, deadline) do
-    case Tunnel.open(host, handle.session_key, tunnel_opts(handle, deadline)) do
+    case phase(handle, :ssh, fn ->
+           Tunnel.open(host, handle.session_key, tunnel_opts(handle, deadline))
+         end) do
       {:ok, local_port, conn} ->
         verify_health(%{handle | tunnel: conn}, config, local_port, deadline)
 
@@ -327,13 +365,50 @@ defmodule CrowdControl.Provider.Gce do
     end
   end
 
+  # Four telemetry events, because `acquire/1` is minutes long and was opaque.
+  #
+  # `:ready_timeout`'s documentation asks the caller to raise it for a heavy
+  # bootstrap and lower it for a prebuilt image — advice they could only follow by
+  # guessing, since nothing reported where the minutes actually went. The phases
+  # are the four questions worth asking separately:
+  #
+  #   * `:insert` — the API accepted it and the operation reached DONE
+  #   * `:running` — the guest is RUNNING and has an address
+  #   * `:ssh`     — sshd accepts, authenticates, and forwards a port
+  #   * `:health`  — the agent answers `GET /v1/health`, which is the only real
+  #                  readiness signal and the one that contains `apt-get`, the
+  #                  caller's bootstrap and the release download
+  #
+  # Emitted on failure too, with `result: :error` — a phase that timed out is
+  # exactly the one a caller needs to see.
+  #
+  #     :telemetry.attach("gce", [:crowd_control, :gce, :phase], &handler/4, nil)
+  defp phase(handle, name, fun) do
+    started = System.monotonic_time(:millisecond)
+    result = fun.()
+    duration = System.monotonic_time(:millisecond) - started
+
+    :telemetry.execute(
+      [:crowd_control, :gce, :phase],
+      %{duration_ms: duration},
+      %{
+        phase: name,
+        result: if(match?({:error, _}, result), do: :error, else: :ok),
+        instance_name: handle.instance_name,
+        zone: handle.zone
+      }
+    )
+
+    result
+  end
+
   # `{:ok, port}` from the tunnel is not evidence the agent is reachable — the
   # remote end is never probed at setup time — so this is the only readiness
   # signal in the whole provider.
   defp verify_health(handle, config, local_port, deadline) do
     endpoint = endpoint(handle, local_port)
 
-    case AgentAPI.await_health(endpoint, remaining(deadline)) do
+    case phase(handle, :health, fn -> AgentAPI.await_health(endpoint, remaining(deadline)) end) do
       :ok -> {:ok, handle, endpoint}
       {:error, reason} -> rollback(handle, config, health_reason(handle, reason))
     end

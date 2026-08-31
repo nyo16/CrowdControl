@@ -1364,7 +1364,7 @@ Requires the optional `:gcp_compute` dependency:
 | `:spot` | `true` | |
 | `:external_ip` | `true` | The agent stays on loopback regardless — see below |
 | `:max_run_duration` | `ready_timeout + session timeout + 5 min` | Server-side orphan backstop |
-| `:ready_timeout` | `300_000` | Boot → healthy agent |
+| `:ready_timeout` | `180_000` | Operation DONE → healthy agent. Measured requirement is **31s** with no bootstrap script (8.9s insert, 0s to RUNNING, 23.8s ssh, 7.3s health; 39.9s end to end on a spot `e2-small`). Attach to `[:crowd_control, :gce, :phase]` to measure your own image |
 | `:ssh_port` | `22` | |
 | `:host_key_fp` | unset | Pin the VM's host key |
 

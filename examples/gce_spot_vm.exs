@@ -61,11 +61,14 @@
 #     sandbox passes a large number. An explicit value below
 #     `:ready_timeout` + 5 minutes is refused.
 #
-#   * `:ready_timeout`'s 300_000 ms default is an **unmeasured estimate**. The
-#     spike that was to measure boot -> guest-SSH-ready -> agent-healthy needed
-#     billable GCP credentials and was never run, so the default is reasoned
-#     from what the startup script does rather than observed. Raise it for a
-#     heavy bootstrap; lower it considerably for a prebuilt image.
+#   * `:ready_timeout`'s 180_000 ms default is **measured**, not reasoned. On a
+#     spot e2-small in us-central1-a with no bootstrap script: 8.9s to the insert
+#     operation reporting DONE, 0.0s more to RUNNING-with-an-address, 23.8s for
+#     sshd to accept and forward, 7.3s for the agent to answer /v1/health —
+#     31.1s inside the timeout's window, 39.9s end to end. The default is ~6x
+#     that because a bootstrap script is what actually costs time. Attach to
+#     [:crowd_control, :gce, :phase] to measure your own image instead of
+#     guessing.
 
 if System.get_env("CC_GCE_CONFIRM") != "yes" do
   IO.puts("""
@@ -83,9 +86,10 @@ Application.put_env(
   System.fetch_env!("CC_SANDBOXD_SECRET")
 )
 
-# Debian boot, apt, a node + CLI install, the release download, agent start.
-# Raise this rather than discovering it as a health timeout on a VM that is
-# already billing.
+# The bare sandbox needs 31s (measured, above). This example adds a node install
+# plus `npm install -g` on a cold apt cache, which is minutes rather than
+# seconds and is the only reason this is not the 180_000 default. Raise it rather
+# than discovering it as a health timeout on a VM that is already billing.
 ready_timeout = 420_000
 
 # Runs as root *before* the agent is installed, which is load-bearing:
