@@ -52,6 +52,19 @@
 
 ### Added
 
+- **A release channel for the `sandboxd` agent tarball: `sandboxd-v*`.** CI built
+  `sandboxd-linux-{amd64,arm64}.tar.gz` and its `.sha256` on every run, but only
+  attached them to a GitHub release on a `v*` tag — the same tag that publishes to
+  Hex. So the artifact that `CrowdControl.Provider.Gce` *requires* as
+  `:sandboxd_url` could not be published without also cutting a package release,
+  and in practice was never published at all: the docs carried a placeholder
+  `OWNER/REPO/releases/download/vX/` URL.
+
+  `sandboxd-v*` now publishes the tarball alone — `refs/tags/sandboxd-v…` does not
+  match the `refs/tags/v` gate, so Hex is untouched — while `v*` continues to do
+  both, since a package release should ship the agent it documents. Release
+  procedure is in `CONTRIBUTING.md`.
+
 - **GCE provisioning telemetry.** `CrowdControl.Provider.Gce`'s acquire/1 is minutes
   long and was opaque; it now emits `[:crowd_control, :gce, :phase]` with
   `%{duration_ms: n}` and `%{phase: :insert | :running | :ssh | :health, result:

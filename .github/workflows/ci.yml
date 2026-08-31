@@ -3,7 +3,14 @@ name: CI
 on:
   push:
     branches: [master]
-    tags: ["v*"]
+    # Two independent release channels, deliberately. `v*` releases the Hex
+    # package; `sandboxd-v*` publishes only the agent tarball. They were the same
+    # tag, which meant the artifact the GCE provider *requires* as
+    # `:sandboxd_url` could not be published without also publishing to Hex — so
+    # in practice it was never published at all, and the docs carried a
+    # placeholder URL. `refs/tags/sandboxd-v…` does not start with
+    # `refs/tags/v`, so the Hex job stays gated to the package channel.
+    tags: ["v*", "sandboxd-v*"]
   pull_request:
     branches: [master]
 
@@ -460,8 +467,14 @@ jobs:
           name: sandboxd-linux-${{ matrix.arch }}
           path: dist/
 
+      # Both channels carry the tarball: a package release should ship the agent
+      # it documents, and a `sandboxd-v*` tag ships the agent alone. The checksum
+      # sidecar goes with it because `:sandboxd_sha256` is mandatory and never
+      # skipped — a URL without its checksum is not a usable artifact.
       - name: Attach to the GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: |
+          startsWith(github.ref, 'refs/tags/v') ||
+          startsWith(github.ref, 'refs/tags/sandboxd-v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*

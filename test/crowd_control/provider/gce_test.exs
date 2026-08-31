@@ -3,12 +3,19 @@ defmodule CrowdControl.Provider.GceTest do
   Integration tests against a **real, billed** GCP project. Excluded by default
   (see `test/test_helper.exs`); nothing here runs unless you ask for it:
 
+      REL=https://github.com/nyo16/CrowdControl/releases/download/sandboxd-v0.1.0
+
       CC_GCE_PROJECT=my-project \\
       CC_GCE_ZONE=us-central1-a \\
       CC_GCE_ACCESS_TOKEN="$(gcloud auth print-access-token)" \\
-      CC_GCE_SANDBOXD_URL=https://github.com/OWNER/REPO/releases/download/vX/sandboxd-linux-amd64.tar.gz \\
-      CC_GCE_SANDBOXD_SHA256="$(curl -fsSL https://github.com/OWNER/REPO/releases/download/vX/sandboxd-linux-amd64.tar.gz.sha256 | cut -d' ' -f1)" \\
+      CC_GCE_SANDBOXD_URL=$REL/sandboxd-linux-amd64.tar.gz \\
+      CC_GCE_SANDBOXD_SHA256="$(curl -fsSL $REL/sandboxd-linux-amd64.tar.gz.sha256 | cut -d' ' -f1)" \\
       mix test --include gce test/crowd_control/provider/gce_test.exs
+
+  The agent tarball has its own release channel, `sandboxd-v*`, so it can be
+  published without publishing the Hex package — see `.github/workflows/ci.yml`.
+  Any URL the VM can reach over plain HTTPS works; a GCS object or your own
+  mirror is fine, and the checksum is what makes the source untrusted.
 
   Optional: `CC_GCE_MACHINE_TYPE` (default `e2-small`), `CC_GCE_SUBNETWORK`,
   `CC_GCE_TAGS` (comma-separated, for your own firewall rule).

@@ -1358,8 +1358,8 @@ Requires the optional `:gcp_compute` dependency:
 | Option | Default | Notes |
 |--------|---------|-------|
 | `:project`, `:zone`, `:token_provider` | — | Or a ready `%GcpCompute.Config{}` as `:gce_config` |
-| `:sandboxd_url` | — | **Required.** Release tarball |
-| `:sandboxd_sha256` | — | **Required and never skipped** |
+| `:sandboxd_url` | — | **Required.** Agent tarball, published under the `sandboxd-v*` release channel: `https://github.com/nyo16/CrowdControl/releases/download/sandboxd-v0.1.0/sandboxd-linux-amd64.tar.gz`. Any URL the VM can reach over plain HTTPS works — a GCS object or your own mirror is fine |
+| `:sandboxd_sha256` | — | **Required and never skipped.** The VM fetches the tarball with no credential, so the checksum is the only thing that makes an untrusted source safe. A `.sha256` sidecar ships with every release |
 | `:bootstrap_script` | unset | Shell run as root before the agent installs |
 | `:spot` | `true` | |
 | `:external_ip` | `true` | The agent stays on loopback regardless — see below |
