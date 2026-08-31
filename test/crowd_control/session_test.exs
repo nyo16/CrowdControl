@@ -384,9 +384,19 @@ defmodule CrowdControl.SessionTest do
       # The session died holding the partial line `{"n"`; the sandbox kept
       # running and its output continues `:2}\n`. Reattaching must rejoin them
       # into one valid message, with no duplicated or lost bytes.
+      #
+      # The gap between the two chunks is deliberate. It forces them into
+      # separate casts, so a wait that stops at "some output arrived" sees
+      # byte_offset 16 and fails the 24 below. That is exactly how this test
+      # failed on one CI leg while every faster machine got lucky.
       ctl =
         start_supervised!(
-          {Mock, events: [{:stdout_data, ~s|:2}\n|}, {:stdout_data, ~s|{"n":3}\n|}]}
+          {Mock,
+           events: [
+             {:stdout_data, ~s|:2}\n|},
+             {:sleep, 25},
+             {:stdout_data, ~s|{"n":3}\n|}
+           ]}
         )
 
       record =
@@ -408,8 +418,13 @@ defmodule CrowdControl.SessionTest do
       assert state.status == :running
       assert state.subscribers == [self()]
 
-      TestHelpers.wait_until(fn -> :sys.get_state(pid).byte_offset > 12 end)
+      # The rejoin is what this test is named for, so assert it: the seeded
+      # `{"n"` and the sandbox's `:2}\n` arrive as one valid message.
+      assert_receive {:crowd_control, ^pid, {:unknown, %{"n" => 2}}}, 2_000
+      assert_receive {:crowd_control, ^pid, {:unknown, %{"n" => 3}}}, 2_000
 
+      # Both chunks are accounted for now: byte_offset is updated in the same
+      # handle_cast that broadcasts, and this call is queued behind it.
       after_state = :sys.get_state(pid)
 
       # 12 seeded + 4 (`:2}\n`) + 8 (`{"n":3}\n`) = 24
