@@ -33,7 +33,45 @@
   normally are still not restarted and still release their `:max_children`
   slot; only abnormal exits are now restarted.
 
+- **Elixir lower bound raised to `~> 1.19`, was `~> 1.18`.** The new
+  `CrowdControl.Provider.Gce` needs `:gcp_compute`, which declares
+  `elixir: "~> 1.19"`. A `Version.match?/2` guard in `mix.exs` would have kept
+  the 1.18 bound nominally alive while leaving the GCE provider untested there,
+  and an untested bound is a claim rather than a guarantee — the same principle
+  that put a lower-bound leg in CI in the first place. The CI matrix's 1.18.3
+  leg is replaced by a 1.19 leg pinned to the new floor, so the bound stays
+  tested rather than merely declared.
+
+  `:ssh` is now listed in `extra_applications`. It is an OTP application rather
+  than a Hex dependency, so it cannot be made `optional: true` the way `:req`
+  and `:kubereq` are, and naming it is the only way to get a release that
+  actually contains it. The cost, stated plainly: `:ssh` starts for every
+  consumer, including those who never touch the GCE provider. It is a small
+  supervisor tree that listens on nothing unless a daemon is explicitly
+  started.
+
 ### Added
+
+- **A release channel for the `sandboxd` agent tarball: `sandboxd-v*`.** CI built
+  `sandboxd-linux-{amd64,arm64}.tar.gz` and its `.sha256` on every run, but only
+  attached them to a GitHub release on a `v*` tag — the same tag that publishes to
+  Hex. So the artifact that `CrowdControl.Provider.Gce` *requires* as
+  `:sandboxd_url` could not be published without also cutting a package release,
+  and in practice was never published at all: the docs carried a placeholder
+  `OWNER/REPO/releases/download/vX/` URL.
+
+  `sandboxd-v*` now publishes the tarball alone — `refs/tags/sandboxd-v…` does not
+  match the `refs/tags/v` gate, so Hex is untouched — while `v*` continues to do
+  both, since a package release should ship the agent it documents. Release
+  procedure is in `CONTRIBUTING.md`.
+
+- **GCE provisioning telemetry.** `CrowdControl.Provider.Gce`'s acquire/1 is minutes
+  long and was opaque; it now emits `[:crowd_control, :gce, :phase]` with
+  `%{duration_ms: n}` and `%{phase: :insert | :running | :ssh | :health, result:
+  :ok | :error, instance_name: _, zone: _}`. Failures are emitted too, because
+  "it timed out" is not actionable while "`:ssh` timed out" names the firewall
+  rule. This is also how `:ready_timeout` stops being guesswork: the moduledoc
+  tells callers to tune it for their own image, and now they can measure it.
 
 - **omp support.** [omp](https://omp.sh/) can now drive a session, alongside
   Claude Code and Open Code. Select it with `agent: :omp` (or just
@@ -167,9 +205,230 @@
   `CrowdControl.Backend.Docker` so both remote backends share one
   implementation. `Docker.apply_credentials/2` now delegates to it and its
   public behaviour is unchanged.
+- **A provider/transport split, so a new substrate is provisioning code only.**
+  `CrowdControl.Backend` already parameterized *where* it provisioned, but each
+  substrate had to bring its own byte transport too — the Docker backend's
+  FIFO/`tee` pair, the Kubernetes backend's exec stream. A VM has no exec API at
+  all, so a fourth substrate meant a fourth transport. The new
+  `CrowdControl.Provider` behaviour owns infrastructure lifecycle
+  (`acquire`/`reconnect`/`release`/`list_live`/`age_ms`/`scrub`) *underneath* a
+  single transport:
+
+  ```elixir
+  CrowdControl.run("Review this diff",
+    backend:
+      {CrowdControl.Backend.Sandboxd,
+       provider: {CrowdControl.Provider.Docker, image: "crowd_control/sandbox:dev", egress: :allow}}
+  )
+  ```
+
+  Three load-bearing contracts, all stated in `CrowdControl.Provider`'s
+  moduledoc: `acquire/1` returns only once the agent has answered
+  `GET /v1/health` (provisioning that reports success early is the single
+  largest source of flaky remote backends, and `insert_and_wait/3` on GCE waits
+  for the *operation*, never the guest); `release/1` is idempotent and treats
+  "already gone" as success; and the endpoint is **never** persisted, because a
+  published port is reassigned on every container start. The behaviour is graded
+  on admitting a Kubernetes provider as ~200 lines of provisioning code, and
+  that mapping table is written out in the moduledoc — writing it is what
+  revealed that `Provider.Endpoint` needs `headers` as well as `token`, since
+  the API server's pod proxy consumes `authorization` for its own credential.
+
+  `CrowdControl.Backend.Docker` is unchanged, undeprecated, and still works with
+  any image that has `sh` and `tail`. The new path needs an image containing the
+  agent, which is the trade it asks you to make.
+- **`CrowdControl.Backend.Sandboxd` — one HTTP transport for every substrate.**
+  Talks to `sandboxd`, an OTP release running inside the sandbox (nested app in
+  `sandboxd/`, four dependencies, its own release). The agent's capture file is
+  byte-for-byte the same artifact as the Docker backend's `tee` file, so the
+  `%{byte_offset:, buffer:}` cursor is unchanged and `start_reader/3` at offset 0
+  *is* the resume path. Offsets are 0-indexed here: `tail -c +N` is 1-indexed
+  and that `+ 1` is a documented hazard this transport simply does not have.
+  Backpressure reuses the Docker backend's proven cancel-and-re-request shape.
+- **`CrowdControl.Provider.Docker`** — one container per sandbox, agent port
+  published on `127.0.0.1`. `:egress` is **required** and has no default; see
+  Security below for why it cannot be inferred.
+- **`CrowdControl.Provider.Compose`** — a per-session stack over the Engine API
+  with no `docker compose` CLI dependency (the Engine API has no compose
+  endpoints; compose is a client-side Go plugin). Networks, volumes, ordered
+  health-gated startup, compose-compatible labels for `docker compose ls|ps`
+  interop — and deliberately *not* `config-hash`/`version`, which would make the
+  compose CLI believe it owns the stack and recreate it. Teardown order is
+  forced: containers, then networks, then named volumes explicitly, because a
+  network `DELETE` fails 403 while attached and `?v=true` removes only anonymous
+  volumes.
+- **`CrowdControl.Provider.Gce`** — a Compute Engine spot VM per sandbox via the
+  optional `{:gcp_compute, "~> 0.2"}`, reached through an OTP `:ssh` tunnel with
+  a per-session ed25519 key generated in memory that never touches disk.
+  `max_run_duration` plus `instanceTerminationAction: DELETE` is a *server-side*
+  orphan backstop that needs no BEAM, because the reaper cannot help if the node
+  dies mid-provision and a leaked spot VM bills forever.
+- **`CrowdControl.Backend.Docker.HostConfig`** — the single definition of
+  container hardening, now shared by `Backend.Docker` and `Provider.Docker`. Two
+  copies would drift, and the failure mode is silent: a sandbox that quietly
+  lost `CapDrop: ALL` looks exactly like one that did not.
+- **`:custom_provider` now works on a remote sandbox.** `CrowdControl.Agent.Omp`
+  resolves a provider's `baseUrl` from `models.yml` under its agent directory,
+  which previously had to already exist *inside* the sandbox — unsatisfiable
+  without a file-transfer channel. With `sandbox_agent_dir: true` the rendered
+  file is written into the sandbox over `PUT /v1/files` after the sandbox exists
+  and before the CLI starts, via a new optional
+  `c:CrowdControl.Agent.sandbox_files/1` callback. General workspace push/pull
+  remains out of scope.
+
+### Changed
+
+- **`CrowdControl.Provider.Gce`'s `:ready_timeout` default is `180_000`, was
+  `300_000` — and it is now measured rather than reasoned.** On a spot `e2-small`
+  in `us-central1-a` with no bootstrap script and the release tarball in a
+  same-region bucket: 8.9s for the insert operation to reach DONE, 0.0s more to
+  RUNNING-with-an-address, 23.8s for sshd to accept and forward, 7.3s for the
+  agent to answer `GET /v1/health`. That is **31.1s** inside the window
+  `:ready_timeout` actually bounds, and **39.9s** end to end.
+
+  The new default is ~6x the measured requirement, sized for a bootstrap script
+  that installs a CLI rather than for the bare case. Lowering it also tightens
+  `:max_run_duration`, whose floor is derived from it — so the orphan backstop is
+  no longer inflated by an over-cautious readiness window. The moduledoc, README
+  and `examples/gce_spot_vm.exs` carry the measurement instead of a caveat saying
+  it was never taken.
+
+  Also verified in the same run: `scheduling.maxRunDuration` plus
+  `instanceTerminationAction: DELETE` really does remove the instance. A VM with
+  a 600s budget was deleted by GCE at +594s, with nothing local involved.
+- **Dependency floors raised: `req ~> 0.7`, `kubereq ~> 0.4.5`,
+  `gcp_compute ~> 0.3`.** These three move together and cannot be separated:
+  `gcp_compute` 0.3.0 requires `req ~> 0.7` (for the `:decoders` hook — 0.6 had
+  only the now-deprecated `:decode_json`), and `kubereq` 0.4.4 pins
+  `req ~> 0.6.0`, so taking one forces the others. The `:req` constraint here is
+  unchanged at `~> 0.5`, which already admits 0.7. Resolving the tree also pulled
+  mint 1.9.0 → 1.9.3 and hpax 1.0.3 → 1.0.4, clearing five security advisories.
+
+  `gcp_compute` 0.2.0 could not complete a single launch against real GCP: every
+  bodyless `POST` was rejected `411 Length Required`, which is
+  `zoneOperations.wait`, which is how both `insert_and_wait/3` and
+  `delete_and_wait/3` finish. 0.3.0 fixes it. **The GCE provider now passes its
+  integration suite against real infrastructure** — three tests that had never
+  executed before.
+- **A rejected Kubernetes exec/log upgrade is now reported asynchronously.**
+  `kubereq` 0.4.5 changed the model: its Req adapter answers a synthetic `101`
+  and casts the real request to a connection process, so `open_exec/5` returns
+  `{:ok, pid}` while the handshake is still in flight and a 404/400/403 cannot
+  surface as a return value. It arrives instead as
+  `{:exec_down, pid, {:k8s, {:upgrade_failed, status}}}` — normalized into the
+  same vocabulary as before, so a consumer does not have to know which kubereq
+  reported it, or whether it was synchronous. The reader already treated a
+  channel death as a stream drop, so resume behaviour is unchanged.
+
+  One consequence worth knowing: `:connected` is now delivered *before* the
+  upgrade is attempted, so it is no longer evidence that a channel exists.
+- **A Kubernetes `write/2` that times out now returns
+  `{:error, {:k8s, :write_indeterminate}}`** rather than `{:k8s, :exec_timeout}`.
+  The exec task is killed brutally and the Mint socket dies with it, but the API
+  server may already have run the `printf` — so the prompt may or may not be in
+  the FIFO. Reported as a plain timeout, the obvious response is to retry, which
+  delivers the same prompt twice. Naming the uncertainty lets a caller decide.
+- **`CrowdControl.Backend.Kubernetes.API.exec_stdin/5` takes an options list**
+  (was `exec_stdin/4`), so the caller pins `:container`.
 
 ### Fixed
 
+- **`CrowdControl.Backend.Docker`'s exec/4 refuses a second call** with
+  `{:error, {:docker, :already_started}}`, matching `Backend.Kubernetes` and
+  `Backend.Sandboxd`. `tee` opens the tee file `O_TRUNC`, so a second launch
+  silently truncated it and every persisted byte offset then pointed into a
+  different file — no error, just a session replaying or skipping output.
+
+  The check asks the *container*, not the handle: a handle rebuilt by
+  `list_live/1` on another node knows nothing about a previous exec, and the
+  launcher and status files are the only durable record. It cannot ride along
+  inside the launch command the way the Kubernetes one does, because Docker's exec
+  is detached and its exit code is never observable — so it costs one extra round
+  trip, once per session. It fails *closed*: refusing wrongly is a clear error on
+  a retryable path, while allowing wrongly corrupts every cursor silently.
+- **The Kubernetes credential write uses a binary websocket frame.**
+  `Kubereq.PodExec.send_stdin/2` builds `{:text, <<0, data>>}`, but channel 0 is a
+  byte channel and RFC 6455 requires a text frame's payload to be valid UTF-8,
+  permitting a peer to fail the connection on anything else.
+
+  Measured rather than assumed: pushing `<<"prefix-", 0xFF, 0xFE, "-suffix">>`
+  through both opcodes against v1.35.6+orb1 delivered all 16 bytes intact either
+  way, so this apiserver does not enforce the rule and the defect was **latent,
+  not live**. The exposure is an intermediary that does enforce it, where the
+  symptom would be an unexplained close on the credential write. The correct
+  opcode costs nothing, so it is now used; there is deliberately no regression
+  test, because every server reachable from here accepts both and such a test
+  could not fail.
+
+- **A crashed CLI no longer hangs a Docker session forever, either.** The same
+  defect as the Kubernetes one below, in the same shape, found by asking whether
+  that one had a twin rather than by a report — and `Backend.Docker` is the
+  default remote backend, so this was the more exposed of the two. Its PID 1 was
+  `sleep infinity` and the CLI is started by a *detached* exec, so PID 1 never
+  spawned it and could not reap it. Measured on a live daemon before the fix: kill
+  the CLI and `alive?/1` still answered `true`, `await_exit/2` answered `:timeout`
+  forever, no `:eof` ever reached the session, and the container billed on.
+
+  PID 1 now waits for a status the launch pipeline writes after `tee` drains and
+  exits with the CLI's own code — `await_exit/2` reports `137` for a SIGKILLed CLI
+  instead of never returning — and a launcher killed before it can report is
+  detected through its pid file rather than waited on forever. Both paths have
+  live tests.
+
+- **`CrowdControl.Provider.Gce.API.list_all/3` actually paginates.** It passed
+  `:maxResults` and `:pageToken`; the library's option is `:max_results` and
+  `:page_token`. 0.2.0 forwarded unrecognised options to the wire untouched, so
+  both were ignored: every call fetched the API server's default first page and
+  the page token never advanced. A project with more sandboxes than one page
+  would have reported the rest as gone — and `CrowdControl.Reaper` deletes the
+  store record of a sandbox it cannot see. 0.3.0 rejects unknown options, which
+  is how this surfaced.
+- **A crashed CLI no longer hangs a Kubernetes session forever.** The sandbox
+  container's PID 1 was `sleep infinity`, and `setsid` makes the CLI a
+  grandchild of it, so nothing in the container noticed the CLI die: the Pod
+  stayed `Running`, `tail -f` never ended, no `:eof` reached the session, and the
+  Pod billed indefinitely. PID 1 now waits for the status the launch pipeline
+  writes *after* `tee` drains and exits with the CLI's own code, so
+  `Backend.Kubernetes.await_exit/2` reports `137` for a SIGKILLed CLI instead of
+  never returning. A launcher killed before it can report (an OOM kill of the
+  process group) is detected through its pid file rather than waited on forever.
+- **`CrowdControl.Backend.Kubernetes.API.open_exec/5` no longer kills a caller
+  that does not trap exits.** `Kubereq.PodExec.start_link/1` links to whoever
+  starts it and stops with the transport error as its reason, and a link signal
+  is not something a `rescue`/`catch :exit` can intercept — so a routine
+  websocket blip killed the caller outright. The channel is now started by a
+  dedicated trapping owner that holds the only link, and a channel death arrives
+  as an `{:exec_down, pid, reason}` message. The owner monitors the consumer, so
+  a channel cannot outlive the process it delivers to.
+- **A failed write of the Kubernetes credential file is no longer reported as
+  success.** `exec_stdin` returned `:ok` on the first close frame and discarded
+  websocket channel 3 entirely, so a write that could not create the file looked
+  fine and the CLI then started with no credentials and failed later, elsewhere,
+  for a reason that named none of this. The channel-3 `Status` is now decoded
+  with the same `exec_status/1` the other exec paths use.
+- **The Kubernetes credential file is written to a named container.** Every other
+  exec pinned `:container`; this one did not, so on a multi-container Pod the API
+  server chose where the secret landed. It worked only because the sandbox Pod
+  has one container plus an already-exited init container.
+- **`Backend.Kubernetes.exec/4` refuses a second call** with
+  `{:error, {:k8s, :already_started}}`, matching `Backend.Sandboxd`. `tee` opens
+  the tee file `O_TRUNC`, so a second launch silently truncated it and every
+  persisted byte offset then pointed into a different file — no error, just a
+  session replaying or skipping output. The guard runs before the credential file
+  is written, so a refused call cannot re-plant a secret that only the launcher
+  unlinks.
+- **A reattached Kubernetes session resumes against the file its offset was
+  measured in.** A handle rebuilt by `list_live/1` took `:tee_path`,
+  `:fifo_path` and `:env_path` from the *caller's* options — a reaper's, usually
+  — so a session provisioned with custom paths resumed against the defaults,
+  reading a file that does not exist. The paths are now persisted as Pod
+  annotations and rebuilt from there; Pods created before this change fall back
+  to the caller's options as before.
+- **The Kubernetes reader asks the API server once per reconnect burst, not once
+  per attempt.** One blip produced five `GET /pods/{name}` calls in about three
+  seconds. Steady-state idle polling is unchanged and deliberately uncached: one
+  Pod carries exactly one reader, so there is nothing for a shared cache to
+  collapse.
 - **`Session.send_prompt/2` no longer rejects a prompt after the first result.**
   A `{:result, _, _}` ends a *turn*, not the process: both
   `claude --input-format stream-json` and `omp --mode rpc` keep reading stdin
@@ -203,9 +462,67 @@
 - **An invalid `:streaming_behavior` is rejected by `build_command/1`.** It
   used to surface only when a prompt was encoded — inside `Session.init/1` or
   `handle_call/3` — killing the session and the calling process.
+- **A crashing HTTP stream task no longer takes a session down without an
+  `:eof`.** `Req`'s `into: :self` machinery `spawn_link`s its worker to the
+  reader, so an abnormal task exit killed the reader before it could cast
+  `:eof` — and `Session` keeps the reader pid but never monitors it, so the
+  session died with no end-of-stream at all. Both readers now trap exits and
+  treat an abnormal task exit as a transport failure. Found while building
+  `Backend.Sandboxd` and back-ported to `CrowdControl.Backend.Docker`, which had
+  the identical latent bug.
+- **A mid-stream transport failure is normalized like every other failure.**
+  `Req.parse_message/2` yields `%Finch.TransportError{}` for a connection that
+  died under an open stream, while `Req.get/2`'s *return* yields
+  `%Req.TransportError{}` for a connect-phase failure. Only the second was
+  folded into the backend's error vocabulary, so the first leaked a raw struct
+  out of the backend in exactly the case most likely to reach a log line.
 
 ### Security
 
+- **No kubeconfig in a crash report.** `kubereq` 0.4.5 casts the whole
+  `%Req.Request{}` to its connection process, so when a websocket upgrade is
+  rejected — a routine event: a Pod reaped mid-session answers 404 — OTP's crash
+  report printed that request as the process's last message. Measured: with a
+  certificate kubeconfig that is `cert: <<48, 130, …>>` in a ~2 KB `:error` line;
+  with a **token** kubeconfig, which is the in-cluster ServiceAccount posture,
+  `Req` redacts the `authorization` header but prints
+  `options.kubeconfig.current_user["token"]` in full.
+
+  `CrowdControl.LogRedactor` is a `:logger` primary filter, installed at
+  application start, that replaces the request term, the process state and the
+  client info with `:redacted_by_crowd_control`. It fires only for reports that
+  actually carry a `%Req.Request{}` or a Kubereq.Connect state, so no other
+  library's crash reports are touched, and it never drops an event — the reason,
+  the process name and the stacktrace survive, because an invisible crash is a
+  worse bargain than a redacted one. Opt out with
+  `config :crowd_control, redact_logs: false`. Verified on a live cluster.
+- **A pod-log failure no longer carries the response headers into its error
+  term.** `PodLogs` fails asynchronously under kubereq 0.4.5 too, so an inspected
+  `%Mint.WebSocket.UpgradeFailureError{}` — status *and* every response header —
+  became the error reason. It is now the same `{:upgrade_failed, status}` the exec
+  path reports.
+- **The Kubernetes `:deny_all` enforcement probe no longer reports a boundary
+  that is not there.** It fetched `http://1.1.1.1`, which made a security
+  decision depend on internet reachability: one dropped packet inside the 5 s
+  window failed the guarded run, and a failed guarded run was read as "the policy
+  stopped it". Observed reporting enforcement on a cluster with no policy
+  controller at all, which ships a sandbox believing it has a network boundary it
+  does not have. The probe now performs a TCP connect to the API server's
+  ClusterIP — no DNS, no TLS, no internet — and reports enforcement only when the
+  guarded container actually **ran** and an identical fetch **succeeded** without
+  the policy in place. Anything else is inconclusive, and inconclusive is never
+  cached and never treated as enforcement. `:network_probe_url` still selects an
+  internet target for callers who specifically want that proven blocked.
+- **Abandoned probe objects no longer accumulate on the cluster.** The probe
+  cleans up in an `after` block, which does not run when the process is *killed*
+  — an ExUnit timeout, a supervisor shutdown — and the objects carry no owner
+  hash, so nothing else could ever match them. Each probe now sweeps abandoned
+  ones older than five minutes, so a killed run self-heals.
+- **A `WithClauseError` from the websocket stack is bounded structurally.**
+  `Kubereq.Connect.create_stream/4` can raise it during `Enum` evaluation, where
+  nothing wraps it into the `MatchError` the normalizer already handled — leaving
+  a length-capped `Exception.message/1` of an inspected `%Mint.HTTP1{}`, which
+  holds the socket and, transitively, the connection's transport options.
 - **Sandbox containers are hardened by default.** `CapDrop: ALL`,
   `no-new-privileges`, and `PidsLimit: 512`. The PID ceiling is independent of
   `:memory`/`:cpus`, neither of which bounds process count, so without it a fork
@@ -226,6 +543,62 @@
 - **A reader transport error no longer kills its session.** A mid-stream failure
   now casts `:eof` as the backend contract requires, instead of raising in a
   linked process.
+- **No agent credential is ever persisted.** `CrowdControl.Backend.Sandboxd`
+  derives each sandbox's bearer token by HMAC-SHA256 over a configured
+  `:sandboxd_secret` and the `session_key` the store already holds, so reattach
+  recomputes it with nothing at rest. `scrub/1` drops the endpoint **wholesale**
+  rather than field-by-field, so a future field on it cannot leak by omission,
+  and `Store.secret_keys/0` gains `:sandboxd_secret` and `:gce_config` (the
+  latter holds a live token-provider argument and is not a secret by name, which
+  is exactly why it needs naming). One documented cost: rotating
+  `:sandboxd_secret` fails reattach closed with `{:sandboxd, :unauthorized}` for
+  every sandbox started under the old secret. That is the intended trade against
+  a live credential in DETS, and the integration suite asserts it.
+- **The agent port is never routable, and `:egress` is never inferred.** On one
+  container, `Internal: true` and a published port are mutually exclusive —
+  publishing requires a non-internal endpoint, and attaching one restores full
+  internet egress. Confirmed six independent ways against Docker 29.4.0, and the
+  failure is *silent*: `create` answers `201` with `"Warnings": []` while
+  `NetworkSettings.Ports` reads `{"8080/tcp": null}`. So
+  `CrowdControl.Provider.Docker` requires an explicit `:egress` (`:allow` or
+  `:no_nat`) exactly as `Backend.Docker` requires an explicit `:network_mode`,
+  and it does **not** claim to block egress. `:no_nat` blocks the internet but
+  leaves the Docker host, sibling containers and embedded DNS reachable — "no
+  NAT", not "dropped" — and SECURITY.md says so rather than glossing it.
+  `HostIp: "127.0.0.1"` is sent on every binding, because omitting it publishes
+  two bindings on every interface.
+- **A per-session internal network makes the proxy footgun unreachable.**
+  `CrowdControl.Provider.Compose` puts the sandbox on an `Internal: true`
+  network with no port bindings and reaches it through a synthesized dual-homed
+  `socat` forwarder, so there is no `bridge` for a caller to choose and the
+  `bridge`-defeats-the-proxy failure mode does not exist for this provider. The
+  forwarder's own publish network disables IP masquerade, so it has no internet
+  either. Verified against a live daemon: the sandbox cannot reach `1.1.1.1`,
+  can reach its sidecar by alias, and the host can reach the agent.
+- **GCE sandboxes are reached only through an SSH tunnel.** The agent binds the
+  VM's loopback; port 22 is the only reachable port, and the per-session ed25519
+  key is generated in memory, set as *instance-level* metadata (a project-wide
+  key would apply to every VM in the project), and never written to disk.
+  Startup interpolates no secret into the script body and verifies a **mandatory**
+  SHA-256 on the release download. GCE metadata is readable by in-sandbox code,
+  which SECURITY.md states plainly rather than hiding.
+- **`PUT /v1/files` rejects path traversal rather than normalizing it**, on both
+  the client and the agent. A request for `/v1/files/../../etc/passwd` is
+  refused with `400`; a legitimate absolute path never needs `..` to express
+  itself. The route exists solely so omp's `:agent_dir` obligation is
+  satisfiable remotely.
+- **The agent's `401` has an empty body and a constant-time comparison.** A
+  distinct message for "no header" versus "wrong token" tells an attacker which
+  half to work on, and a byte-wise comparison leaks the token to anything that
+  can time responses — which, for a loopback-published port, is every process on
+  the host. `GET /v1/health` is the only unauthenticated route and returns
+  `{"ok": true}` and nothing else, because a provider must poll it before any
+  token round trip can have succeeded.
+- **The agent refuses to boot without a token.** A missing `CC_SANDBOXD_TOKEN`
+  is a hard startup failure, not a warning that degrades into an
+  unauthenticated process-exec endpoint. The release also disables Erlang
+  distribution, so it never registers with EPMD and opens no port that
+  `CC_SANDBOXD_BIND` does not govern.
 
 - **Strict env-var validation.** `CrowdControl.CLI.build_env/1` now rejects env
   keys that don't match `^[A-Za-z_][A-Za-z0-9_]*$` and values containing null

@@ -73,3 +73,34 @@ If you believe you have found a vulnerability, please follow
 - [ ] CHANGELOG.md updated under `## Unreleased`
 - [ ] New public functions have `@doc` and `@spec`
 - [ ] Security-sensitive changes have adversarial tests
+
+## Releasing
+
+Two independent channels. Pushing the wrong tag publishes the wrong thing, so the
+distinction is worth reading once.
+
+**`v*` — the Hex package.** Sets the version from the tag, publishes to Hex, and
+*also* attaches the agent tarballs to the GitHub release.
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+**`sandboxd-v*` — the agent tarball only.** Builds
+`sandboxd-linux-{amd64,arm64}.tar.gz` plus a `.sha256` sidecar inside the target
+image (an OTP release must be built on the glibc it will run on), smoke-tests that
+the amd64 one actually boots and answers `GET /v1/health`, and attaches all four
+files to the GitHub release. **No Hex publish** — `refs/tags/sandboxd-v…` does not
+match the `refs/tags/v` gate.
+
+```bash
+git tag sandboxd-v0.1.0 && git push origin sandboxd-v0.1.0
+```
+
+Use this channel when the agent changes but the package has not, and when you
+need a URL to hand to `:sandboxd_url` — which `CrowdControl.Provider.Gce`
+requires, along with `:sandboxd_sha256`, because the VM fetches it over plain
+HTTPS with no credential and the checksum is the only thing making that safe.
+
+The tarballs are also uploaded as workflow artifacts on every run, including pull
+requests, so you can test a change without tagging anything.

@@ -14,10 +14,14 @@ defmodule CrowdControl.Backend.Docker do
   directions through the filesystem:
 
       provision  POST /containers/create
-                 entrypoint: mkfifo <fifo> && mkdir -p <teedir> && sleep infinity
+                 entrypoint: mkfifo <fifo> && mkdir -p <teedir>
+                             && wait for <status>, then exit with it
 
       exec       POST /containers/{id}/exec  (started detached)
-                 sh -c 'exec 3<> <fifo>; <cli> ... <&3 | tee <teefile>'
+                 sh -c 'echo $$ > <launcher>; exec 3<> <fifo>;
+                        { <cli> ... <&3; echo $? > <status>.partial; }
+                          | tee <teefile>;
+                        mv -f <status>.partial <status>'
 
       write      POST /containers/{id}/exec  (started detached)
                  sh -c 'printf %s <escaped> >> <fifo>'
@@ -31,7 +35,7 @@ defmodule CrowdControl.Backend.Docker do
   `Content-Type: application/vnd.docker.raw-stream`, which `Req` streams
   happily. No `101 Upgrade`, no raw socket handling, no `Mint.WebSocket`.
 
-  Two details are load-bearing and were both established empirically:
+  Three details are load-bearing and were all established empirically:
 
     * **The FIFO is held open read-write** (`exec 3<> <fifo>`). A plain
       `< <fifo>` redirect sees EOF the moment the first writer detaches, which
@@ -39,6 +43,17 @@ defmodule CrowdControl.Backend.Docker do
       every session would be lost.
     * **`tail -c +N` is 1-indexed**, hence `byte_offset + 1`. Off by one here
       duplicates a byte per resume, which corrupts the JSON line stream.
+    * **PID 1 relays the CLI's exit status**, and is not the CLI itself. The CLI
+      is started later by a *detached* exec, so PID 1 never spawned it and cannot
+      reap it; while PID 1 was `sleep infinity` a killed CLI left the container
+      `Running`, `alive?/1` answering `true`, `await_exit/2` answering `:timeout`
+      forever, and `tail -f` never ending — so no `:eof` reached the session and
+      the container billed on. The launcher writes the CLI's own status *after*
+      `tee` drains, never before, or PID 1 could exit while bytes were still
+      buffered and truncate the tail of the session. A launcher killed before it
+      can report is detected through its pid file, because that hang is the same
+      bug one level up. Identical in shape to `CrowdControl.Backend.Kubernetes`,
+      and found by asking whether that defect had a twin.
 
   ## Live and resume are the same code path
 
@@ -123,7 +138,7 @@ defmodule CrowdControl.Backend.Docker do
 
   require Logger
 
-  alias CrowdControl.Backend.Docker.{API, Demux}
+  alias CrowdControl.Backend.Docker.{API, Demux, HostConfig}
   alias CrowdControl.Backend.Shell
   alias CrowdControl.Store
 
@@ -131,18 +146,6 @@ defmodule CrowdControl.Backend.Docker do
   @default_fifo "/var/run/cc.fifo"
   @default_network "none"
   @default_max_inflight 4 * 1024 * 1024
-  @default_pids_limit 512
-
-  # Only used when :readonly_rootfs is enabled. The fifo and tee live under
-  # /var/run and /var/log, so both must be writable for the entrypoint to work
-  # at all; /tmp is conventional. noexec/nosuid so these do not become a way to
-  # stage and run a binary.
-  @default_tmpfs %{
-    "/tmp" => "rw,noexec,nosuid,size=64m",
-    "/var/run" => "rw,noexec,nosuid,size=8m",
-    "/var/log" => "rw,noexec,nosuid,size=64m"
-  }
-
   defstruct [
     :container_id,
     :image,
@@ -224,54 +227,44 @@ defmodule CrowdControl.Backend.Docker do
     end
   end
 
+  # PID 1 creates the FIFO, then waits for the CLI's status and exits with it.
+  #
+  # It was `sleep infinity`, which made a dead CLI invisible: the CLI is started
+  # later by a *detached* exec, so PID 1 never spawned it and cannot reap it.
+  # Measured on a live daemon — kill the CLI and `alive?/1` answered `true`,
+  # `await_exit/2` answered `:timeout` forever, `tail -f` never ended so no `:eof`
+  # reached the session, and the container billed on. Identical in shape to the
+  # `Backend.Kubernetes` defect, found by asking whether that one had a twin.
+  #
+  # PID 1 cannot *be* the CLI: the tee file has to outlive any individual exec,
+  # and `exec/4` runs after the container is already up.
+  #
+  # The second condition is what keeps this from being the same bug one level up:
+  # the status file is the launcher's job, so anything that kills the launcher
+  # before it reports — an OOM kill of the process group — would leave PID 1
+  # waiting on a file nobody will ever write. `/proc/<pid>` rather than `kill -0`
+  # needs no signal permission and no opinion about the image's builtins.
   defp entrypoint_script(handle) do
     tee_dir = Path.dirname(handle.tee_path)
+    status = Shell.escape(status_path(handle))
+    launcher = Shell.escape(launcher_pid_path(handle))
 
     "mkfifo -m 600 #{Shell.escape(handle.fifo_path)} && " <>
       "mkdir -p #{Shell.escape(tee_dir)} && " <>
-      "sleep infinity"
+      "while [ ! -e #{status} ]; do " <>
+      "if [ -e #{launcher} ] && [ ! -d \"/proc/$(cat #{launcher} 2>/dev/null)\" ]; then " <>
+      "echo 1 > #{status}; break; fi; " <>
+      "sleep 1; done; " <>
+      "code=$(cat #{status} 2>/dev/null); " <>
+      "case \"$code\" in ''|*[!0-9]*) code=1;; esac; " <>
+      "exit \"$code\""
   end
 
+  # Hardening lives in Backend.Docker.HostConfig, shared verbatim with
+  # Provider.Docker. Two copies of these defaults would drift, and a sandbox
+  # that silently lost CapDrop: ALL is indistinguishable from one that did not.
   defp host_config(handle) do
-    config = handle.config
-
-    %{
-      # Non-negotiable. A restarted container truncates the tee file and
-      # invalidates every persisted byte_offset. Making restart impossible is
-      # cheaper and safer than trying to detect it.
-      "RestartPolicy" => %{"Name" => "no"},
-      "NetworkMode" => network_mode(config),
-      "AutoRemove" => false,
-
-      # Hardening defaults. The code running in here is model-driven and
-      # untrusted, so the sandbox should not be weaker than the trusted
-      # container this project ships for itself. These three are safe for any
-      # image: a CLI needs no Linux capabilities, never needs to gain
-      # privileges, and has no business forking without bound. `Memory` and
-      # `NanoCpus` do NOT bound PIDs, so the fork-bomb ceiling has to be set
-      # separately.
-      "CapDrop" => config[:cap_drop] || ["ALL"],
-      "SecurityOpt" => config[:security_opt] || ["no-new-privileges:true"],
-      "PidsLimit" => Keyword.get(config, :pids_limit, @default_pids_limit)
-    }
-    |> maybe_put("NanoCpus", config[:cpus] && trunc(config[:cpus] * 1_000_000_000))
-    |> maybe_put("Memory", config[:memory])
-    |> put_readonly_rootfs(config)
-  end
-
-  # Opt-in rather than default: a read-only root filesystem breaks any image
-  # whose CLI writes outside the tmpfs mounts (npm caches, ~/.claude, and so
-  # on), and silently breaking every caller's image is not an acceptable way to
-  # ship a hardening default. When enabled, the fifo and tee paths must stay
-  # writable or the entrypoint cannot even start.
-  defp put_readonly_rootfs(host_config, config) do
-    if config[:readonly_rootfs] do
-      host_config
-      |> Map.put("ReadonlyRootfs", true)
-      |> Map.put("Tmpfs", config[:tmpfs] || @default_tmpfs)
-    else
-      host_config
-    end
+    HostConfig.build(handle.config, network_mode: network_mode(handle.config))
   end
 
   # Deliberately never infers `"bridge"`. Reaching an egress proxy does require
@@ -300,12 +293,25 @@ defmodule CrowdControl.Backend.Docker do
 
   # --- exec ---
 
+  # `tee` opens the tee file `O_TRUNC`, so a second `exec/4` silently truncates
+  # it — after which `tail -c +N` restarts from a new byte 0 and *every* persisted
+  # cursor points at the wrong place. No error, just a session replaying or
+  # skipping output. `Backend.Kubernetes` and `Backend.Sandboxd` both refuse, so
+  # refusing here makes all three agree.
+  #
+  # The check asks the *container*, not the handle: a handle rebuilt by
+  # `list_live/1` on another node knows nothing about a previous exec, and the
+  # launcher and status files are the only durable record. Unlike Kubernetes,
+  # this cannot ride along inside the launch command — the exec is detached, so
+  # its exit code is never observable — hence one extra round trip, once per
+  # session, on a path that has just made several.
   @impl true
   def exec(%__MODULE__{container_id: id} = handle, executable, args, env) when is_binary(id) do
     command = cli_command(handle, executable, args)
     env = apply_credentials(env, handle.config)
 
-    with {:ok, exec_id} <-
+    with :ok <- refuse_second_exec(handle),
+         {:ok, exec_id} <-
            create_exec(handle, ["/bin/sh", "-c", command], attach: false, env: env),
          :ok <- start_exec_detached(handle, exec_id) do
       {:ok, handle}
@@ -313,6 +319,43 @@ defmodule CrowdControl.Backend.Docker do
   end
 
   def exec(%__MODULE__{}, _executable, _args, _env), do: {:error, :not_provisioned}
+
+  # Fail *closed*: an unanswerable probe refuses the exec.
+  #
+  # The two failures are not symmetric. Refusing wrongly is a clear error on a
+  # path the caller can retry, and the daemon has just answered a create and a
+  # start, so a blip exactly here is unlikely. Allowing wrongly truncates the tee
+  # file and silently corrupts every persisted cursor, with no error at all. The
+  # recoverable failure wins.
+  defp refuse_second_exec(handle) do
+    script =
+      "if [ -e #{Shell.escape(launcher_pid_path(handle))} ] || " <>
+        "[ -e #{Shell.escape(status_path(handle))} ]; then echo cc-started; fi"
+
+    case run_attached(handle, ["/bin/sh", "-c", script]) do
+      {:ok, output} ->
+        if String.contains?(output, "cc-started"),
+          do: {:error, {:docker, :already_started}},
+          else: :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # An attached exec, run to completion, demuxed. The only place in this module
+  # that needs a command's *output* rather than its side effect.
+  defp run_attached(handle, cmd) do
+    with {:ok, exec_id} <- create_exec(handle, cmd, attach: true),
+         {:ok, raw} <-
+           API.request(handle.config, :post, "/exec/#{exec_id}/start",
+             json: %{"Detach" => false, "Tty" => false},
+             decode_body: false
+           ) do
+      {payloads, _demux} = Demux.feed(Demux.new(), raw)
+      {:ok, IO.iodata_to_binary(payloads)}
+    end
+  end
 
   # `exec 3<> fifo` holds a read-write fd open for the life of the pipeline, so
   # no writer detaching is ever observable as EOF by the CLI. Verified: the
@@ -324,12 +367,37 @@ defmodule CrowdControl.Backend.Docker do
   # (see create_exec/3), which is the remote equivalent of Backend.Local's
   # env-file indirection. docker_test.exs greps the container's `ps` output to
   # keep this honest.
+  #
+  # The status relay is the same shape as `Backend.Kubernetes`, and for the same
+  # reason: this exec is detached, so the container's PID 1 is the only thing that
+  # can notice the CLI die, and it cannot see a process it did not spawn. Measured
+  # before the fix: kill the CLI and `alive?/1` still answered `true`,
+  # `await_exit/2` answered `:timeout` forever, no `:eof` ever reached the
+  # session, and the container billed on.
+  #
+  #   * `echo $$ > launcher` first, so PID 1 can tell "not started yet" from
+  #     "gone without reporting" — an OOM kill of the process group leaves no
+  #     status behind, and waiting on a file nobody will write is the same hang.
+  #   * `{ CLI; echo $? > staging; }` captures the CLI's own status. `$?` after a
+  #     bare pipeline is `tee`'s, which is 0 even when the CLI died.
+  #   * the `mv` runs only after the pipeline drains, so PID 1 cannot exit while
+  #     `tee` still holds buffered bytes and truncate the tail of the session.
   defp cli_command(handle, executable, args) do
     argv = Enum.map_join([executable | args], " ", &Shell.escape/1)
+    status = Shell.escape(status_path(handle))
+    staging = Shell.escape(status_path(handle) <> ".partial")
+    launcher = Shell.escape(launcher_pid_path(handle))
 
-    "exec 3<> #{Shell.escape(handle.fifo_path)}; " <>
-      "#{argv} <&3 | tee #{Shell.escape(handle.tee_path)}"
+    "echo $$ > #{launcher}; " <>
+      "exec 3<> #{Shell.escape(handle.fifo_path)}; " <>
+      "{ #{argv} <&3; echo $? > #{staging}; } | tee #{Shell.escape(handle.tee_path)}; " <>
+      "mv -f #{staging} #{status}"
   end
+
+  # Beside the FIFO, so both live in a directory the entrypoint already created
+  # and that is writable under `:readonly_rootfs`'s tmpfs mounts.
+  defp status_path(handle), do: Path.join(Path.dirname(handle.fifo_path), "cc.status")
+  defp launcher_pid_path(handle), do: Path.join(Path.dirname(handle.fifo_path), "cc.launcher")
 
   @doc """
   Rewrite the CLI's credential env for egress-proxy mode.
@@ -419,8 +487,17 @@ defmodule CrowdControl.Backend.Docker do
 
     # The reader is spawn_linked per the Backend reader contract: if it dies,
     # the session must die with it rather than go silently deaf.
+    #
+    # It also traps exits, because `Req`'s `into: :self` machinery spawn_links
+    # its own worker task to *this* process: an abnormal task exit would
+    # otherwise kill the reader before it could cast `:eof`, and Session never
+    # monitors the reader, so the session would go down with no end-of-stream
+    # at all. Measured while building Backend.Sandboxd, which has the identical
+    # exposure; the fix is the same in both.
     reader =
       spawn_link(fn ->
+        Process.flag(:trap_exit, true)
+
         reader_loop(%{
           handle: handle,
           session: session_pid,
@@ -493,6 +570,9 @@ defmodule CrowdControl.Backend.Docker do
     receive do
       {:cc_ack, bytes} ->
         state |> ack(bytes) |> consume()
+
+      {:EXIT, pid, reason} ->
+        on_exit_signal(state, pid, reason, &consume/1)
 
       message ->
         case Req.parse_message(state.resp, message) do
@@ -570,10 +650,30 @@ defmodule CrowdControl.Backend.Docker do
         else
           await_drain(state)
         end
+
+      {:EXIT, pid, reason} ->
+        on_exit_signal(state, pid, reason, &await_drain/1)
+
+      # An orphan chunk or a late :done from the cancelled request. There is no
+      # live response to parse it against, and the bytes are re-sent from
+      # `offset` when the stream reopens, so it is dropped.
+      _other ->
+        await_drain(state)
     after
       # The session went away or stopped acking; nothing left to read for.
       60_000 ->
         GenServer.cast(state.session, :eof)
+    end
+  end
+
+  # The session going away is not a failure and needs no :eof — there is nobody
+  # left to tell. Anything else exiting abnormally is Req's own stream task
+  # dying, which is a transport failure and must produce exactly one :eof.
+  defp on_exit_signal(state, pid, reason, continue) do
+    cond do
+      pid == state.session -> :ok
+      reason == :normal -> continue.(state)
+      true -> fail(state, {:stream_task_exit, reason})
     end
   end
 

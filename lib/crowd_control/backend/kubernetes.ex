@@ -16,13 +16,17 @@ defmodule CrowdControl.Backend.Kubernetes do
 
       provision  POST   /api/v1/namespaces/{ns}/pods
                  initContainer: mkfifo -m 600 <fifo> && mkdir -p <teedir>
-                 container:     sleep infinity
+                 container:     wait for <status>, then exit with it
 
       exec       POST   /api/v1/namespaces/{ns}/pods/{pod}/exec   (stdin)
                  sh -c 'umask 077; cat > <env>'      <- the secrets channel
                  then a second, detaching exec:
-                 setsid sh -c '. <env>; rm -f <env>; exec 3<> <fifo>;
-                               <cli> <&3 | tee <tee>' </dev/null >/dev/null 2>&1 &
+                 setsid sh -c 'echo $$ > <launcher>; . <env>; rm -f <env>;
+                               exec 3<> <fifo>;
+                               { <cli> <&3; echo $? > <status>.partial; }
+                                 | tee <tee>;
+                               mv -f <status>.partial <status>' \
+                           </dev/null >/dev/null 2>&1 &
 
       write      POST   .../exec   sh -c 'printf %s <escaped> >> <fifo>'
 
@@ -31,7 +35,7 @@ defmodule CrowdControl.Backend.Kubernetes do
 
       destroy    DELETE /api/v1/namespaces/{ns}/pods/{pod}?gracePeriodSeconds=0
 
-  Two details are load-bearing and were both established empirically, exactly as
+  Three details are load-bearing and were all established empirically, exactly as
   under Docker:
 
     * **The FIFO is held open read-write** (`exec 3<> <fifo>`). A plain
@@ -40,6 +44,17 @@ defmodule CrowdControl.Backend.Kubernetes do
       session would be lost.
     * **`tail -c +N` is 1-indexed**, hence `byte_offset + 1`. Off by one here
       duplicates a byte per resume, which corrupts the JSON line stream.
+    * **PID 1 relays the CLI's exit status**, and is not the CLI itself. The
+      container's process cannot *be* the CLI, because the tee file has to outlive
+      any individual exec and the CLI is started later by a detaching one. But it
+      must still notice the CLI: `setsid` makes the CLI a grandchild, so while PID
+      1 was `sleep infinity` a crashed CLI left the container `Running`, `tail -f`
+      never ended, no `:eof` was ever cast, and the session waited forever while
+      the Pod billed forever. The launcher writes the CLI's own status after `tee`
+      drains — never before, or PID 1 could exit while bytes were still buffered —
+      and PID 1 adopts it. A launcher killed before it can report is detected
+      through its pid file and reported as exit 1, because that hang is the same
+      bug one level up.
 
   ## Secrets travel the exec stdin channel, never argv and never the API object
 
@@ -121,7 +136,10 @@ defmodule CrowdControl.Backend.Kubernetes do
 
   ## Options
 
-    * `:image` — Pod image (required)
+    * `:image` — Pod image (required). Needs the CLI plus `sh`, `tail`, `tee` and
+      `head` on `PATH`; busybox and coreutils both suffice. `head -c` is what
+      bounds the credential read — see `API.exec_stdin/5` for why stdin EOF
+      cannot be used for that
     * `:namespace` — default: the kubeconfig context's namespace, else `"default"`
     * `:kubeconfig` — a `%Kubereq.Kubeconfig{}`, a pipeline module, or
       `{module, opts}`; default `Kubereq.Kubeconfig.Default`, which covers both
@@ -130,7 +148,11 @@ defmodule CrowdControl.Backend.Kubernetes do
     * `:network_probe` — `false` skips the `:deny_all` enforcement probe for
       callers who already know their CNI enforces
     * `:network_probe_image` — probe image, default `"busybox:1.36"`
-    * `:network_probe_url` — probe egress target, default `"http://1.1.1.1"`
+    * `:network_probe_url` — probe *internet* egress instead of the default,
+      which is a TCP connect to the API server's ClusterIP. The default needs no
+      DNS and no internet, so it does not make a security decision depend on
+      external reachability; set this only if internet egress is what you need
+      proven blocked
     * `:cpus` — fractional CPU limit, e.g. `1.5`
     * `:memory` — byte limit, e.g. `512 * 1024 * 1024`
     * `:tee_path` — default `/var/log/cc/out.jsonl`
@@ -190,13 +212,16 @@ defmodule CrowdControl.Backend.Kubernetes do
   @default_provision_timeout 120_000
   @default_pod_poll_ms 60_000
   @default_probe_image "busybox:1.36"
-  @default_probe_url "http://1.1.1.1"
 
-  # Consecutive reconnects with no delivered byte before the reader gives up and
-  # casts :eof. Progress resets it; see deliver/2.
+  # Consecutive failures to *establish* a stream before the reader gives up and
+  # casts :eof. A stream that opened and stayed open resets it; see
+  # attach_stream/2 for why "since the last delivered byte" was the wrong
+  # measure.
   @max_reconnects 5
 
-  @drain_timeout 60_000
+  # No @drain_timeout: backpressure now waits on a monitor of the session rather
+  # than a wall clock, because a slow consumer is not an end of stream.
+  # See await_drain/1.
 
   # Only used when :readonly_rootfs is enabled: the FIFO and tee directories are
   # emptyDir volumes either way (the init container has to hand the FIFO across),
@@ -285,10 +310,74 @@ defmodule CrowdControl.Backend.Kubernetes do
       :ok
     else
       {:error, reason} ->
+        # Diagnose BEFORE the rollback, because destroy/1 deletes the only thing
+        # that can still be asked. Previously this path produced
+        # `{:k8s, {:pod_not_ready, "CrashLoopBackOff"}}` and nothing else, and by
+        # the time an operator ran `kubectl logs` the Pod was gone.
+        log_provision_failure(handle, reason)
+
         # Roll back a created-but-not-Running Pod rather than leaking a billed
         # object, exactly as Docker rolls back a created-but-unstarted container.
         _ = destroy(handle)
         {:error, reason}
+    end
+  end
+
+  # The diagnosis is logged rather than folded into the error term, deliberately.
+  # `{:k8s, {:pod_not_ready, reason}}` is a value callers and tests match on;
+  # widening it to carry a log blob would break that vocabulary and put a
+  # multi-line container log inside a tuple that ends up in crash reports. A
+  # human reads logs; a caller matches terms.
+  defp log_provision_failure(handle, reason) do
+    case diagnose(handle) do
+      nil ->
+        Logger.warning(
+          "Kubernetes provision failed for #{handle.pod_name}: #{inspect(reason)} " <>
+            "(no container output and no waiting message — the Pod never got far enough to say anything)"
+        )
+
+      detail ->
+        Logger.warning(
+          "Kubernetes provision failed for #{handle.pod_name}: #{inspect(reason)}\n#{detail}"
+        )
+    end
+  end
+
+  # Three sources, in the order that answers the most failures.
+  #
+  # Logs first, then the *previous* container's logs — which is the one that
+  # matters for a CrashLoopBackOff, where the current container has produced
+  # nothing precisely because the interesting run already ended. Then the
+  # waiting message, which is the only source that says anything at all for an
+  # ImagePullBackOff or an invalid image reference: no container ever started,
+  # so there are no logs to read.
+  defp diagnose(%__MODULE__{} = handle) do
+    Enum.find_value(
+      [
+        fn -> logs_detail(handle, []) end,
+        fn -> logs_detail(handle, previous: true) end,
+        fn -> waiting_detail(handle) end
+      ],
+      fn source -> source.() end
+    )
+  end
+
+  defp logs_detail(handle, opts) do
+    label = if opts[:previous], do: "previous container logs", else: "container logs"
+
+    case API.logs(handle.config, handle.pod_name, Keyword.put(opts, :container, @container)) do
+      {:ok, ""} -> nil
+      {:ok, text} -> "#{label}:\n#{text}"
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp waiting_detail(handle) do
+    with {:ok, pod} <- API.get_pod(handle.config, handle.pod_name),
+         message when is_binary(message) and message != "" <- waiting_message(pod) do
+      "container is waiting: #{message}"
+    else
+      _ -> nil
     end
   end
 
@@ -350,9 +439,22 @@ defmodule CrowdControl.Backend.Kubernetes do
         },
         # Annotation VALUES are unconstrained, so the raw owner lives here and
         # Reaper.owned_by?/3 keeps comparing exact strings. The KEY has no "/"
-        # on purpose: a "crowd_control.io/owner" prefix is rejected, because a
+        # for the same reason the label keys do not: a key with a "/" has its
         # prefix must be a lowercase DNS subdomain and "_" is illegal in one.
-        "annotations" => %{"crowd_control.owner" => to_string(handle.owner)}
+        #
+        # The three paths are here because a rebuilt handle otherwise loses them.
+        # `list_live/1` reconstructs handles from the Pod, and it used to take the
+        # paths from the *caller's* opts — so a session provisioned with a custom
+        # `:tee_path` resumed against the default path after a reattach, reading a
+        # file that does not exist, with a byte offset that referred to another
+        # file entirely. The paths are provisioning facts about this sandbox, so
+        # they belong on the object rather than in whichever process asks about it.
+        "annotations" => %{
+          "crowd_control.owner" => to_string(handle.owner),
+          "crowd_control.tee_path" => handle.tee_path,
+          "crowd_control.fifo_path" => handle.fifo_path,
+          "crowd_control.env_path" => handle.env_path
+        }
       },
       "spec" =>
         %{
@@ -409,10 +511,19 @@ defmodule CrowdControl.Backend.Kubernetes do
     %{
       "name" => @container,
       "image" => handle.image,
-      # PID 1 does nothing but hold the Pod open. The CLI is started later by a
-      # detaching exec and reparents to this process; the tee file it writes has
-      # to outlive any individual exec, which is why PID 1 is not the CLI.
-      "command" => ["/bin/sh", "-c", "sleep infinity"],
+      # PID 1 holds the Pod open until the CLI is done, then exits with the CLI's
+      # status. It is deliberately not the CLI itself: the tee file has to
+      # outlive any individual exec, and the CLI is started later by a detaching
+      # exec that reparents to this process.
+      #
+      # It used to be `sleep infinity`, which made a dead CLI invisible. The CLI
+      # is a grandchild after `setsid`, so when it died the container stayed
+      # Running, `tail -f` never ended, no `:eof` was ever cast, and the session
+      # waited forever while the Pod kept billing. Waiting on the status file
+      # turns that into a terminal Pod phase, which every existing mechanism —
+      # the reader's liveness check, `await_exit/2`, the reaper — already
+      # understands.
+      "command" => ["/bin/sh", "-c", supervise_script(handle)],
       "securityContext" =>
         %{
           # Hardening defaults, on by default for the same reason Docker's are:
@@ -433,6 +544,51 @@ defmodule CrowdControl.Backend.Kubernetes do
     "mkfifo -m 600 #{Shell.escape(handle.fifo_path)} && " <>
       "mkdir -p #{Shell.escape(Path.dirname(handle.tee_path))}"
   end
+
+  # PID 1: block until the launcher reports the CLI's status, then adopt it.
+  #
+  # A 1s poll rather than a blocking read on a second FIFO, because the FIFO
+  # would have to be created by the init container and the poll costs nothing on
+  # a path that is idle by definition. Container exit is not the latency-
+  # sensitive event: the reader learns the CLI is gone the moment `tail -f` dies
+  # with the container, not from the Pod phase.
+  #
+  # The second clause is what makes this robust rather than merely usual. The
+  # status file is written by the launcher, so anything that kills the launcher
+  # *before* it reports — an OOM kill of the whole process group, a `kill -9` on
+  # the pipeline, a node under memory pressure — leaves a status that will never
+  # arrive. Waiting on it forever would reintroduce exactly the hang this fix
+  # exists to remove, one level up. So PID 1 also watches the launcher itself and
+  # treats its disappearance as an abnormal end.
+  #
+  # Order matters: status is checked first, and the launcher writes the status
+  # before exiting, so a normal end is never misread as a vanished launcher.
+  #
+  # `/proc/<pid>` rather than `kill -0`: it needs no signal permission and no
+  # opinion about which builtins this image's `sh` shipped with.
+  #
+  # The status is validated before `exit` because a non-numeric argument makes
+  # `sh` fail in a way that reports the wrong thing — an unreadable status means
+  # "something went wrong", i.e. 1.
+  defp supervise_script(handle) do
+    status = Shell.escape(status_path(handle))
+    pid = Shell.escape(launcher_pid_path(handle))
+
+    "while [ ! -e #{status} ]; do " <>
+      "if [ -e #{pid} ] && [ ! -d \"/proc/$(cat #{pid} 2>/dev/null)\" ]; then " <>
+      "echo 1 > #{status}; break; fi; " <>
+      "sleep 1; done; " <>
+      "code=$(cat #{status} 2>/dev/null); " <>
+      "case \"$code\" in ''|*[!0-9]*) code=1;; esac; " <>
+      "exit \"$code\""
+  end
+
+  # Both live beside the FIFO, so they are inside a directory that is already an
+  # emptyDir mount and already writable under :readonly_rootfs. Deriving them
+  # rather than adding options keeps the handle's path set unchanged, which
+  # matters because those paths are what a persisted offset refers to.
+  defp status_path(handle), do: Path.join(Path.dirname(handle.fifo_path), "cc.status")
+  defp launcher_pid_path(handle), do: Path.join(Path.dirname(handle.fifo_path), "cc.launcher")
 
   defp resources(config) do
     limits =
@@ -544,6 +700,17 @@ defmodule CrowdControl.Backend.Kubernetes do
 
   # --- exec ---
 
+  # `tee` opens the tee file `O_TRUNC`, so a second `exec/4` silently truncates
+  # it — after which `tail -c +N` restarts from a new byte 0 and *every*
+  # persisted cursor points at the wrong place. Nothing prevented that, and the
+  # damage is invisible: no error, just a session replaying or skipping output.
+  # `Backend.Sandboxd` already answers 409 for this, so refusing here makes the
+  # two backends agree.
+  #
+  # The guard rides on the env-file write rather than costing its own round trip,
+  # and it must come *before* that write for a second reason: a refused exec must
+  # not re-plant the credential file, because only the launcher unlinks it and a
+  # refused launch would leave the secret sitting in the sandbox.
   @impl true
   def exec(%__MODULE__{pod_name: name} = handle, executable, args, env) when is_binary(name) do
     with :ok <- write_env_file(handle, env) do
@@ -575,11 +742,32 @@ defmodule CrowdControl.Backend.Kubernetes do
   # the absence of Docker's `Detach: true`.
   defp launch_command(handle, executable, args) do
     argv = Enum.map_join([executable | args], " ", &Shell.escape/1)
+    status = Shell.escape(status_path(handle))
+    staging = Shell.escape(status_path(handle) <> ".partial")
+    pid = Shell.escape(launcher_pid_path(handle))
 
+    # Four things happen in this order, and the order is the whole point.
+    #
+    # `echo $$ > pid` first, and before the CLI exists, so PID 1 can tell "the
+    # launcher has not started yet" from "the launcher is gone". `$$` is this
+    # shell, which is the process that survives the pipeline and runs the `mv`;
+    # if it dies, no status will ever arrive and PID 1 needs to know that.
+    #
+    # `{ CLI; echo $? > staging; } | tee` captures the CLI's own status, not the
+    # pipeline's. `$?` after a bare pipeline is `tee`'s status, which is 0 even
+    # when the CLI died — POSIX sh has no PIPESTATUS to reach for.
+    #
+    # The `mv` runs only once the pipeline has finished, which means `tee` has
+    # flushed. Writing the final path directly would let PID 1 see the status,
+    # exit, and take the container down while `tee` still had buffered bytes —
+    # silently truncating the tail of the session's output. `mv` is atomic within
+    # a filesystem, so PID 1 never observes a partial file either.
     pipeline =
-      ". #{Shell.escape(handle.env_path)}; rm -f #{Shell.escape(handle.env_path)}; " <>
+      "echo $$ > #{pid}; " <>
+        ". #{Shell.escape(handle.env_path)}; rm -f #{Shell.escape(handle.env_path)}; " <>
         "exec 3<> #{Shell.escape(handle.fifo_path)}; " <>
-        "#{argv} <&3 | tee #{Shell.escape(handle.tee_path)}"
+        "{ #{argv} <&3; echo $? > #{staging}; } | tee #{Shell.escape(handle.tee_path)}; " <>
+        "mv -f #{staging} #{status}"
 
     "setsid sh -c #{Shell.escape(pipeline)} </dev/null >/dev/null 2>&1 &"
   end
@@ -589,17 +777,46 @@ defmodule CrowdControl.Backend.Kubernetes do
   # the exec websocket's stdin channel so the bytes never touch argv or the Pod
   # object. `umask 077` means the file is 0600 from the instant it exists.
   defp write_env_file(handle, env) do
-    content =
+    payload =
       env
       |> Credentials.apply_credentials(handle.config)
       |> Enum.map_join("\n", fn {k, v} -> "export #{k}=#{Shell.escape(v)}" end)
+      |> Kernel.<>("\n")
 
-    API.exec_stdin(
-      handle.config,
+    handle.config
+    |> API.exec_stdin(
       handle.pod_name,
-      ["/bin/sh", "-c", "umask 077; cat > #{Shell.escape(handle.env_path)}"],
-      content <> "\n"
+      ["/bin/sh", "-c", env_write_command(handle, byte_size(payload))],
+      payload,
+      container: @container
     )
+    |> case do
+      {:error, {:k8s, {:exit_status, 99}}} -> {:error, {:k8s, :already_started}}
+      other -> other
+    end
+  end
+
+  @doc false
+  # Doc-false public because two things in this one string are load-bearing and
+  # neither is visible from the outside; both are asserted in
+  # kubernetes_unit_test.exs.
+  #
+  # `head -c N`, not `cat`. `cat` ends only on stdin EOF, and the only way to
+  # signal EOF is to close the websocket — which makes the API server tear the
+  # exec down *before* it writes the channel-3 status, so a write that failed
+  # reported success and the CLI started with no credentials. Measured; see
+  # `API.exec_stdin/5`. Reading exactly the payload makes the command
+  # self-terminating, so the status arrives on its own.
+  #
+  # The already-started guard comes FIRST, before anything is written. A refused
+  # second `exec/4` must not re-plant the credential file, because only the
+  # launcher unlinks it — a refused launch would leave the secret on disk.
+  # 99 is out of the way of anything `head` or `sh` produces by itself, so the
+  # code is unambiguous evidence of the guard rather than of a failed write.
+  def env_write_command(handle, byte_count) do
+    "if [ -e #{Shell.escape(launcher_pid_path(handle))} ] || " <>
+      "[ -e #{Shell.escape(status_path(handle))} ]; then exit 99; fi; " <>
+      "umask 077; head -c #{byte_count} > #{Shell.escape(handle.env_path)}"
   end
 
   # --- write ---
@@ -616,6 +833,12 @@ defmodule CrowdControl.Backend.Kubernetes do
 
     case API.exec_once(handle.config, name, ["/bin/sh", "-c", command], container: @container) do
       {:ok, _output} -> :ok
+      # A timeout here is not a failure, it is an *unknown*. `bounded/2` kills the
+      # exec task brutally and the Mint socket dies with it, but the API server
+      # may already have run the `printf` — so the prompt may or may not be in the
+      # FIFO. Reported as a generic timeout, the obvious response is to retry,
+      # which delivers the prompt twice. Naming it lets a caller decide.
+      {:error, {:k8s, :exec_timeout}} -> {:error, {:k8s, :write_indeterminate}}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -673,7 +896,20 @@ defmodule CrowdControl.Backend.Kubernetes do
           podexec: nil,
           reconnects: 0,
           max_inflight: handle.config[:max_inflight_bytes] || @default_max_inflight,
-          poll_ms: handle.config[:pod_poll_ms] || @default_pod_poll_ms
+          poll_ms: handle.config[:pod_poll_ms] || @default_pod_poll_ms,
+          # When the current exec channel was opened; see attach_stream/2.
+          opened_at: nil,
+          # The last thing the container said on stderr or the exec error
+          # channel. Kept so a give-up reason can name the actual cause instead
+          # of an opaque transport error — see reconnect_or_eof/2.
+          last_stderr: nil,
+          # Channel 3's `Status`, kept separately: it arrives after stderr and
+          # would otherwise overwrite it. See explain/2.
+          last_exec_error: nil,
+          # The last liveness answer and when it was taken; see
+          # memoized_liveness/1 for why a reconnect burst does not re-ask.
+          liveness: nil,
+          liveness_at: nil
         })
       end)
 
@@ -701,8 +937,18 @@ defmodule CrowdControl.Backend.Kubernetes do
   defp open_stream(state) do
     cmd = ["tail", "-c", "+#{state.offset + 1}", "-f", state.handle.tee_path]
 
+    # stderr: true is not cosmetic. `exec_params/2` defaults it to FALSE, so
+    # without it channel 2 is never opened, the `{:stderr, data}` clause in
+    # consume/1 is unreachable, and the one thing that explains a failing read
+    # never arrives. Measured against a live cluster: with stderr off, a missing
+    # tee file produces only `:connected` and an opaque
+    # "command terminated with non-zero exit code"; with it on, the same failure
+    # also delivers `tail: can't open '/var/log/cc/out.jsonl': No such file or
+    # directory`. The bytes still never reach the session's stdout — consume/1
+    # keeps them out — they reach the *failure reason*.
     case API.open_exec(state.handle.config, state.handle.pod_name, cmd, self(),
-           container: @container
+           container: @container,
+           stderr: true
          ) do
       {:ok, podexec} -> {:ok, attach_stream(state, podexec)}
       {:error, reason} -> {:error, reason}
@@ -715,16 +961,37 @@ defmodule CrowdControl.Backend.Kubernetes do
   # There is no demux state to drop here -- kubereq owns channel framing -- so
   # the invariant this seam defends is the complement of the Docker one:
   # `offset` is a position in the tee *file* and MUST survive the swap, while
-  # `podexec` must be replaced wholesale. `reconnects` is deliberately carried
-  # through rather than reset: it counts reconnects since the last delivered
-  # byte, so a channel that flaps open-and-closed against a Running Pod is still
-  # bounded by @max_reconnects. Only deliver/2 resets it, because only delivered
-  # bytes are progress.
+  # `podexec` must be replaced wholesale.
+  #
+  # `opened_at` is stamped here because `reconnects` counts **consecutive
+  # failures to establish a stream**, not reconnects since the last delivered
+  # byte. The latter is what it used to count, and it made idle sessions
+  # guaranteed to die: the reader's own comment concedes an idle session emits
+  # nothing for hours, while a CRI streaming server closes an idle exec stream
+  # every 4h and an ALB may do it every 60s. Any five such closes with no output
+  # in between — however far apart — exhausted the budget and ended a healthy
+  # session. A stream that opened and *stayed* open is progress, so
+  # `reader_loop/1` clears the count on the next successful open.
   #
   # Exposed (doc-false) so both halves are testable without a cluster and a
   # precisely-timed socket failure. See kubernetes_unit_test.exs.
   def attach_stream(state, podexec) do
-    %{state | podexec: podexec}
+    %{state | podexec: podexec, opened_at: System.monotonic_time(:millisecond)}
+  end
+
+  # A stream that lived at least this long counts as having worked, so the next
+  # failure starts a fresh budget. Short enough that genuine flapping (open,
+  # immediate close, repeat) never resets and stays bounded by @max_reconnects.
+  @stream_progress_ms 30_000
+
+  defp note_progress(%{opened_at: nil} = state), do: state
+
+  defp note_progress(%{opened_at: opened_at} = state) do
+    if System.monotonic_time(:millisecond) - opened_at >= @stream_progress_ms do
+      %{state | reconnects: 0}
+    else
+      state
+    end
   end
 
   defp consume(%{parent: parent, podexec: podexec} = state) do
@@ -732,26 +999,31 @@ defmodule CrowdControl.Backend.Kubernetes do
       {:cc_ack, bytes} ->
         state |> ack(bytes) |> consume()
 
-      # kubereq opens every exec channel with a zero-byte stdout frame. Passing
-      # it on would cast {:stdout_data, ""} to the session before a single byte
-      # of output exists -- harmless to the offset, but it makes "the reader
-      # produced output" untrue at exactly the moment a caller is waiting on it.
+      # A zero-byte stdout frame would advance nothing but would make "the
+      # reader produced output" true before any output exists, so it is dropped.
+      # Note this apiserver does not actually send one — measured on
+      # v1.35.6+orb1, across stdin true/false and silent and immediate commands
+      # — so this clause is cheap insurance rather than a load-bearing filter,
+      # and no test should claim to depend on it.
       {:stdout, ""} ->
         consume(state)
 
       {:stdout, data} ->
         state |> deliver(data) |> after_deliver()
 
-      # AttachStderr: false is Docker's equivalent; here stderr and the
-      # undecoded channel-3 error stream are visible rather than silently
-      # dropped, but never mixed into the session's stdout.
+      # stderr and the exec error channel never mix into the session's stdout —
+      # that part is the same trade as Docker's `AttachStderr: false`. What
+      # changed is that the last line is now *kept*: it is the only thing that
+      # explains a failing read, and at :debug it was invisible in exactly the
+      # situation where someone is trying to find out why a sandbox went quiet.
       {:stderr, data} ->
-        Logger.debug("Kubernetes reader ignoring stderr: #{inspect(data)}")
-        consume(state)
+        state |> remember_stderr(data) |> consume()
 
+      # Channel 3, the exec status. Kept apart from stderr because it always
+      # arrives last and would otherwise overwrite the line that explains the
+      # failure — see explain/2.
       {:error, data} ->
-        Logger.debug("Kubernetes reader ignoring exec error channel: #{inspect(data)}")
-        consume(state)
+        state |> remember_exec_error(data) |> consume()
 
       :connected ->
         consume(state)
@@ -764,11 +1036,19 @@ defmodule CrowdControl.Backend.Kubernetes do
         # contract -- a reader that outlives its session is a leak.
         exit(reason)
 
-      {:EXIT, ^podexec, reason} ->
+      # The exec channel died. It arrives as a message rather than an exit signal
+      # because `API.open_exec/5` keeps the link inside its own owner process —
+      # a linked channel killed any caller that did not trap, which `guard`
+      # cannot prevent, and this reader was the only caller in the tree that got
+      # that right.
+      {:exec_down, ^podexec, reason} ->
         reconnect_or_eof(%{state | podexec: nil}, reason)
 
-      # A stale EXIT from an exec channel we already replaced. Reacting to it
+      # A stale notice from an exec channel we already replaced. Reacting to it
       # would tear down a perfectly good connection.
+      {:exec_down, _pid, _reason} ->
+        consume(state)
+
       {:EXIT, _pid, _reason} ->
         consume(state)
 
@@ -822,7 +1102,30 @@ defmodule CrowdControl.Backend.Kubernetes do
     await_drain(%{state | podexec: nil})
   end
 
+  # Waiting on the session, not on a wall clock.
+  #
+  # The old `after @drain_timeout -> cast(:eof)` was a silent truncation of a
+  # healthy session: at that moment the Pod is Running, the CLI is running, the
+  # tee file is still growing, and nothing is reading it — yet the session was
+  # told the stream had *ended*. A consumer that stalled for 61 seconds (a
+  # blocked LiveView, a long GC pause, a slow downstream) lost the remainder of
+  # its output and had no way to know.
+  #
+  # A monitor is the honest signal: EOF when the session is actually gone, and
+  # wait as long as it takes while it is alive. `pause/1` already closed the exec
+  # channel, so waiting here costs one idle process and no cluster resources —
+  # the Pod's own lifetime is bounded by the session's, not by this.
   defp await_drain(%{parent: parent} = state) do
+    ref = Process.monitor(state.session)
+
+    try do
+      drain_loop(state, parent, ref)
+    after
+      Process.demonitor(ref, [:flush])
+    end
+  end
+
+  defp drain_loop(state, parent, ref) do
     receive do
       {:cc_ack, bytes} ->
         state = ack(state, bytes)
@@ -832,17 +1135,19 @@ defmodule CrowdControl.Backend.Kubernetes do
         if state.inflight <= div(state.max_inflight, 2) do
           reader_loop(state)
         else
-          await_drain(state)
+          drain_loop(state, parent, ref)
         end
+
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        # Nobody left to deliver to. No :eof either — there is no session to
+        # receive it.
+        :ok
 
       {:EXIT, ^parent, reason} ->
         exit(reason)
 
       _other ->
-        await_drain(state)
-    after
-      # The session went away or stopped acking; nothing left to read for.
-      @drain_timeout -> GenServer.cast(state.session, :eof)
+        drain_loop(state, parent, ref)
     end
   end
 
@@ -852,26 +1157,177 @@ defmodule CrowdControl.Backend.Kubernetes do
   # Resume is free by construction, so reconnect instead, and only give up once
   # the Pod is confirmed gone or the reconnects stop making progress.
   defp reconnect_or_eof(state, reason) do
-    cond do
-      state.reconnects >= @max_reconnects ->
+    # A stream that stayed open long enough to count as working clears the
+    # consecutive-failure budget before it is checked.
+    state = note_progress(state)
+    {liveness, state} = memoized_liveness(state)
+
+    case {state.reconnects >= @max_reconnects, liveness} do
+      # Out of budget. Consecutive failures to *establish* a stream, not
+      # "failures since the last byte" -- see attach_stream/2 for why that
+      # distinction guaranteed idle sessions died.
+      {true, _} ->
         Logger.warning(
-          "Kubernetes reader giving up after #{state.reconnects} reconnects: #{inspect(reason)}"
+          "Kubernetes reader giving up after #{state.reconnects} consecutive " <>
+            "reconnects: #{inspect(explain(state, reason))}"
         )
 
         GenServer.cast(state.session, :eof)
 
-      alive?(state.handle) ->
-        attempt = state.reconnects + 1
-        Process.sleep(backoff(attempt))
-        reader_loop(%{state | reconnects: attempt})
+      {false, :running} ->
+        retry(state)
 
-      true ->
-        Logger.warning("Kubernetes reader stopped: #{inspect(reason)}")
+      # The one case that justifies ending the session.
+      {false, :terminal} ->
+        Logger.warning("Kubernetes reader stopped: #{inspect(explain(state, reason))}")
         GenServer.cast(state.session, :eof)
+
+      # The API server did not answer. That is not evidence the Pod is gone, and
+      # treating it as such used to end a live session over a single 429.
+      {false, :unknown} ->
+        Logger.debug("Kubernetes reader: pod liveness unknown, retrying")
+        retry(state)
     end
   end
 
-  defp backoff(attempt), do: min(100 * Bitwise.bsl(1, attempt - 1), 2_000)
+  # Short enough that a Pod which really went away is noticed within a second,
+  # long enough to cover one reconnect burst: the first four backoffs total
+  # 100 + 200 + 400 = 700 ms, so an episode asks the API server once instead of
+  # five times. Necessarily far below `reap_grace_ms`, which is 60 s by default —
+  # a liveness answer older than the grace window could let the reaper act on
+  # stale information.
+  @liveness_ttl_ms 1_000
+
+  # Deliberately per-reader state rather than a shared cache.
+  #
+  # The plan called for a per-Pod cache so "N readers on one node cost one
+  # request", but that premise does not hold here: one Pod carries one session
+  # and one reader, so no two readers ever ask about the same Pod and there is
+  # nothing for a shared table to collapse. It would add an ETS table, an owner
+  # process and a global staleness window to save nothing.
+  #
+  # What is real is the *burst*: `reconnect_or_eof/2` is consulted once per failed
+  # attempt, so one blip asked five times in about three seconds. That is what
+  # this collapses.
+  #
+  # Steady-state volume is unchanged and is not cached away by anything: idle
+  # polling is one `GET /pods/{name}` per session per `pod_poll_ms` (60 s), i.e.
+  # roughly `sessions / 60` requests per second — 5 QPS at 300 concurrent
+  # sessions. If that ever becomes the constraint, the answer is a watch, not a
+  # cache.
+  # Doc-false public so the TTL is assertable with a counting adapter rather than
+  # by timing a live cluster.
+  @doc false
+  def memoized_liveness(state) do
+    now = System.monotonic_time(:millisecond)
+
+    if state.liveness && now - state.liveness_at < @liveness_ttl_ms do
+      {state.liveness, state}
+    else
+      answer = liveness(state.handle)
+      {answer, %{state | liveness: answer, liveness_at: now}}
+    end
+  end
+
+  defp retry(state) do
+    attempt = state.reconnects + 1
+    # Only returns when the window elapses; a dead session exits from inside.
+    state = sleep_interruptibly(state, backoff(attempt))
+    reader_loop(%{state | reconnects: attempt})
+  end
+
+  # `Process.sleep/1` here made the reader deaf for up to 3.1s cumulative across
+  # the five reconnect attempts -- to `{:cc_ack, _}` (so a session that resumed
+  # consuming was not noticed) and, worse, to `{:EXIT, parent, _}` (so a session
+  # being shut down could not take its reader with it). Waiting in `receive`
+  # instead keeps both live.
+  defp sleep_interruptibly(state, ms) do
+    # A deadline, not a per-message timeout. Passing `ms` straight to `after` on
+    # every recursion restarts the window each time a message arrives, so a
+    # session acking steadily during backoff would defer the reconnect forever.
+    wait_until(state, System.monotonic_time(:millisecond) + ms)
+  end
+
+  # The transport reason alone is frequently useless -- `{:close, 1000, ""}` or
+  # "command terminated with non-zero exit code" tells you the channel ended,
+  # not why. The container's own last words usually do, so they are attached
+  # when there are any.
+  #
+  # stderr wins over the exec status, and the two are kept apart for a reason:
+  # channel 3 always arrives *after* channel 2, so folding both into one field
+  # meant the status JSON overwrote the useful line every single time. Measured
+  # against a missing tee file: channel 2 carried
+  # `tail: can't open '/var/log/cc/out.jsonl': No such file or directory` and
+  # channel 3 then replaced it with `{"status":"Failure",…"ExitCode"…}` — so the
+  # give-up line named an exit code nobody can act on and dropped the sentence
+  # that says exactly what is wrong.
+  defp explain(%{last_stderr: stderr}, reason) when is_binary(stderr),
+    do: {reason, {:stderr, stderr}}
+
+  defp explain(%{last_exec_error: payload}, reason) when is_binary(payload),
+    do: {reason, exec_error_reason(payload)}
+
+  defp explain(_state, reason), do: reason
+
+  # Channel 3 is a v4 `Status`, so it is decoded rather than pasted in raw.
+  # `exec_status/1` wraps every failure as `{:k8s, _}`, so there is deliberately
+  # no catch-all here: one would be dead code the type checker flags.
+  defp exec_error_reason(payload) do
+    case API.exec_status(payload) do
+      :ok -> {:exec_status, :success}
+      {:error, {:k8s, reason}} -> {:exec_status, reason}
+    end
+  end
+
+  defp remember_stderr(state, data) when is_binary(data) do
+    # Bounded, and the *tail* rather than the head: the useful line is the last
+    # one the container managed to write, and this string ends up in a log.
+    trimmed = data |> String.trim() |> String.slice(-200, 200)
+    if trimmed == "", do: state, else: %{state | last_stderr: trimmed}
+  end
+
+  defp remember_stderr(state, _data), do: state
+
+  defp remember_exec_error(state, data) when is_binary(data) do
+    trimmed = String.trim(data)
+    if trimmed == "", do: state, else: %{state | last_exec_error: trimmed}
+  end
+
+  defp remember_exec_error(state, _data), do: state
+
+  @doc false
+  # Exposed (doc-false) for the same reason as `attach_stream/2`: both halves of
+  # this are about what happens to messages that arrive *inside* a backoff
+  # window, and reproducing that against a cluster would need a precisely-timed
+  # socket failure. See kubernetes_unit_test.exs.
+  def wait_until(%{parent: parent} = state, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      state
+    else
+      receive do
+        {:EXIT, ^parent, reason} -> exit(reason)
+        {:cc_ack, bytes} -> wait_until(ack(state, bytes), deadline)
+        {:stderr, data} -> wait_until(remember_stderr(state, data), deadline)
+        {:error, data} -> wait_until(remember_exec_error(state, data), deadline)
+        # Frames from the channel that just died, and its EXIT. Nothing to do
+        # with them: `offset` never advanced, so the resume re-reads those bytes.
+        _other -> wait_until(state, deadline)
+      after
+        remaining -> state
+      end
+    end
+  end
+
+  # Jittered, because the unjittered version had every reader on a node retrying
+  # in lockstep: one apiserver blip disconnects N sessions simultaneously and
+  # they then all reconnect at the same five instants. Full jitter over the
+  # window costs nothing and spreads the retry.
+  defp backoff(attempt) do
+    ceiling = min(100 * Bitwise.bsl(1, attempt - 1), 2_000)
+    div(ceiling, 2) + :rand.uniform(div(ceiling, 2))
+  end
 
   # --- lifecycle ---
 
@@ -904,14 +1360,41 @@ defmodule CrowdControl.Backend.Kubernetes do
   def await_exit(%__MODULE__{}, _timeout), do: :timeout
 
   @impl true
-  def alive?(%__MODULE__{pod_name: name} = handle) when is_binary(name) do
+  def alive?(%__MODULE__{} = handle), do: liveness(handle) == :running
+
+  @doc false
+  # Tri-state, because the boolean the `Backend` callback requires cannot express
+  # the difference between "the Pod is gone" and "the API server did not answer",
+  # and the reader must not treat those the same.
+  #
+  # `alive?/1` collapsing `{:error, _}` to `false` meant one throttled or
+  # timed-out liveness GET — a 429, a 500, a DNS blip — ended a live session and
+  # orphaned a billed Pod. `await_exit/2` already fails *open* on the same error,
+  # so the boolean was the inconsistent one.
+  #
+  # Only `:terminal` justifies EOF. `:unknown` means ask again later.
+  @spec liveness(t()) :: :running | :terminal | :unknown
+  def liveness(%__MODULE__{pod_name: name} = handle) when is_binary(name) do
     case API.get_pod(handle.config, name) do
-      {:ok, pod} -> phase(pod) == "Running"
-      {:error, _reason} -> false
+      {:ok, pod} ->
+        cond do
+          # A Pod being deleted is going away even while it still reports
+          # Running, and reconnecting into it just races the deletion.
+          get_in(pod, ["metadata", "deletionTimestamp"]) -> :terminal
+          phase(pod) == "Running" -> :running
+          true -> :terminal
+        end
+
+      # 404 is the one error that genuinely means gone.
+      {:error, {:k8s, {:not_found, _}}} ->
+        :terminal
+
+      {:error, _reason} ->
+        :unknown
     end
   end
 
-  def alive?(%__MODULE__{}), do: false
+  def liveness(%__MODULE__{}), do: :terminal
 
   @impl true
   def destroy(%__MODULE__{pod_name: nil}), do: :ok
@@ -976,13 +1459,24 @@ defmodule CrowdControl.Backend.Kubernetes do
       pod_name: metadata["name"],
       namespace: metadata["namespace"],
       image: container["image"],
-      tee_path: opts[:tee_path] || @default_tee,
-      fifo_path: opts[:fifo_path] || @default_fifo,
-      env_path: opts[:env_path] || @default_env,
+      tee_path: sandbox_path(annotations, opts, :tee_path, @default_tee),
+      fifo_path: sandbox_path(annotations, opts, :fifo_path, @default_fifo),
+      env_path: sandbox_path(annotations, opts, :env_path, @default_env),
       session_key: labels["crowd_control.session"],
       owner: annotations["crowd_control.owner"] || owner,
       config: opts
     }
+  end
+
+  # From the Pod, not from `opts`: these are facts about how this sandbox was
+  # provisioned, and a byte offset is only meaningful against the file it was
+  # measured in. A handle rebuilt from `opts` alone resumed a session with a
+  # custom `:tee_path` against the default path — a file that does not exist.
+  #
+  # The `opts` fallback covers Pods that were already running when the
+  # annotations shipped, and the module defaults cover the rest.
+  defp sandbox_path(annotations, opts, key, default) do
+    annotations["crowd_control.#{key}"] || opts[key] || default
   end
 
   @doc """
@@ -1070,11 +1564,23 @@ defmodule CrowdControl.Backend.Kubernetes do
     end
   end
 
+  # Deliberately NOT gated on `config[:network] == :deny_all`, which is how this
+  # leaked. A handle rebuilt by `list_live/1` carries the *caller's* config
+  # (`handle_from_pod/3`), not the config the sandbox was provisioned with — so
+  # every reaper-driven teardown, and every `destroy_all/1`-style cleanup, saw
+  # `config[:network] == nil`, skipped this, and left the NetworkPolicy behind
+  # for good.
+  #
+  # Unconditional is also safe rather than merely convenient: the only name this
+  # can ever delete is `<pod_name>-deny-all`, which is derived from a Pod name we
+  # minted, so it is ours by construction. A caller-supplied
+  # `network: {:policy, name}` is never touched, and a 404 for a policy that was
+  # never created is success.
   defp delete_managed_policy(%__MODULE__{config: config} = handle) do
-    if config[:network] == :deny_all do
-      API.delete_network_policy(config, policy_name(handle.pod_name))
-    else
-      :ok
+    case API.delete_network_policy(config, policy_name(handle.pod_name)) do
+      {:ok, _} -> :ok
+      {:error, {:k8s, {:not_found, _}}} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1146,26 +1652,158 @@ defmodule CrowdControl.Backend.Kubernetes do
   defp enforcement_result(true), do: :ok
   defp enforcement_result(false), do: {:error, {:k8s, :network_policy_not_enforced}}
 
+  # Guarded run first, control only when needed.
+  #
+  # Ordering matters for cost and for strictness. On a cluster that enforces
+  # nothing the guarded fetch simply succeeds, which is conclusive on its own —
+  # one Pod, no control. Only a *failed* guarded run is ambiguous, and that is
+  # when the control earns its keep.
+  #
+  # Two independent things must both hold before enforcement is believed, because
+  # each rules out a different false positive:
+  #
+  #   * the guarded container actually RAN and exited non-zero. A Pod that never
+  #     started (scheduling, image pull) also reports phase `Failed`, and reading
+  #     that as "blocked by policy" is how this reported enforcement on a cluster
+  #     with no policy controller at all.
+  #   * the same fetch succeeds with no policy in place. That rules out a broken
+  #     network, an unreachable probe URL, and a wget that fails for its own
+  #     reasons.
+  #
+  # Anything else is inconclusive, and inconclusive is never cached and never
+  # treated as enforcement.
   defp run_enforcement_probe(config) do
     suffix = 6 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower)
-    name = "cc-netpol-probe-" <> suffix
-    namespace = API.namespace(config)
 
-    policy = probe_policy_manifest(name, namespace)
-    pod = probe_pod_manifest(name, namespace, config)
+    # A probe that was killed rather than returning left its Pods and its
+    # NetworkPolicy behind: `probe_egress/3` cleans up in `after`, and `after`
+    # does not run when the process is *killed* — which is exactly what ExUnit
+    # does on a timeout, and what a supervisor does on a shutdown. Nothing else
+    # would ever remove them: the objects carry no owner hash, so neither the
+    # Reaper nor any owner-scoped cleanup can match them.
+    #
+    # Sweeping here rather than in the `after` block is deliberate: the next probe
+    # is the first moment we know the previous one is over.
+    _ = sweep_stale_probes(config)
+
+    with {:ok, guarded} <- probe_egress(config, "cc-netpol-probe-" <> suffix, policy?: true) do
+      classify_guarded(config, suffix, guarded)
+    end
+  end
+
+  # Only objects older than this are swept. A probe takes seconds, so anything
+  # this old is abandoned — and the floor is what keeps one node's sweep from
+  # deleting another node's probe out from under it while it is reading phases.
+  @probe_stale_ms 300_000
+
+  defp sweep_stale_probes(config) do
+    case API.list_all(config, nil, label_selectors: [{"crowd_control.probe_sweep", "true"}]) do
+      {:ok, pods} ->
+        for pod <- pods,
+            name = get_in(pod, ["metadata", "name"]),
+            is_binary(name),
+            stale_probe?(pod) do
+          Logger.info("Kubernetes: sweeping abandoned network probe #{name}")
+          _ = API.delete_pod(config, name)
+          _ = API.delete_network_policy(config, name)
+        end
+
+        :ok
+
+      # Fail open. A sweep that cannot list says nothing about the cluster, and
+      # refusing to probe because housekeeping failed would turn a cleanup
+      # problem into a provisioning outage.
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp stale_probe?(pod) do
+    case parse_age(get_in(pod, ["metadata", "labels", "crowd_control.created_at"])) do
+      nil -> false
+      age -> age >= @probe_stale_ms
+    end
+  end
+
+  defp classify_guarded(config, suffix, guarded) do
+    if needs_control?(guarded) do
+      case probe_egress(config, "cc-netpol-ctl-" <> suffix, policy?: false) do
+        {:ok, control} -> probe_verdict(guarded, control)
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      probe_verdict(guarded, nil)
+    end
+  end
+
+  # A guarded run that is conclusive on its own does not spend a second Pod: the
+  # fetch either went through (nothing is enforcing) or the container never ran
+  # (the result says nothing about the network either way).
+  defp needs_control?(%{phase: "Succeeded"}), do: false
+  defp needs_control?(%{ran?: false}), do: false
+  defp needs_control?(_guarded), do: true
+
+  @doc false
+  # The probe's entire decision, separated from the two Pod runs so that all four
+  # outcomes are assertable without a cluster — a watch stream cannot be stubbed
+  # through the `:req_adapter` seam, which is why this used to be live-only and
+  # therefore effectively untested.
+  #
+  # `nil` control means one was not needed.
+  @spec probe_verdict(map(), map() | nil) :: {:ok, boolean()} | {:error, term()}
+  def probe_verdict(%{phase: "Succeeded"}, _control), do: {:ok, false}
+
+  def probe_verdict(%{ran?: false}, _control) do
+    {:error, {:k8s, {:network_probe_inconclusive, :probe_never_ran}}}
+  end
+
+  # Blocked, and the identical fetch succeeded without the policy. This is the
+  # only path that reports enforcement.
+  def probe_verdict(_guarded, %{phase: "Succeeded"}), do: {:ok, true}
+
+  def probe_verdict(_guarded, _control) do
+    {:error, {:k8s, {:network_probe_inconclusive, :control_failed}}}
+  end
+
+  defp probe_egress(config, name, opts) do
+    namespace = API.namespace(config)
+    pod = probe_manifest(name, namespace, config)
 
     try do
-      with {:ok, _} <- API.create_network_policy(config, policy),
+      # The probe's PID 1 *is* the egress attempt, so its exit status is the
+      # answer: Succeeded means the fetch went through, Failed means it did not.
+      with :ok <- maybe_create_probe_policy(config, name, namespace, opts[:policy?]),
            {:ok, _} <- API.create_pod(config, pod),
            {:ok, phase} <- await_probe_phase(config, name) do
-        # The probe's PID 1 *is* the egress attempt, so its exit status is the
-        # answer: Succeeded means the fetch went through and nothing enforced
-        # the deny-all; Failed means it was blocked.
-        {:ok, phase == "Failed"}
+        {:ok, %{phase: phase, ran?: probe_ran?(config, name)}}
       end
     after
       _ = API.delete_pod(config, name)
-      _ = API.delete_network_policy(config, name)
+      if opts[:policy?], do: API.delete_network_policy(config, name)
+    end
+  end
+
+  # Did the container get far enough to exit on its own? A `terminated` state
+  # means it ran; `waiting` means it never did.
+  defp probe_ran?(config, name) do
+    case API.get_pod(config, name) do
+      {:ok, pod} ->
+        pod
+        |> get_in(["status", "containerStatuses"])
+        |> List.wrap()
+        |> Enum.any?(&get_in(&1, ["state", "terminated"]))
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  defp maybe_create_probe_policy(_config, _name, _namespace, false), do: :ok
+
+  defp maybe_create_probe_policy(config, name, namespace, true) do
+    case API.create_network_policy(config, probe_policy_manifest(name, namespace)) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1216,16 +1854,28 @@ defmodule CrowdControl.Backend.Kubernetes do
     }
   end
 
-  defp probe_pod_manifest(name, namespace, config) do
-    url = config[:network_probe_url] || @default_probe_url
-
+  @doc false
+  # Public so the probe's labels and its egress command are assertable without a
+  # cluster: the probe creates Pods and then waits on a watch stream, and a watch
+  # cannot be stubbed through the `:req_adapter` seam.
+  @spec probe_manifest(String.t(), String.t(), keyword()) :: map()
+  def probe_manifest(name, namespace, config) do
     %{
       "apiVersion" => "v1",
       "kind" => "Pod",
       "metadata" => %{
         "name" => name,
         "namespace" => namespace,
-        "labels" => %{"crowd_control.probe" => name}
+        # Two labels, two jobs. The name-valued one is what this probe's own
+        # NetworkPolicy selects, so it must stay unique per probe. The constant
+        # one is what `sweep_stale_probes/1` selects on, since a selector cannot
+        # ask for "any value"; `created_at` is what tells the sweep whether a
+        # probe is abandoned or merely someone else's, in flight right now.
+        "labels" => %{
+          "crowd_control.probe" => name,
+          "crowd_control.probe_sweep" => "true",
+          "crowd_control.created_at" => to_string(System.system_time(:millisecond))
+        }
       },
       "spec" => %{
         "restartPolicy" => "Never",
@@ -1235,11 +1885,7 @@ defmodule CrowdControl.Backend.Kubernetes do
           %{
             "name" => "probe",
             "image" => config[:network_probe_image] || @default_probe_image,
-            "command" => [
-              "/bin/sh",
-              "-c",
-              "wget -q -O- -T 5 #{Shell.escape(url)} >/dev/null 2>&1"
-            ],
+            "command" => ["/bin/sh", "-c", probe_script(config)],
             "securityContext" => %{
               "allowPrivilegeEscalation" => false,
               "capabilities" => %{"drop" => ["ALL"]}
@@ -1250,19 +1896,55 @@ defmodule CrowdControl.Backend.Kubernetes do
     }
   end
 
+  # A TCP connect to the API server, and deliberately nothing more ambitious.
+  #
+  # The probe used to `wget http://1.1.1.1`, which made a *security* decision
+  # depend on the internet: a slow link or a dropped packet inside the 5s window
+  # failed the guarded run, and a failed guarded run reads as "policy stopped
+  # it". That direction of error is the dangerous one, and it was observed —
+  # this reported enforcement on a cluster with no policy controller at all.
+  #
+  # The API server's ClusterIP is reachable from every Pod on a working cluster
+  # by construction, and `KUBERNETES_SERVICE_HOST` is injected by the kubelet
+  # even with `enableServiceLinks: false` (verified). So: no DNS, no TLS, no
+  # internet, no name resolution — one TCP handshake, which is exactly what a
+  # deny-all egress policy blocks and nothing else plausibly does.
+  #
+  # `:network_probe_url` remains for callers who specifically want to prove
+  # *internet* egress is blocked. It is the less deterministic choice and the
+  # control run is what keeps it honest.
+  defp probe_script(config) do
+    case config[:network_probe_url] do
+      nil ->
+        ~S|nc -z -w 5 "$KUBERNETES_SERVICE_HOST" "${KUBERNETES_SERVICE_PORT:-443}"|
+
+      url ->
+        "wget -q -O- -T 5 #{Shell.escape(url)} >/dev/null 2>&1"
+    end
+  end
+
   # --- Private ---
 
   defp phase(pod), do: get_in(pod, ["status", "phase"])
 
-  defp waiting_reason(pod) do
-    pod
-    |> get_in(["status", "containerStatuses"])
-    |> List.wrap()
-    |> List.first()
-    |> case do
-      nil -> nil
-      status -> get_in(status, ["state", "waiting", "reason"])
-    end
+  # Both status lists, init first.
+  #
+  # This was a real misdiagnosis: the init container shares the sandbox image, so
+  # an unpullable image fails on the *init* container and its status lands in
+  # `initContainerStatuses` while `containerStatuses` is still absent. Reading
+  # only the latter meant `settled?/1` never saw `ImagePullBackOff`, the watch
+  # never settled, and a broken image reference surfaced as a 25-second
+  # `:provision_timeout` instead of an immediate `{:pod_not_ready,
+  # "ImagePullBackOff"}`. Init first because it runs first, so its failure is
+  # both the earlier and the more specific one.
+  defp waiting_reason(pod), do: waiting_field(pod, "reason")
+
+  defp waiting_message(pod), do: waiting_field(pod, "message")
+
+  defp waiting_field(pod, field) do
+    ["initContainerStatuses", "containerStatuses"]
+    |> Enum.flat_map(&(pod |> get_in(["status", &1]) |> List.wrap()))
+    |> Enum.find_value(fn status -> get_in(status, ["state", "waiting", field]) end)
   end
 
   defp exit_code(pod) do

@@ -4,6 +4,11 @@ defmodule CrowdControl.Application do
 
   @impl true
   def start(_type, _args) do
+    # Before anything can fail: a rejected exec upgrade makes kubereq's
+    # connection process crash with the whole %Req.Request{} — kubeconfig
+    # included — as its last message. See CrowdControl.LogRedactor.
+    :ok = CrowdControl.LogRedactor.install()
+
     max_sessions = fetch_max_sessions!()
     {store, store_opts} = CrowdControl.Store.resolve()
 
