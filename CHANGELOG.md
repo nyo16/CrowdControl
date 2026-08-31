@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.0 — 2026-08-31
+
+First published release. The version matches `@version` in `mix.exs`; if you tag
+something other than `v0.1.0`, change this heading to match, because CI rewrites
+the version in `mix.exs` from the tag but not this file.
+
 ### Breaking
 
 - **Licensed under Apache-2.0**, replacing MIT. Apache-2.0 adds an express
@@ -51,6 +57,21 @@
   started.
 
 ### Added
+
+- **`docs/` — four guides, wired into ExDoc under "Guides".**
+  [`architecture.md`](docs/architecture.md) (the four layers and what each is forbidden to know),
+  [`sandboxes.md`](docs/sandboxes.md) (how a sandbox actually works: FIFO and tee file, byte-exact
+  resume, PID 1's exit-status relay, and the HTTP-agent alternative),
+  [`providers.md`](docs/providers.md) (container, Compose stack, GCE spot VM) and
+  [`operations.md`](docs/operations.md) (store, reaper, reattach across a node restart, log
+  redaction, what to alarm on). 13 mermaid diagrams, every one parsed with mermaid 11 rather than
+  eyeballed. `SECURITY.md` stays the authority on threat model and egress; the guides link to it
+  instead of restating it.
+- **`examples/sandbox_lifecycle.exs`** — the sandbox with the bytes visible, driving
+  `Backend.Docker` directly rather than through a session: provision before any CLI exists, a
+  refused second `exec/4`, three prompts through the FIFO, a reattach at a byte offset that lands
+  *mid-line*, and a killed CLI producing `:eof` plus `{:ok, 137}`. Needs Docker and `alpine`; no API
+  key, because the "CLI" is a shell loop that echoes JSON lines — which is itself the point.
 
 - **A release channel for the `sandboxd` agent tarball: `sandboxd-v*`.** CI built
   `sandboxd-linux-{amd64,arm64}.tar.gz` and its `.sha256` on every run, but only

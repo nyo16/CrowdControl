@@ -9,6 +9,16 @@ Orchestrate many [Claude Code](https://github.com/anthropics/claude-code) / [Ope
 
 Built on [net_runner](https://hex.pm/packages/net_runner) for zero-zombie subprocess management with NIF-based backpressure. Security disclosures: see [`SECURITY.md`](SECURITY.md). Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). Runnable examples: [`examples/`](https://github.com/nyo16/CrowdControl/tree/master/examples).
 
+**How it works**, beyond the option tables below — architecture, sandbox internals, providers and
+day-two operations:
+
+| Guide | Answers |
+|-------|---------|
+| [`docs/architecture.md`](docs/architecture.md) | What the four layers are, what each is forbidden to know, and how a prompt travels end to end |
+| [`docs/sandboxes.md`](docs/sandboxes.md) | How a sandbox actually works: the FIFO and tee file, byte-exact resume, why PID 1 relays the CLI's exit status, and the HTTP-agent alternative |
+| [`docs/providers.md`](docs/providers.md) | The three substrates a sandbox can live on — container, Compose stack, GCE spot VM — and what each costs you |
+| [`docs/operations.md`](docs/operations.md) | Store and reaper, reattach across a node restart, log redaction, and what to alarm on |
+
 ```mermaid
 graph LR
     CC[CrowdControl] --> S1[claude #1]

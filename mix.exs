@@ -80,7 +80,9 @@ defmodule CrowdControl.MixProject do
         "Changelog" => "#{@source_url}/blob/master/CHANGELOG.md",
         "Security" => "#{@source_url}/blob/master/SECURITY.md"
       },
-      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE SECURITY.md)
+      # CONTRIBUTING.md is here because `docs.extras` names it: without it in the
+      # tarball, `mix docs` fails for anyone who unpacks the package.
+      files: ~w(lib docs mix.exs README.md CHANGELOG.md CONTRIBUTING.md LICENSE SECURITY.md)
     ]
   end
 
@@ -91,9 +93,16 @@ defmodule CrowdControl.MixProject do
       source_ref: "v#{@version}",
       extras: [
         "README.md",
+        "docs/architecture.md",
+        "docs/sandboxes.md",
+        "docs/providers.md",
+        "docs/operations.md",
         "CHANGELOG.md",
         "SECURITY.md",
         "CONTRIBUTING.md"
+      ],
+      groups_for_extras: [
+        Guides: ~r/^docs\//
       ],
       groups_for_modules: [
         Core: [CrowdControl, CrowdControl.Session],
