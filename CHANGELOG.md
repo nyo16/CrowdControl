@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Added
+
+- **`:volumes` — one mount shape for every substrate**, accepted by
+  `Backend.Docker`, `Backend.Kubernetes`, `Provider.Docker` and
+  `Provider.Compose`: `[%{name: "workspace", target: "/workspace"}]`. `:name` is
+  a Docker named volume or a Kubernetes PersistentVolumeClaim, `:host_path` is a
+  bind mount or a `hostPath`, and the rules live in one place
+  (`CrowdControl.Volume`) so the three cannot drift. Nothing is created for you
+  — except by `Provider.Compose`, which already declared and owned its named
+  volumes and now also accepts a host path.
+
+  Refused before any container, Pod or NetworkPolicy exists: relative paths,
+  both source keys at once, duplicate targets, and any target that shadows the
+  FIFO, tee or env path *or a directory holding one*. That last one is the
+  reason the check exists — mounting over the FIFO yields a sandbox that starts
+  and then delivers nothing, which reads as a hang rather than a mistake.
+
+  Verified end to end rather than in a manifest: a Docker named volume written
+  by one sandbox and read back by a second, a Kubernetes `hostPath` written by
+  one Pod and read by another, and both agents driven against a live
+  OpenAI-compatible endpoint from inside a container and a Pod with their
+  configuration supplied *by* a mount — `claude` 2.1.252 via
+  `CLAUDE_CONFIG_DIR`, `omp` 18.0.11 via `:agent_dir`.
+
 ### Fixed
 
 - **A tagged release with a mismatched CHANGELOG heading is now refused before

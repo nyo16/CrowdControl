@@ -51,6 +51,8 @@ defmodule CrowdControl.Provider.Docker do
     * `:agent_port` — the port `sandboxd` listens on inside the container,
       default `8080`
     * `:capture_path` — default `/var/log/cc/out.jsonl`
+    * `:volumes` — mounts, `[%{name: "workspace", target: "/workspace"}]`, in
+      the shape every substrate takes; see `CrowdControl.Volume`
     * `:ready_timeout` — how long `acquire/1` waits for `GET /v1/health`,
       default `30_000`
     * `:docker_host`, `:timeout` — as `CrowdControl.Backend.Docker.API`
@@ -129,7 +131,10 @@ defmodule CrowdControl.Provider.Docker do
         config: opts
       }
 
-      start(handle, egress)
+      case CrowdControl.Volume.normalize(opts, [handle.capture_path]) do
+        {:ok, _mounts} -> start(handle, egress)
+        {:error, reason} -> {:error, {:docker, reason}}
+      end
     end
   end
 
@@ -212,7 +217,10 @@ defmodule CrowdControl.Provider.Docker do
         "Labels" => labels(handle),
         "HostConfig" =>
           handle.config
-          |> HostConfig.build(network_mode: handle.network_name)
+          |> HostConfig.build(
+            network_mode: handle.network_name,
+            volumes: CrowdControl.Volume.normalize!(handle.config, [handle.capture_path])
+          )
           |> Map.put("PortBindings", %{
             # HostIp is mandatory, not cosmetic: omitting it yields TWO
             # bindings (IPv4 + IPv6) bound to every interface, which publishes

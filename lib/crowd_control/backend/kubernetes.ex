@@ -158,6 +158,11 @@ defmodule CrowdControl.Backend.Kubernetes do
     * `:tee_path` — default `/var/log/cc/out.jsonl`
     * `:fifo_path` — default `/var/run/cc.fifo`
     * `:env_path` — default `/var/run/cc.env`
+    * `:volumes` — mounts, `[%{name: "ws-claim", target: "/workspace"}]`. One
+      shape across every substrate; see `CrowdControl.Volume`. Here a `:name`
+      is a **PersistentVolumeClaim** that must already exist and be bound, and
+      a `:host_path` is a `hostPath`. Neither is created for you: provisioning
+      storage needs RBAC that running sandboxes does not justify
     * `:timeout` — HTTP receive timeout, default 30s
     * `:exec_timeout` — wall-clock bound on every short exec, default 15s
     * `:provision_timeout` — wall-clock bound on reaching `Running`, default 120s
@@ -305,11 +310,21 @@ defmodule CrowdControl.Backend.Kubernetes do
         config: opts
       }
 
-      with :ok <- network_preflight!(handle),
+      # First, because it is the only one of these that costs nothing to check
+      # and everything below it creates cluster objects.
+      with :ok <- validate_volumes(handle),
+           :ok <- network_preflight!(handle),
            :ok <- ensure_network_policy(handle),
            :ok <- create_pod(handle) do
         {:ok, handle}
       end
+    end
+  end
+
+  defp validate_volumes(handle) do
+    case CrowdControl.Volume.normalize(handle.config, mount_paths(handle) ++ [handle.env_path]) do
+      {:ok, _mounts} -> :ok
+      {:error, reason} -> {:error, {:k8s, reason}}
     end
   end
 
@@ -642,7 +657,19 @@ defmodule CrowdControl.Backend.Kubernetes do
   end
 
   defp volume_mounts(handle) do
-    for path <- mount_paths(handle), do: %{"name" => volume_name(path), "mountPath" => path}
+    transport =
+      for path <- mount_paths(handle), do: %{"name" => volume_name(path), "mountPath" => path}
+
+    user =
+      for {mount, i} <- Enum.with_index(user_volumes(handle)) do
+        %{
+          "name" => user_volume_name(i),
+          "mountPath" => mount.target,
+          "readOnly" => mount.read_only
+        }
+      end
+
+    transport ++ user
   end
 
   # Disk-backed and unbounded by default, so the tee file is no more capped than
@@ -653,17 +680,47 @@ defmodule CrowdControl.Backend.Kubernetes do
   defp volumes(handle) do
     sizes = handle.config[:volume_sizes] || @default_volume_sizes
 
-    for path <- mount_paths(handle) do
+    transport =
+      for path <- mount_paths(handle) do
+        body =
+          if handle.config[:readonly_rootfs] do
+            %{"medium" => "Memory", "sizeLimit" => sizes[path] || "64Mi"}
+          else
+            %{}
+          end
+
+        %{"name" => volume_name(path), "emptyDir" => body}
+      end
+
+    transport ++ user_volume_specs(handle)
+  end
+
+  # `:name` is a PersistentVolumeClaim and `:host_path` is a hostPath, which are
+  # the two things a Kubernetes Pod can mount without this library provisioning
+  # storage on the caller's behalf. The claim must already exist and be bound:
+  # creating one needs `persistentvolumeclaims` RBAC and leaves an object behind
+  # that outlives the sandbox, which is a lifecycle this backend does not own.
+  defp user_volume_specs(handle) do
+    for {mount, i} <- Enum.with_index(user_volumes(handle)) do
       body =
-        if handle.config[:readonly_rootfs] do
-          %{"medium" => "Memory", "sizeLimit" => sizes[path] || "64Mi"}
-        else
-          %{}
+        case mount.kind do
+          :volume -> %{"persistentVolumeClaim" => %{"claimName" => mount.source}}
+          :host_path -> %{"hostPath" => %{"path" => mount.source}}
         end
 
-      %{"name" => volume_name(path), "emptyDir" => body}
+      Map.put(body, "name", user_volume_name(i))
     end
   end
+
+  defp user_volumes(handle) do
+    CrowdControl.Volume.normalize!(handle.config, mount_paths(handle) ++ [handle.env_path])
+  end
+
+  # Indexed rather than derived from the source: a PVC name may be up to 253
+  # characters and a volume name must be a 63-character RFC 1123 label, so
+  # deriving one would need truncation, and truncation collides. The mountPath
+  # in the same manifest is what identifies it to a reader.
+  defp user_volume_name(index), do: "cc-vol-#{index}"
 
   defp volume_name("/" <> rest), do: "cc-" <> String.replace(rest, "/", "-")
 

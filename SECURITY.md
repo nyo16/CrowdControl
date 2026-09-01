@@ -301,6 +301,41 @@ filter. The return path is separately bounded — see
 `CrowdControl.Backend.Kubernetes.API`'s exception_reason/1, which keeps the same
 material out of the error *term*.
 
+## Mounted volumes
+
+`:volumes` is accepted by `Backend.Docker`, `Backend.Kubernetes`,
+`Provider.Docker` and `Provider.Compose` in one shape — see
+`CrowdControl.Volume`. Two of its keys have very different blast radii, which
+is why they are two keys and not one `:source`.
+
+`:name` is managed storage: a Docker named volume, or a Kubernetes
+PersistentVolumeClaim. The sandbox reaches exactly that volume and nothing
+else, and a compromised sandbox can corrupt its contents — which matters if
+another session mounts the same one, since a poisoned workspace is an
+injection channel into the *next* agent that reads it.
+
+`:host_path` is a hole into the machine: a Docker bind mount, or a Kubernetes
+`hostPath`. Under `read_only: true` it is a disclosure boundary; without it, a
+write boundary. **Untrusted model-driven code plus a writable host mount is
+not a sandbox**, and some targets end the discussion entirely —
+`/var/run/docker.sock` is root on the host, and a kubelet or containerd
+directory is the node. Nothing here validates *which* path you mount, because
+a blocklist of escape-equivalent paths cannot be complete; the decision is the
+caller's, and it should be `:name` unless a host path is genuinely required.
+
+What is enforced: no relative paths on either side, exactly one source per
+mount, no duplicate targets, and no target that shadows `:fifo_path`,
+`:tee_path`, `:env_path` or a directory containing one. That last check is not
+cosmetic — mounting over the FIFO produces a sandbox that starts, blocks on a
+FIFO nobody writes, and delivers nothing, which reads as a hang rather than a
+configuration error. All of it is refused before any container, Pod or
+NetworkPolicy is created.
+
+Nothing is created for you. `Provider.Compose` is the exception and only for
+`:name`, because a Compose stack declares its own volumes and destroys them
+with the stack; everywhere else the storage must already exist, for the same
+reason this library does not create Kubernetes namespaces.
+
 ## Sandbox agent transport
 
 `CrowdControl.Backend.Sandboxd` drives a CLI over HTTP to `sandboxd`, an OTP

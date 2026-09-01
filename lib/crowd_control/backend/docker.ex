@@ -78,6 +78,11 @@ defmodule CrowdControl.Backend.Docker do
     * `:cpus` — fractional CPU limit, e.g. `1.5`
     * `:memory` — byte limit, e.g. `512 * 1024 * 1024`
     * `:tee_path` — default `/var/log/cc/out.jsonl`
+    * `:volumes` — mounts, `[%{name: "workspace", target: "/workspace"}]`. One
+      shape across every substrate; see `CrowdControl.Volume`. A `:name` is a
+      Docker named volume that must already exist, a `:host_path` is a bind
+      mount, and a target that shadows the FIFO or tee file is refused before
+      the container is created
     * `:fifo_path` — default `/var/run/cc.fifo`
     * `:max_stream_bytes` — cap on total output; `nil` (default) is unbounded
     * `:max_inflight_bytes` — reader backpressure watermark, default 4 MiB
@@ -186,10 +191,20 @@ defmodule CrowdControl.Backend.Docker do
         config: opts
       }
 
-      with {:ok, id} <- create_container(handle),
+      # Before the container exists: a bad mount should cost nothing, and
+      # `host_config/1` downstream raises rather than returning on one.
+      with :ok <- validate_volumes(handle),
+           {:ok, id} <- create_container(handle),
            :ok <- start_container(handle, id) do
         {:ok, %{handle | container_id: id}}
       end
+    end
+  end
+
+  defp validate_volumes(handle) do
+    case CrowdControl.Volume.normalize(handle.config, reserved_paths(handle)) do
+      {:ok, _mounts} -> :ok
+      {:error, reason} -> {:error, {:docker, reason}}
     end
   end
 
@@ -264,7 +279,17 @@ defmodule CrowdControl.Backend.Docker do
   # Provider.Docker. Two copies of these defaults would drift, and a sandbox
   # that silently lost CapDrop: ALL is indistinguishable from one that did not.
   defp host_config(handle) do
-    HostConfig.build(handle.config, network_mode: network_mode(handle.config))
+    HostConfig.build(handle.config,
+      network_mode: network_mode(handle.config),
+      volumes: CrowdControl.Volume.normalize!(handle.config, reserved_paths(handle))
+    )
+  end
+
+  # The FIFO, the tee file and the two files PID 1 polls. A mount over any of
+  # them, or over a directory holding one, yields a sandbox that starts and
+  # then never delivers a byte.
+  defp reserved_paths(handle) do
+    [handle.fifo_path, handle.tee_path, status_path(handle), launcher_pid_path(handle)]
   end
 
   # Deliberately never infers `"bridge"`. Reaching an egress proxy does require

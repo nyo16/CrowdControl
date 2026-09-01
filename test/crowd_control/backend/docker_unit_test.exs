@@ -198,6 +198,67 @@ defmodule CrowdControl.Backend.DockerUnitTest do
     end
   end
 
+  describe "volume mounts (blocker: a mount that shadows the FIFO)" do
+    alias CrowdControl.Backend.Docker.HostConfig
+
+    test "no Binds key at all when nothing is mounted" do
+      # An empty list would be harmless to the Engine but would show up in
+      # `docker inspect` as a deliberate choice nobody made.
+      refute Map.has_key?(HostConfig.build([], network_mode: "none"), "Binds")
+    end
+
+    test "a named volume and a host path both become Binds, with the mode" do
+      # Mounts arrive already normalized, through opts — the same way both
+      # Docker call sites pass them. HostConfig never reads :volumes out of
+      # config, because Provider.Compose's config uses that key for stack-level
+      # volume declarations and would be silently reinterpreted.
+      mounts =
+        CrowdControl.Volume.normalize!(
+          [
+            volumes: [
+              %{name: "workspace", target: "/workspace"},
+              %{host_path: "/srv/fixtures", target: "/fixtures", read_only: true}
+            ]
+          ],
+          []
+        )
+
+      assert HostConfig.build([], network_mode: "none", volumes: mounts)["Binds"] ==
+               ["workspace:/workspace:rw", "/srv/fixtures:/fixtures:ro"]
+    end
+
+    test "a Compose-style :volumes in config is never reinterpreted as mounts" do
+      # The collision this layering exists to prevent: Compose declares
+      # [%{name: "workspace"}] with no target, and builds its own Binds.
+      refute Map.has_key?(
+               HostConfig.build([volumes: [%{name: "workspace"}]], network_mode: "none"),
+               "Binds"
+             )
+    end
+
+    test "provision/1 refuses a mount over the FIFO before creating a container" do
+      # No daemon is touched: the gate runs on the handle's own paths, and the
+      # error names Docker so a caller can match on it like any other.
+      assert {:error, {:docker, {:invalid_volume, _, {:reserved_target, "/var/run/cc.fifo"}}}} =
+               Docker.provision(
+                 image: "alpine:latest",
+                 network_mode: "none",
+                 session_key: Store.new_key(),
+                 volumes: [%{name: "w", target: "/var/run/cc.fifo"}]
+               )
+    end
+
+    test "the tee directory is refused as well, since mounting it hides the file" do
+      assert {:error, {:docker, {:invalid_volume, _, {:reserved_target, "/var/log/cc"}}}} =
+               Docker.provision(
+                 image: "alpine:latest",
+                 network_mode: "none",
+                 session_key: Store.new_key(),
+                 volumes: [%{name: "w", target: "/var/log/cc"}]
+               )
+    end
+  end
+
   describe "API.transport/1" do
     alias CrowdControl.Backend.Docker.API
 

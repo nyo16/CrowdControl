@@ -64,8 +64,11 @@ defmodule CrowdControl.Provider.Compose do
       `socat` on `PATH` works; the provider sets `Entrypoint` itself.
     * `:network` — `[internal: true, driver: "bridge", options: %{}]`. See the
       warning below.
-    * `:volumes` — named volume declarations, `[%{name: "workspace"}]`. Created
-      as `<project>-<name>` and destroyed with the stack.
+    * `:volumes` — named volume *declarations*, `[%{name: "workspace"}]`.
+      Created as `<project>-<name>` and destroyed with the stack. Note this is
+      a declaration list, not a mount list: a service mounts one by naming it
+      in its own `:volumes`, and only Compose creates the storage it mounts —
+      Docker and Kubernetes expect it to exist already.
     * `:ready` — per-service healthchecks, `%{"db" => %{test: [...]}}`.
     * `:project_name` — default `"cc-<session_key>"`.
     * `:proxy_service` — the sidecar fronting the egress proxy. See below.
@@ -92,7 +95,10 @@ defmodule CrowdControl.Provider.Compose do
         entrypoint: ["/proxy"],             # optional
         command: ["--listen", ":8080"],     # optional
         env: %{"LOG_LEVEL" => "info"},      # optional
-        volumes: [%{name: "cache", target: "/cache", read_only: false}],
+        volumes: [                          # see `CrowdControl.Volume`
+          %{name: "cache", target: "/cache", read_only: false},
+          %{host_path: "/srv/in", target: "/in", read_only: true}
+        ],
         depends_on: ["db"],                 # optional, topologically ordered
         user: "1000:1000",                  # optional
         port: 8080                          # only read for :proxy_service
@@ -506,7 +512,13 @@ defmodule CrowdControl.Provider.Compose do
   defp binds(handle, service) do
     Enum.map(service.mounts, fn mount ->
       suffix = if mount.read_only, do: ":ro", else: ""
-      "#{handle.project}-#{mount.name}:#{mount.target}#{suffix}"
+
+      # A named volume is namespaced by the project, because the stack created
+      # it and destroys it. A host path is the host's, and prefixing it would
+      # name a directory that does not exist.
+      source = mount.host_path || "#{handle.project}-#{mount.name}"
+
+      "#{source}:#{mount.target}#{suffix}"
     end)
   end
 
@@ -1143,15 +1155,22 @@ defmodule CrowdControl.Provider.Compose do
 
   defp binary_pair?({key, value}), do: is_binary(key) and is_binary(value)
 
+  # The shape rules live in `CrowdControl.Volume` so Compose, Docker and
+  # Kubernetes cannot drift on what a mount is. What stays here is Compose's
+  # own vocabulary for a bad one, and the fact that a `:name` must be a volume
+  # this stack declared — see `validate_mounts/2`, which a host path skips
+  # because there is nothing to declare.
   defp spec_mounts(spec, name) do
     collect(Map.get(spec, :volumes, []), fn mount ->
-      with true <- is_map(mount),
-           volume when is_binary(volume) <- Map.get(mount, :name),
-           target when is_binary(target) <- Map.get(mount, :target),
-           true <- String.starts_with?(target, "/") do
-        {:ok, %{name: volume, target: target, read_only: !!Map.get(mount, :read_only, false)}}
-      else
-        _ -> {:error, {:compose, {:bad_mount, {name, mount}}}}
+      case CrowdControl.Volume.normalize([volumes: [mount]], []) do
+        {:ok, [%{kind: :volume, source: volume, target: target, read_only: read_only}]} ->
+          {:ok, %{name: volume, host_path: nil, target: target, read_only: read_only}}
+
+        {:ok, [%{kind: :host_path, source: path, target: target, read_only: read_only}]} ->
+          {:ok, %{name: nil, host_path: path, target: target, read_only: read_only}}
+
+        {:error, _reason} ->
+          {:error, {:compose, {:bad_mount, {name, mount}}}}
       end
     end)
   end
@@ -1230,7 +1249,14 @@ defmodule CrowdControl.Provider.Compose do
     declared = MapSet.new(volumes, & &1.name)
 
     each_ok(services, fn service ->
-      case Enum.find(service.mounts, &(not MapSet.member?(declared, &1.name))) do
+      # A host path has nothing to declare; only a named volume must exist in
+      # the stack, because the stack is what creates and destroys it.
+      undeclared =
+        Enum.find(service.mounts, fn mount ->
+          mount.name != nil and not MapSet.member?(declared, mount.name)
+        end)
+
+      case undeclared do
         nil -> :ok
         mount -> {:error, {:compose, {:unknown_volume, mount.name}}}
       end

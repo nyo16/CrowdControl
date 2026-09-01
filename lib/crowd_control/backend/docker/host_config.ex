@@ -59,6 +59,13 @@ defmodule CrowdControl.Backend.Docker.HostConfig do
 
   Recognised keys in `config`: `:cap_drop`, `:security_opt`, `:pids_limit`,
   `:cpus`, `:memory`, `:readonly_rootfs`, `:tmpfs`.
+
+  Mounts arrive through `opts` as `:volumes`, already normalized by
+  `CrowdControl.Volume.normalize/2` — deliberately not read out of `config`.
+  `CrowdControl.Provider.Compose` passes its own `config` here and its
+  top-level `:volumes` means something else entirely (stack-level volume
+  *declarations*, which it creates and mounts itself), so scraping the key
+  would silently reinterpret one caller's option as another's.
   """
   @spec build(keyword(), keyword()) :: map()
   def build(config, opts) do
@@ -73,6 +80,22 @@ defmodule CrowdControl.Backend.Docker.HostConfig do
     |> maybe_put("NanoCpus", config[:cpus] && trunc(config[:cpus] * 1_000_000_000))
     |> maybe_put("Memory", config[:memory])
     |> put_readonly_rootfs(config)
+    |> put_binds(Keyword.get(opts, :volumes, []))
+  end
+
+  # `Binds` rather than `Mounts`: both reach the same place, and the string form
+  # is what `docker inspect` shows, so a mount asserted in a test reads the same
+  # as one a human looks up. A named volume and a bind differ only in whether
+  # the source is a path, which is exactly how the Engine tells them apart too.
+  defp put_binds(host_config, []), do: host_config
+
+  defp put_binds(host_config, mounts) do
+    binds =
+      Enum.map(mounts, fn mount ->
+        "#{mount.source}:#{mount.target}:#{if mount.read_only, do: "ro", else: "rw"}"
+      end)
+
+    Map.put(host_config, "Binds", binds)
   end
 
   @doc """

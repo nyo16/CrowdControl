@@ -1001,6 +1001,7 @@ CrowdControl.start_session(
 | `:tee_path` | `/var/log/cc/out.jsonl` | Where output is recorded |
 | `:fifo_path` | `/var/run/cc.fifo` | Where prompts are written |
 | `:max_stream_bytes` | `nil` (unbounded) | Destroys the sandbox past this much total output |
+| `:volumes` | `[]` | Mounts — see [Mounting volumes](#mounting-volumes) |
 | `:max_inflight_bytes` | 4 MiB | Reader backpressure watermark |
 | `:proxy_url`, `:session_token` | unset | Egress proxy — see [SECURITY.md](SECURITY.md#egress-proxy-contract) |
 
@@ -1066,6 +1067,7 @@ CrowdControl.start_session(
 | `:tee_path` | `/var/log/cc/out.jsonl` | Where output is recorded |
 | `:fifo_path` | `/var/run/cc.fifo` | Where prompts are written |
 | `:env_path` | `/var/run/cc.env` | Env file, written over exec stdin and unlinked before the CLI starts |
+| `:volumes` | `[]` | Mounts; `:name` is a **PersistentVolumeClaim** here — see [Mounting volumes](#mounting-volumes) |
 | `:timeout` | 30s | HTTP receive timeout |
 | `:exec_timeout` | 15s | Wall-clock bound on every short exec |
 | `:provision_timeout` | 120s | Wall-clock bound on reaching `Running` |
@@ -1239,6 +1241,82 @@ Two safety properties are worth knowing about, because both are load-bearing:
 - Containers are labelled with `:owner_id` and the reaper only destroys its
   own. Two nodes cannot reap each other's work.
 
+### Mounting volumes
+
+A sandbox is empty on purpose: the CLI, a FIFO, a tee file, nothing else.
+Mounting is how a workspace, a package cache or a directory of fixtures gets
+in. One shape works on every substrate — see `CrowdControl.Volume`:
+
+```elixir
+volumes: [
+  %{name: "workspace", target: "/workspace"},
+  %{host_path: "/srv/fixtures", target: "/fixtures", read_only: true}
+]
+```
+
+| Key | Meaning |
+|---|---|
+| `:name` | Managed storage: a Docker named volume, or a Kubernetes `PersistentVolumeClaim` |
+| `:host_path` | A path on the machine running the container: a Docker bind mount, or a Kubernetes `hostPath` |
+| `:target` | Absolute path inside the sandbox. **Required** |
+| `:read_only` | Default `false` |
+
+They are separate keys rather than one overloaded `:source` because they are
+not the same decision, and a review can grep for one without the other.
+
+**Nothing is created for you.** A `:name` must already exist — a Docker volume,
+or a *bound* PVC. `Provider.Compose` is the one exception, because a Compose
+stack declares and owns its named volumes: declare them in the stack's
+top-level `:volumes` and mount them from a service's own `:volumes`.
+
+Refused before anything is created, rather than at the API server:
+
+- a target that is not absolute, or a relative `:host_path` — the Docker CLI
+  resolves those against the shell's cwd, the Engine API and Kubernetes do not
+  resolve them at all;
+- both `:name` and `:host_path` on one mount;
+- two mounts on the same target — Docker takes the last, Kubernetes rejects the
+  Pod, so the same config would behave differently per substrate;
+- a target that shadows `:fifo_path`, `:tee_path` or `:env_path`, **or a
+  directory holding one**. That mount does not fail loudly: the sandbox starts,
+  the CLI blocks on a FIFO nobody writes, and the reader delivers nothing.
+
+> **A writable `:host_path` is not a sandbox.** It hands model-driven code part
+> of the machine's filesystem; `/var/run/docker.sock` or a kubelet directory is
+> a full escape. Prefer `:name`, and `read_only: true` when a host path is
+> genuinely needed. See [SECURITY.md](SECURITY.md).
+
+#### Getting a real CLI to run in a sandbox
+
+Mounting is what makes an agent's own configuration reach the sandbox, and both
+CLIs need something. Measured against a container and a Pod running
+`claude` 2.1.252 and `omp` 18.0.11 on a local OpenAI-compatible endpoint:
+
+```elixir
+# omp: render the provider dir on the host, mount it, name the in-sandbox path.
+# It must be WRITABLE — omp opens a SQLite database inside it, and a read-only
+# mount fails with "Cannot open an anonymous database in read-only mode".
+dir = CrowdControl.Agent.Omp.provider_dir!(base_url: "http://…/v1", api_key: key)
+
+CrowdControl.run("…",
+  backend: {CrowdControl.Backend.Docker, image: "my-agents:latest",
+            network_mode: "bridge",
+            volumes: [%{host_path: dir, target: "/agent"}]},
+  agent: :omp, agent_dir: "/agent",
+  # :agent_dir and :custom_provider are mutually exclusive, so the key the
+  # rendered models.yml refers to has to be supplied here.
+  env: %{"OMP_CUSTOM_PROVIDER_KEY" => key},
+  model: "vllm/…")
+```
+
+For Claude Code, mount a config directory and point `CLAUDE_CONFIG_DIR` at it —
+a clean container has no cached feature flags and negotiates differently against
+a non-Anthropic endpoint. **Do not pass
+`permission_mode: "bypassPermissions"` in a container that runs as root:**
+Claude Code refuses `--dangerously-skip-permissions` under uid 0 and exits
+immediately, which surfaces as `{:error, :session_exited}`. Either drop it or
+set `:user` (Docker) / `:run_as_user` (Kubernetes).
+
 ### The tee-file contract
 
 This is the part to understand before changing anything in the Docker backend.
@@ -1355,6 +1433,7 @@ file, so [the tee-file contract](#the-tee-file-contract) applies here unchanged
 | `:ready_timeout` | `30_000` | How long `acquire/1` waits for `GET /v1/health` |
 | `:docker_host`, `:timeout` | as `Backend.Docker` | |
 | `:agent_env` | `%{}` | Extra env for the *agent*, not the CLI |
+| `:volumes` | `[]` | Mounts, `[%{name: "workspace", target: "/workspace"}]` — see [Mounting volumes](#mounting-volumes) |
 
 Hardening options are identical to the Docker backend's and come from the same
 module, so the two cannot drift.
@@ -1397,7 +1476,7 @@ endpoints, so the stack is synthesized directly.
 | `:sandbox_service` | `"sandbox"` | |
 | `:forwarder_service` / `:forwarder_image` | `"forwarder"` / `alpine/socat:1.8.1.3` | Always synthesized, never caller-supplied |
 | `:network` | `[internal: true, driver: "bridge"]` | |
-| `:volumes` | `[]` | Named `<project>-<name>`, destroyed with the stack |
+| `:volumes` | `[]` | Named volume **declarations**, created as `<project>-<name>` and destroyed with the stack. A service mounts one through its own `:volumes` — see [Mounting volumes](#mounting-volumes) |
 | `:ready` | `%{}` | Per-service healthchecks, gating start order |
 | `:project_name` | `cc-<session_key>` | |
 | `:proxy_service` | unset | Sidecar fronting the egress proxy |
@@ -1460,11 +1539,6 @@ backstop: the reaper runs on the BEAM, so if the node dies mid-provision nothing
 local knows the VM exists, and a leaked spot VM bills forever. No service
 account is attached unless you ask for one — with one, the sandboxed CLI can
 mint project credentials from the metadata server.
-
-> `:ready_timeout`'s default is an **estimate, not a measurement.** The billable
-> end-to-end spike that would have measured operation-DONE → SSH-ready →
-> agent-healthy was never run. Measure it against your own image and machine
-> type before trusting it in production.
 
 See [SECURITY.md](SECURITY.md#sandbox-agent-transport) for the full posture of
 all three, including the regressions each carries relative to the others.

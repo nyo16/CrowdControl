@@ -318,6 +318,68 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
     end
   end
 
+  describe "volume mounts (blocker: a mount that shadows the FIFO)" do
+    test "nothing user-supplied appears when nothing is asked for" do
+      spec = Kubernetes.pod_manifest(handle())["spec"]
+
+      assert Enum.all?(spec["volumes"], &Map.has_key?(&1, "emptyDir")),
+             "only the transport's own emptyDirs should be present"
+    end
+
+    test ":name is a PersistentVolumeClaim and :host_path is a hostPath" do
+      # The two Kubernetes can mount without this library provisioning storage.
+      spec =
+        handle(
+          volumes: [
+            %{name: "ws-claim", target: "/workspace"},
+            %{host_path: "/srv/fixtures", target: "/fixtures", read_only: true}
+          ]
+        )
+        |> Kubernetes.pod_manifest()
+        |> Map.fetch!("spec")
+
+      user = Enum.filter(spec["volumes"], &String.starts_with?(&1["name"], "cc-vol-"))
+
+      assert user == [
+               %{"name" => "cc-vol-0", "persistentVolumeClaim" => %{"claimName" => "ws-claim"}},
+               %{"name" => "cc-vol-1", "hostPath" => %{"path" => "/srv/fixtures"}}
+             ]
+    end
+
+    test "each mount carries its target and its mode into the container" do
+      manifest =
+        Kubernetes.pod_manifest(
+          handle(
+            volumes: [
+              %{name: "ws-claim", target: "/workspace"},
+              %{host_path: "/srv/fixtures", target: "/fixtures", read_only: true}
+            ]
+          )
+        )
+
+      mounts =
+        manifest
+        |> container()
+        |> Map.fetch!("volumeMounts")
+        |> Enum.filter(&String.starts_with?(&1["name"], "cc-vol-"))
+
+      assert mounts == [
+               %{"name" => "cc-vol-0", "mountPath" => "/workspace", "readOnly" => false},
+               %{"name" => "cc-vol-1", "mountPath" => "/fixtures", "readOnly" => true}
+             ]
+    end
+
+    test "provision/1 refuses a mount over a transport path before creating anything" do
+      # Ordered before network_preflight!/1 deliberately: a bad mount must not
+      # cost a NetworkPolicy that then has to be rolled back.
+      assert {:error, {:k8s, {:invalid_volume, _, {:reserved_target, "/var/run/cc.env"}}}} =
+               Kubernetes.provision(
+                 image: "busybox:1.36",
+                 volumes: [%{name: "w", target: "/var/run/cc.env"}]
+               )
+    end
+  end
+
   describe "pod events (blocker: a failure the cluster explained and we did not)" do
     test "the Pod's own events are requested, scoped to it" do
       # A cluster-wide event list would be both enormous and wrong.
