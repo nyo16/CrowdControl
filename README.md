@@ -1055,7 +1055,7 @@ CrowdControl.start_session(
 | Option | Default | Notes |
 |--------|---------|-------|
 | `:image` | — | **Required.** Needs the CLI plus `sh`, `tail`, `tee` and `head` on `PATH` — busybox and coreutils both suffice |
-| `:namespace` | kubeconfig context's namespace, else `"default"` | |
+| `:namespace` | kubeconfig context's namespace, else `"default"` | **Must already exist — the backend never creates one.** Creating namespaces needs cluster-scoped RBAC, which is a larger grant than running sandboxes justifies; see below |
 | `:kubeconfig` | `Kubereq.Kubeconfig.Default` | A `%Kubereq.Kubeconfig{}`, a pipeline module, or `{module, opts}`. The default covers both a developer's `~/.kube/config` and an in-cluster ServiceAccount |
 | `:network` | — | `:deny_all` \| `{:policy, name}` \| `:unrestricted`. **Required** when `:proxy_url`/`:api_url` is set — see below |
 | `:network_probe` | `true` | `false` skips the `:deny_all` enforcement probe, for callers who already know their CNI enforces |
@@ -1082,6 +1082,9 @@ Hardening:
 | `:run_as_user` / `:run_as_group` | image default | Opt-in; also sets `runAsNonRoot` (for a non-zero uid) and the Pod's `fsGroup`, so the `emptyDir` volumes are writable |
 | `:readonly_rootfs` | `false` | Opt-in. The fifo and tee directories are `emptyDir` volumes either way (the init container has to hand the FIFO across), so this is a pure toggle: it makes them in-memory (`medium: Memory`) and adds `/tmp` |
 | `:volume_sizes` | `64Mi`, `/var/run` `8Mi` | `sizeLimit` per mount path; used only under `:readonly_rootfs` |
+| `:runtime_class` | unset | `runtimeClassName` — `"gvisor"`, `"kata"`. The only option here that changes **which kernel** the container talks to; see below |
+| `:node_selector` | unset | Map of node labels, e.g. `%{"sandbox.gke.io/runtime" => "gvisor"}` |
+| `:tolerations` | unset | Raw toleration maps, for the tainted node pools sandbox runtimes run on |
 
 `automountServiceAccountToken: false` and `enableServiceLinks: false` are not
 options — a projected API token inside a sandbox running untrusted model-driven
@@ -1091,6 +1094,43 @@ equivalent**: there is no `PidsLimit` (`podPidsLimit` is node-level kubelet
 config) and `emptyDir` cannot be mounted `noexec,nosuid`. Both are stated in
 [SECURITY.md](SECURITY.md#the-kubernetes-backend) rather than silently dropped;
 read that before running this against untrusted output.
+
+**Sandbox runtimes are the kernel boundary, and they are opt-in.** Everything in
+the table above narrows what the container may *ask* of a kernel it still shares
+with the host; one container escape defeats the lot together. A RuntimeClass
+changes which kernel answers the syscall at all — gVisor's `runsc` handles them
+in userspace, Kata gives the Pod its own VM:
+
+```elixir
+{CrowdControl.Backend.Kubernetes,
+  image: "my-cli:latest",
+  network: :deny_all,
+  runtime_class: "gvisor",
+  # A RuntimeClass alone is usually not enough: sandbox node pools are tainted,
+  # and a Pod that cannot tolerate the taint sits Pending until
+  # :provision_timeout. GKE Sandbox uses this pair.
+  node_selector: %{"sandbox.gke.io/runtime" => "gvisor"},
+  tolerations: [
+    %{"key" => "sandbox.gke.io/runtime", "operator" => "Equal",
+      "value" => "gvisor", "effect" => "NoSchedule"}
+  ]}
+```
+
+It is never defaulted, because the RuntimeClass admission controller rejects a
+Pod naming one the cluster does not have — measured, verbatim: `pods "cc-…" is
+forbidden: pod rejected: RuntimeClass "gvisor" not found`. Guessing would turn
+every cluster without gVisor into a provisioning failure. What you need on the
+cluster side is a node pool running `runsc` or Kata and a matching `RuntimeClass`
+object; GKE Sandbox, and the SIG-Apps
+[Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project, both
+configure exactly this field.
+
+If the RuntimeClass exists but the *nodes* do not implement its handler, the Pod
+is admitted and never starts. That used to read as a bare
+`{:k8s, :provision_timeout}`; the backend now reports the cluster's own reason —
+`FailedCreatePodSandBox: … RuntimeHandler "gvisor" not supported` — because a
+Pod that never started has no logs and no container `waiting` message, and the
+explanation exists only in its events.
 
 **Network posture is never inferred.** A Pod always has cluster networking —
 there is no `NetworkMode: "none"` here — so `:network` is explicit, and omitting
@@ -1114,7 +1154,26 @@ RBAC the backend's identity needs, in `:namespace`:
 
     pods            create, get, list, delete
     pods/exec       create
+    events          list                    # only to explain a failed provision
     networkpolicies create, get, delete     # only under network: :deny_all
+
+**Namespace isolation is yours to provision, deliberately.** The backend runs
+every sandbox in `:namespace` and never creates, labels or deletes one: that
+would need cluster-scoped `namespaces` RBAC, and a library that can create
+namespaces can create them anywhere. Isolating a tenant is therefore a
+namespace you make, with a `ResourceQuota` and `LimitRange` on it, plus the
+`pod-security.kubernetes.io/enforce=restricted` label if you want the API
+server enforcing what this backend already sets:
+
+```bash
+kubectl create namespace sandboxes
+kubectl label namespace sandboxes pod-security.kubernetes.io/enforce=restricted
+kubectl -n sandboxes create quota cc --hard=pods=50
+```
+
+Then pass `namespace: "sandboxes"`. Per-*session* isolation is the Pod itself —
+one Pod per session, a deny-all NetworkPolicy under `:network`, and optionally a
+sandbox runtime above.
 
 Reaper configuration is the same shape as Docker's — the backend entry needs
 whatever `list_live/1` requires to reach the cluster and rebuild handles:

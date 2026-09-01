@@ -73,6 +73,7 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   @default_log_bytes 64 * 1024
 
   @pod_api [api_version: "v1", kind: "Pod"]
+  @event_api [api_version: "v1", kind: "Event"]
   @netpol_api [api_version: "networking.k8s.io/v1", kind: "NetworkPolicy"]
 
   # kubereq raises rather than returns in several places: a malformed kubeconfig
@@ -374,6 +375,33 @@ defmodule CrowdControl.Backend.Kubernetes.API do
         params: [gracePeriodSeconds: 0]
       )
     end)
+  end
+
+  @doc """
+  Warning-class events for one Pod.
+
+  The only place some failures exist. A Pod that never started has no logs, and
+  often no container `waiting.message` either — `FailedCreatePodSandBox:
+  RuntimeHandler "gvisor" not supported` is reported *only* as an event, so
+  without this a `:runtime_class` pointing at a runtime the nodes do not have
+  reads as a bare `:provision_timeout`.
+
+  This is diagnosis: the caller already holds a failure, so an unreadable event
+  stream returns `{:ok, []}` rather than replacing one error with another.
+  """
+  @spec pod_events(config(), String.t()) :: {:ok, [map()]}
+  def pod_events(config, pod_name) do
+    result =
+      run(fn ->
+        Kubereq.list(client(config, @event_api), namespace(config),
+          params: [fieldSelector: "involvedObject.name=#{pod_name}", limit: 32]
+        )
+      end)
+
+    case result do
+      {:ok, %{"items" => items}} when is_list(items) -> {:ok, items}
+      _ -> {:ok, []}
+    end
   end
 
   @doc """

@@ -165,6 +165,14 @@ defmodule CrowdControl.Backend.Kubernetes do
     * `:max_inflight_bytes` — reader backpressure watermark, default 4 MiB
     * `:proxy_url`, `:session_token` — see the egress proxy contract in
       `SECURITY.md`
+    * `:runtime_class` — `runtimeClassName`, e.g. `"gvisor"` or `"kata"`. This
+      is the Kubernetes-level sandboxing control and the only option here that
+      changes *which kernel* the container talks to; see "Sandbox runtimes"
+      below
+    * `:node_selector` — map of node labels, e.g.
+      `%{"sandbox.gke.io/runtime" => "gvisor"}`
+    * `:tolerations` — list of raw toleration maps, needed to schedule onto the
+      tainted node pools sandbox runtimes usually run on
 
   Hardening:
 
@@ -280,6 +288,7 @@ defmodule CrowdControl.Backend.Kubernetes do
   def provision(opts) do
     with :ok <- ensure_kubereq!(),
          :ok <- validate_network!(opts),
+         :ok <- validate_runtime!(opts),
          {:ok, image} <- fetch_image(opts),
          session_key = opts[:session_key] || Store.new_key(),
          {:ok, pod_name} <- pod_name(session_key),
@@ -356,10 +365,31 @@ defmodule CrowdControl.Backend.Kubernetes do
       [
         fn -> logs_detail(handle, []) end,
         fn -> logs_detail(handle, previous: true) end,
-        fn -> waiting_detail(handle) end
+        fn -> waiting_detail(handle) end,
+        fn -> events_detail(handle) end
       ],
       fn source -> source.() end
     )
+  end
+
+  # Last, because logs and a waiting message are more specific when they exist.
+  # But a Pod the node refused to start has neither: `FailedCreatePodSandBox`
+  # lives only here. Without this, naming a `:runtime_class` the nodes do not
+  # support costs `:provision_timeout` and the operator is told the Pod "never
+  # got far enough to say anything" while the cluster was saying exactly why.
+  defp events_detail(handle) do
+    {:ok, events} = API.pod_events(handle.config, handle.pod_name)
+
+    events
+    |> Enum.filter(&(&1["type"] == "Warning"))
+    |> Enum.take(-3)
+    |> Enum.map(fn event ->
+      "#{event["reason"]}: #{String.slice(to_string(event["message"]), 0, 300)}"
+    end)
+    |> case do
+      [] -> nil
+      lines -> "pod events:\n" <> Enum.join(lines, "\n")
+    end
   end
 
   defp logs_detail(handle, opts) do
@@ -473,6 +503,7 @@ defmodule CrowdControl.Backend.Kubernetes do
           "volumes" => volumes(handle)
         }
         |> put_pod_security_context(config)
+        |> put_scheduling(config)
     }
   end
 
@@ -659,6 +690,32 @@ defmodule CrowdControl.Backend.Kubernetes do
     else
       spec
     end
+  end
+
+  # --- sandbox runtime and placement ---
+
+  # `runtimeClassName` selects a container runtime handler -- gVisor's `runsc`,
+  # Kata Containers -- in place of the node's default `runc`. It is the one
+  # option in this backend that changes the kernel boundary rather than what a
+  # container may ask of the host kernel it already shares: capability drops,
+  # `allowPrivilegeEscalation: false` and a missing service-account token all
+  # narrow requests to a *shared* kernel, and a container escape defeats them
+  # together. A sandbox runtime answers those syscalls somewhere else.
+  #
+  # Never defaulted. The RuntimeClass admission controller rejects a Pod naming
+  # a RuntimeClass that does not exist, so guessing `"gvisor"` would convert
+  # every working cluster without it into a provisioning failure.
+  #
+  # `:node_selector` and `:tolerations` ride along because a RuntimeClass alone
+  # usually is not enough: sandbox node pools are tainted (GKE Sandbox uses
+  # `sandbox.gke.io/runtime=gvisor:NoSchedule`), and a Pod that cannot tolerate
+  # the taint stays Pending until `:provision_timeout` -- a slow, opaque failure
+  # for something a caller can state in one line.
+  defp put_scheduling(spec, config) do
+    spec
+    |> maybe_put("runtimeClassName", config[:runtime_class])
+    |> maybe_put("nodeSelector", config[:node_selector])
+    |> maybe_put("tolerations", config[:tolerations])
   end
 
   # --- naming and ownership ---
@@ -1535,6 +1592,47 @@ defmodule CrowdControl.Backend.Kubernetes do
         {:error, {:k8s, {:invalid_network, other}}}
     end
   end
+
+  # Shape-checked here rather than at the API server, because these three land
+  # in a Pod spec that is only submitted after a NetworkPolicy may already have
+  # been created. A 422 at that point costs a rollback; a typo is worth
+  # catching before anything exists.
+  @doc false
+  @spec validate_runtime!(keyword()) :: :ok | {:error, term()}
+  def validate_runtime!(config) do
+    with :ok <- validate_runtime_class(config[:runtime_class]),
+         :ok <- validate_node_selector(config[:node_selector]) do
+      validate_tolerations(config[:tolerations])
+    end
+  end
+
+  defp validate_runtime_class(nil), do: :ok
+  defp validate_runtime_class(name) when is_binary(name) and name != "", do: :ok
+  defp validate_runtime_class(other), do: {:error, {:k8s, {:invalid_runtime_class, other}}}
+
+  defp validate_node_selector(nil), do: :ok
+
+  defp validate_node_selector(map) when is_map(map) do
+    if Enum.all?(map, fn {k, v} -> is_binary(k) and is_binary(v) end) do
+      :ok
+    else
+      {:error, {:k8s, {:invalid_node_selector, map}}}
+    end
+  end
+
+  defp validate_node_selector(other), do: {:error, {:k8s, {:invalid_node_selector, other}}}
+
+  defp validate_tolerations(nil), do: :ok
+
+  defp validate_tolerations(list) when is_list(list) do
+    if Enum.all?(list, &is_map/1) do
+      :ok
+    else
+      {:error, {:k8s, {:invalid_tolerations, list}}}
+    end
+  end
+
+  defp validate_tolerations(other), do: {:error, {:k8s, {:invalid_tolerations, other}}}
 
   defp ensure_network_policy(%__MODULE__{config: config} = handle) do
     case config[:network] do

@@ -159,6 +159,45 @@ and neither is overridable:
   namespace is injected into the sandbox's environment: free cluster
   reconnaissance for anything running in there.
 
+**The shared kernel is the ceiling on all of it.** Every control above —
+dropped capabilities, `allowPrivilegeEscalation: false`, a read-only rootfs, no
+service-account token — narrows what the sandbox may *ask* of a kernel it still
+shares with the node and every other Pod on it. They are defence in depth
+against one bug class: a container escape defeats them together, because they
+all assume the kernel enforcing them is intact.
+
+`:runtime_class` is the only option in this backend that moves that ceiling. It
+sets `runtimeClassName`, selecting a runtime handler — gVisor's `runsc`, which
+answers syscalls in userspace, or Kata, which gives the Pod its own kernel in a
+VM — so an escape has to get through that first. For untrusted model-driven
+code this is the difference in kind; the rest is degree.
+
+It is opt-in and never defaulted, because the RuntimeClass admission controller
+rejects a Pod naming a class the cluster lacks (measured: `pod rejected:
+RuntimeClass "gvisor" not found`), so a default would break every cluster
+without it. Enabling it needs three things on the cluster, none of which this
+library can create: nodes running the handler, a `RuntimeClass` object naming
+it, and — because those node pools are normally tainted — `:node_selector` plus
+`:tolerations` so the Pod can land there. GKE Sandbox and the SIG-Apps
+[Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project both
+drive exactly this field.
+
+A RuntimeClass that exists while its handler does not is admitted and never
+runs. The backend reports the cluster's own words for it —
+`FailedCreatePodSandBox: … RuntimeHandler "gvisor" not supported`, read from the
+Pod's events, since a Pod that never started has neither logs nor a container
+`waiting` message.
+
+**Namespaces are the operator's boundary, not this library's.** The backend
+never creates, labels or deletes a namespace: doing so needs cluster-scoped
+RBAC, and an identity that can create namespaces can create them outside
+whatever tenancy scheme you built. Per-tenant isolation is a namespace you
+provision, with a `ResourceQuota`, a `LimitRange`, and the
+`pod-security.kubernetes.io/enforce=restricted` label if you want the API server
+independently enforcing what this backend already sets. What the library owns is
+narrower and per-session: one Pod per session, one NetworkPolicy under
+`:deny_all`, both deleted with the session.
+
 **Network posture is never inferred.** There is no `NetworkMode: "none"` here —
 a Pod always has cluster networking — so `:network` is explicit and mandatory in
 the one case where guessing removes the boundary:

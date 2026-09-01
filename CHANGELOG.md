@@ -4,6 +4,22 @@
 
 ### Added
 
+- **`:runtime_class` on `CrowdControl.Backend.Kubernetes`**, with `:node_selector`
+  and `:tolerations`. Sets `runtimeClassName`, which is the only control in this
+  backend that changes *which kernel* answers the sandbox's syscalls — gVisor's
+  `runsc` or Kata — rather than narrowing what it may ask of a kernel it shares
+  with the host. Never defaulted: the RuntimeClass admission controller rejects a
+  Pod naming a class the cluster lacks, so a default would break every cluster
+  without one. The placement options ride along because sandbox node pools are
+  normally tainted and a RuntimeClass alone leaves the Pod Pending until
+  `:provision_timeout`.
+- **A failed provision now reports the Pod's events.** A Pod the node refused to
+  start has no logs and no container `waiting` message, so the reason existed
+  only as an event and the diagnosis said the Pod "never got far enough to say
+  anything". Measured against a live cluster, the same failure now reads
+  `FailedCreatePodSandBox: … RuntimeHandler "crun" not supported`. Needs `events
+  list` in the namespace; unreadable events stay silent rather than replacing the
+  real error.
 - **`examples/kubernetes_task.exs`** — fan out N sandboxes as concurrent tasks,
   one Pod each, then ask the API server whether anything leaked. It needs no API
   key and no custom image: the CLI inside each Pod is a `sh` loop wired in

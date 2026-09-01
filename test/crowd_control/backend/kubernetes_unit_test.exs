@@ -237,6 +237,134 @@ defmodule CrowdControl.Backend.KubernetesUnitTest do
     end
   end
 
+  describe "sandbox runtimes (blocker: a Pod that only looks isolated)" do
+    test "no runtime, placement or toleration is assumed" do
+      # Defaulting :runtime_class to "gvisor" would break every cluster without
+      # it: the RuntimeClass admission controller rejects a Pod naming one that
+      # does not exist. Absent keys, not nil values -- a nil runtimeClassName is
+      # a 422 from the API server.
+      spec = Kubernetes.pod_manifest(handle())["spec"]
+
+      refute Map.has_key?(spec, "runtimeClassName")
+      refute Map.has_key?(spec, "nodeSelector")
+      refute Map.has_key?(spec, "tolerations")
+    end
+
+    test ":runtime_class is the one option that changes which kernel answers" do
+      # Everything else this backend hardens narrows what the container may ask
+      # of a kernel it shares with the host. This picks a different one.
+      spec = Kubernetes.pod_manifest(handle(runtime_class: "gvisor"))["spec"]
+
+      assert spec["runtimeClassName"] == "gvisor"
+    end
+
+    test "placement rides along, because a RuntimeClass alone leaves Pods Pending" do
+      # GKE Sandbox taints its node pool sandbox.gke.io/runtime=gvisor:NoSchedule.
+      # Without a toleration the Pod waits out :provision_timeout and fails with
+      # nothing an operator can read.
+      tolerations = [
+        %{
+          "key" => "sandbox.gke.io/runtime",
+          "operator" => "Equal",
+          "value" => "gvisor",
+          "effect" => "NoSchedule"
+        }
+      ]
+
+      spec =
+        handle(
+          runtime_class: "gvisor",
+          node_selector: %{"sandbox.gke.io/runtime" => "gvisor"},
+          tolerations: tolerations
+        )
+        |> Kubernetes.pod_manifest()
+        |> Map.fetch!("spec")
+
+      assert spec["nodeSelector"] == %{"sandbox.gke.io/runtime" => "gvisor"}
+      assert spec["tolerations"] == tolerations
+    end
+
+    test "the gate accepts the shapes the API server accepts" do
+      assert Kubernetes.validate_runtime!([]) == :ok
+      assert Kubernetes.validate_runtime!(runtime_class: "kata") == :ok
+      assert Kubernetes.validate_runtime!(node_selector: %{"a" => "b"}) == :ok
+      assert Kubernetes.validate_runtime!(tolerations: [%{"key" => "k"}]) == :ok
+    end
+
+    test "a typo is refused before a NetworkPolicy has been created" do
+      # provision/1 validates before it creates anything. Letting these through
+      # costs a 422 on the Pod submit, which is after ensure_network_policy/1 may
+      # already have created a policy that then has to be rolled back.
+      assert Kubernetes.validate_runtime!(runtime_class: :gvisor) ==
+               {:error, {:k8s, {:invalid_runtime_class, :gvisor}}}
+
+      assert Kubernetes.validate_runtime!(runtime_class: "") ==
+               {:error, {:k8s, {:invalid_runtime_class, ""}}}
+
+      assert Kubernetes.validate_runtime!(node_selector: [{"a", "b"}]) ==
+               {:error, {:k8s, {:invalid_node_selector, [{"a", "b"}]}}}
+
+      assert Kubernetes.validate_runtime!(node_selector: %{"a" => 1}) ==
+               {:error, {:k8s, {:invalid_node_selector, %{"a" => 1}}}}
+
+      assert Kubernetes.validate_runtime!(tolerations: %{"key" => "k"}) ==
+               {:error, {:k8s, {:invalid_tolerations, %{"key" => "k"}}}}
+    end
+
+    test "provision/1 runs the gate before it reaches the API server" do
+      # No daemon is involved: the error must come from the gate, not a socket.
+      assert Kubernetes.provision(image: "busybox:1.36", runtime_class: :gvisor) ==
+               {:error, {:k8s, {:invalid_runtime_class, :gvisor}}}
+    end
+  end
+
+  describe "pod events (blocker: a failure the cluster explained and we did not)" do
+    test "the Pod's own events are requested, scoped to it" do
+      # A cluster-wide event list would be both enormous and wrong.
+      test_pid = self()
+
+      adapter = fn req ->
+        send(test_pid, {:query, req.url.query})
+
+        {req,
+         Req.Response.new(
+           status: 200,
+           body: %{
+             "items" => [
+               %{"type" => "Normal", "reason" => "Scheduled", "message" => "assigned"},
+               %{
+                 "type" => "Warning",
+                 "reason" => "FailedCreatePodSandBox",
+                 "message" => ~s(RuntimeHandler "gvisor" not supported)
+               }
+             ]
+           }
+         )}
+      end
+
+      config = [kubeconfig: kubeconfig("https://k8s.test"), req_adapter: adapter]
+
+      assert {:ok, events} = API.pod_events(config, "cc-abc")
+      assert_received {:query, query}
+      # Decoded, because the selector is percent-encoded on the wire and the
+      # thing worth pinning is the selector, not Req's escaping.
+      assert URI.decode_query(query)["fieldSelector"] == "involvedObject.name=cc-abc"
+
+      assert Enum.map(events, & &1["reason"]) == ["Scheduled", "FailedCreatePodSandBox"]
+    end
+
+    test "an unreadable event stream is not a second failure" do
+      # This runs only when a provision has already failed. Returning an error
+      # here would replace the reason the caller wants with the reason the
+      # diagnosis failed, and `diagnose/1` matches {:ok, _} on the strength of
+      # this guarantee.
+      adapter = fn req -> {req, Req.Response.new(status: 403, body: %{"message" => "nope"})} end
+      config = [kubeconfig: kubeconfig("https://k8s.test"), req_adapter: adapter]
+
+      assert API.pod_events(config, "cc-abc") == {:ok, []}
+    end
+  end
+
   describe "pod naming and owner labelling (blocker: API-server rejection)" do
     test "a minted session key always yields a legal Pod name" do
       key = Store.new_key()
