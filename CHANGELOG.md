@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **`examples/kubernetes_task.exs`** — fan out N sandboxes as concurrent tasks,
+  one Pod each, then ask the API server whether anything leaked. It needs no API
+  key and no custom image: the CLI inside each Pod is a `sh` loop wired in
+  through the public `CrowdControl.Agent` behaviour, so every layer below the
+  agent is exactly what a real CLI gets. The README's Kubernetes and GCE
+  sections now link their runnable examples, which nothing did before.
+
 ## 0.1.1 — 2026-08-31
 
 Two defects in 0.1.0, both found by smoke-testing the *published* release rather

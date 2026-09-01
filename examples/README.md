@@ -24,4 +24,5 @@ valid API key in `ANTHROPIC_API_KEY` (or pass `:api_key` per-session).
 | [`sandbox_lifecycle.exs`](sandbox_lifecycle.exs) | The sandbox itself, one step at a time: FIFO, tee file, a mid-line byte-exact reattach, and a killed CLI ending the session. Needs Docker and `alpine`, no API key — see [`docs/sandboxes.md`](../docs/sandboxes.md) |
 | [`sandboxd_docker.exs`](sandboxd_docker.exs) | Drive a sandbox over HTTP with `Backend.Sandboxd` + `Provider.Docker` (needs Docker and a sandboxd image) |
 | [`compose_stack.exs`](compose_stack.exs) | A two-service stack: internal-only sandbox plus an egress proxy sidecar (needs Docker and a proxy image) |
+| [`kubernetes_task.exs`](kubernetes_task.exs) | Fan out N sandboxes as concurrent tasks, one Pod each, and verify nothing leaked. Needs a cluster and `:kubereq`; no API key and no custom image — the in-Pod CLI is a `sh` loop wired in through `CrowdControl.Agent` |
 | [`gce_spot_vm.exs`](gce_spot_vm.exs) | **BILLABLE** — one GCE spot VM per sandbox, reached over an SSH tunnel (needs `:gcp_compute` and GCP credentials) |

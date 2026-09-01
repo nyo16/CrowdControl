@@ -1101,6 +1101,10 @@ to provision with `{:error, {:k8s, :network_policy_not_enforced}}` if it is not.
 Any API server accepts a NetworkPolicy object; only a CNI with a policy
 controller acts on one.
 
+Runnable example: [`examples/kubernetes_task.exs`](examples/kubernetes_task.exs)
+fans out N sandboxes as concurrent tasks, one Pod each, and then asks the API
+server whether anything leaked. It needs no API key and no custom image.
+
 RBAC the backend's identity needs, in `:namespace`:
 
     pods            create, get, list, delete
@@ -1364,6 +1368,10 @@ Requires the optional `:gcp_compute` dependency:
   machine_type: "e2-standard-2",
   spot: true}
 ```
+
+Runnable example: [`examples/gce_spot_vm.exs`](examples/gce_spot_vm.exs) — one
+spot VM per sandbox, end to end. It is **billable** and guarded by an explicit
+`CC_GCE_CONFIRM=yes`.
 
 | Option | Default | Notes |
 |--------|---------|-------|
