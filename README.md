@@ -1101,9 +1101,14 @@ to provision with `{:error, {:k8s, :network_policy_not_enforced}}` if it is not.
 Any API server accepts a NetworkPolicy object; only a CNI with a policy
 controller acts on one.
 
-Runnable example: [`examples/kubernetes_task.exs`](examples/kubernetes_task.exs)
-fans out N sandboxes as concurrent tasks, one Pod each, and then asks the API
-server whether anything leaked. It needs no API key and no custom image.
+Runnable examples, neither needing an API key or a custom image:
+
+- [`examples/kubernetes_task.exs`](examples/kubernetes_task.exs) — fan out N
+  sandboxes as concurrent tasks, one Pod each, then ask the API server whether
+  anything leaked.
+- [`examples/kubernetes_fanout.exs`](examples/kubernetes_fanout.exs) — the batch
+  shape: a queue of tasks with different parameters each, a max-concurrency
+  ceiling, and a report of every result at the end.
 
 RBAC the backend's identity needs, in `:namespace`:
 

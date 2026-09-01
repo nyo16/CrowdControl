@@ -10,6 +10,13 @@
   through the public `CrowdControl.Agent` behaviour, so every layer below the
   agent is exactly what a real CLI gets. The README's Kubernetes and GCE
   sections now link their runnable examples, which nothing did before.
+- **`examples/kubernetes_fanout.exs`** — the batch shape: a queue of tasks with
+  different parameters each (model, per-task CPU), a max-concurrency ceiling,
+  and one report at the end with per-task timings, speedup, observed peak
+  concurrency and a leak check. Two of its claims are demonstrated rather than
+  asserted: each Pod echoes back the model it was handed, so broken per-task
+  plumbing shows up as one model repeated; and the peak counter tracks the
+  limit it is given (measured at 1, 3 and 6) rather than reporting it.
 
 ## 0.1.1 — 2026-08-31
 

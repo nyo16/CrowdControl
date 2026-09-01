@@ -25,4 +25,5 @@ valid API key in `ANTHROPIC_API_KEY` (or pass `:api_key` per-session).
 | [`sandboxd_docker.exs`](sandboxd_docker.exs) | Drive a sandbox over HTTP with `Backend.Sandboxd` + `Provider.Docker` (needs Docker and a sandboxd image) |
 | [`compose_stack.exs`](compose_stack.exs) | A two-service stack: internal-only sandbox plus an egress proxy sidecar (needs Docker and a proxy image) |
 | [`kubernetes_task.exs`](kubernetes_task.exs) | Fan out N sandboxes as concurrent tasks, one Pod each, and verify nothing leaked. Needs a cluster and `:kubereq`; no API key and no custom image — the in-Pod CLI is a `sh` loop wired in through `CrowdControl.Agent` |
+| [`kubernetes_fanout.exs`](kubernetes_fanout.exs) | Batch shape: a queue of tasks with **different parameters each** (model, per-task CPU), a **max-concurrency ceiling**, and one report at the end — per-task timings, speedup, observed peak vs limit, and a leak check |
 | [`gce_spot_vm.exs`](gce_spot_vm.exs) | **BILLABLE** — one GCE spot VM per sandbox, reached over an SSH tunnel (needs `:gcp_compute` and GCP credentials) |
