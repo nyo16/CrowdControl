@@ -552,6 +552,23 @@ jobs:
           sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
           grep '@version' mix.exs
 
+      # CI rewrites mix.exs from the tag but never the changelog, so the two can
+      # disagree and only the changelog ships wrong. v0.1.1 caught this by hand;
+      # v0.2.0 did not, and published with "## Unreleased" as its heading —
+      # permanently, since hexdocs is per-version. Fail before publishing
+      # instead.
+      - name: Require a CHANGELOG heading for this version
+        env:
+          TAG_REF: ${{ github.ref }}
+        run: |
+          TAG_VERSION="${TAG_REF#refs/tags/v}"
+          ESCAPED=$(printf '%s' "$TAG_VERSION" | sed 's/\./\\./g')
+          if ! grep -qE "^## ${ESCAPED}( |\$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## ${TAG_VERSION}' heading. Rename '## Unreleased' before tagging — the tag sets the package version, this file does not follow it."
+            exit 1
+          fi
+          echo "found: $(grep -m1 -E "^## ${ESCAPED}( |\$)" CHANGELOG.md)"
+
       - run: mix deps.get
         env:
           MIX_ENV: dev

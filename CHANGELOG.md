@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A tagged release with a mismatched CHANGELOG heading is now refused before
+  it publishes.** CI rewrites `mix.exs` from the tag and never this file, so the
+  two can disagree and only this one ships wrong — 0.2.0 went out with
+  `## Unreleased` as its heading, which hexdocs keeps per-version and therefore
+  forever. The publish job now greps for `## <version>` and fails without it.
+  Verified against the tree that shipped: the gate rejects it.
+
+## 0.2.0 — 2026-09-01
+
 ### Added
 
 - **`:runtime_class` on `CrowdControl.Backend.Kubernetes`**, with `:node_selector`
@@ -41,7 +52,7 @@
   `Req.Request` — a distinct module to the compiler — so `ReqAdapter.put/2` and
   the Kubernetes API client warned in every project that does not pull `:req`,
   and `Provider.Gce`'s telemetry emit warned without `:telemetry`. Same defect
-  as 0.1.1's `Kubereq.Connect`, found the same way: installing the package
+  as 0.1.1's Kubereq.Connect fix, found the same way: installing the package
   somewhere it is not already satisfied.
 - **CI now compiles the library as a consumer with no optional dependencies**
   and fails on any warning. Every other job resolves the full tree, which is
