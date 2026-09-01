@@ -33,10 +33,21 @@
 defmodule ShellAgent do
   @behaviour CrowdControl.Agent
 
+  # With CC_K8S_HOSTPATH set, every Pod appends its own name to one shared
+  # file on the mount, so the line count grows across Pods and the volume is
+  # demonstrated rather than asserted. Without it, the same script reports
+  # that nothing is mounted.
   @script """
   printf '{"type":"system","subtype":"init","session_id":"%s"}\\n' "$(hostname)"
   while IFS= read -r _line; do
-    printf '{"type":"result","subtype":"success","result":"answered by pod %s","num_turns":1}\\n' "$(hostname)"
+    if [ -d /workspace ]; then
+      hostname >> /workspace/pods.txt
+      note="/workspace shared by $(wc -l < /workspace/pods.txt | tr -d ' ') pod(s) so far"
+    else
+      note="no volume mounted"
+    fi
+    printf '{"type":"result","subtype":"success","result":"answered by pod %s — %s","num_turns":1}\\n' \\
+      "$(hostname)" "$note"
   done
   """
 
@@ -89,6 +100,25 @@ backend =
     case System.get_env("CC_K8S_NAMESPACE") do
       nil -> opts
       ns -> Keyword.put(opts, :namespace, ns)
+    end
+  end)
+  |> then(fn opts ->
+    # Optional shared volume. A hostPath is what a laptop cluster can offer
+    # without provisioning storage; on a real cluster this is more likely
+    # `%{name: "some-claim", target: "/workspace"}` against a bound PVC, which
+    # is the same option with a different source key.
+    #
+    #     CC_K8S_HOSTPATH=/tmp/cc-workspace mix run examples/kubernetes_task.exs
+    #
+    # Writable on purpose here, because the Pods write to it. Read SECURITY.md
+    # before pointing a *writable* host path at anything running real
+    # model-driven code.
+    case System.get_env("CC_K8S_HOSTPATH") do
+      nil ->
+        opts
+
+      path ->
+        Keyword.put(opts, :volumes, [%{host_path: path, target: "/workspace"}])
     end
   end)
 

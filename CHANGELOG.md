@@ -26,6 +26,12 @@
   configuration supplied *by* a mount — `claude` 2.1.252 via
   `CLAUDE_CONFIG_DIR`, `omp` 18.0.11 via `:agent_dir`.
 
+  Both Kubernetes examples take `CC_K8S_HOSTPATH` and demonstrate the mount
+  rather than describing it: `kubernetes_task.exs` has every Pod append its
+  name to one shared file and report the growing count, and
+  `kubernetes_fanout.exs` gains a batch-wide cache with a hit/miss column —
+  six tasks across three models produce exactly three hits.
+
 ### Fixed
 
 - **A tagged release with a mismatched CHANGELOG heading is now refused before

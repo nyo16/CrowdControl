@@ -39,11 +39,20 @@
 defmodule EchoAgent do
   @behaviour CrowdControl.Agent
 
+  # The third field is the shared-cache probe. With CC_K8S_HOSTPATH set every
+  # task sees one `/cache`, so a task can tell whether its model's entry was
+  # already there — which is the batch reason to mount anything at all.
   @script """
   printf '{"type":"system","subtype":"init","session_id":"%s"}\\n' "$(hostname)"
   while IFS= read -r _line; do
-    printf '{"type":"result","subtype":"success","result":"%s|%s","num_turns":1}\\n' \\
-      "$(hostname)" "$CC_MODEL"
+    if [ -d /cache ]; then
+      if [ -f "/cache/$CC_MODEL" ]; then cache=hit; else cache=miss; fi
+      echo "$(hostname)" >> "/cache/$CC_MODEL"
+    else
+      cache=none
+    fi
+    printf '{"type":"result","subtype":"success","result":"%s|%s|%s","num_turns":1}\\n' \\
+      "$(hostname)" "$CC_MODEL" "$cache"
   done
   """
 
@@ -84,6 +93,17 @@ max_concurrency = String.to_integer(System.get_env("CC_MAX_CONCURRENCY", "3"))
 image = System.get_env("CC_K8S_IMAGE", "busybox:1.36")
 owner = "cc-fanout-#{:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower)}"
 
+# Optional shared cache across the whole batch:
+#
+#     CC_K8S_HOSTPATH=/tmp/cc-cache mix run examples/kubernetes_fanout.exs
+#
+# Empty list = no mount, which is why every task can pass it unconditionally.
+cache_volume =
+  case System.get_env("CC_K8S_HOSTPATH") do
+    nil -> []
+    path -> [%{host_path: path, target: "/cache"}]
+  end
+
 # The queue: heterogeneous work, one row per task. Models here are labels the
 # stand-in echoes; with a real CLI these are the model names it dispatches on,
 # and `:cpus`/`:memory` are per-task Pod limits rather than a global default.
@@ -113,20 +133,24 @@ run_task = fn task ->
       executable: "/bin/sh",
       model: task.model,
       timeout: 120_000,
-      backend:
-        {
-          CrowdControl.Backend.Kubernetes,
-          # Per-task sizing: a summary does not need a design review's CPU.
-          # See kubernetes_task.exs on why :unrestricted is honest for a shell
-          # loop and wrong for real model-driven code.
-          image: image,
-          owner: owner,
-          cpus: task.cpus,
-          network: :unrestricted,
-          provision_timeout: 180_000,
-          timeout: 60_000,
-          exec_timeout: 30_000
-        }
+      backend: {
+        CrowdControl.Backend.Kubernetes,
+        # Per-task sizing: a summary does not need a design review's CPU.
+        # See kubernetes_task.exs on why :unrestricted is honest for a shell
+        # loop and wrong for real model-driven code.
+        # One shared cache for the whole batch, which is the usual reason a
+        # batch mounts anything: work the first task does, the rest reuse.
+        # On a real cluster this is a bound PVC — `%{name: "cache", …}` —
+        # rather than a host path.
+        image: image,
+        owner: owner,
+        cpus: task.cpus,
+        network: :unrestricted,
+        provision_timeout: 180_000,
+        timeout: 60_000,
+        exec_timeout: 30_000,
+        volumes: cache_volume
+      }
     )
 
   Peak.leave()
@@ -157,14 +181,14 @@ rows =
   Enum.map(report, fn row ->
     case row.result do
       {:result, "success", %{"result" => payload}} ->
-        [pod, model_seen] = String.split(payload, "|", parts: 2)
-        {row, "ok", pod, model_seen}
+        [pod, model_seen, cache] = String.split(payload, "|", parts: 3)
+        {row, "ok", pod, model_seen, cache}
 
       {:result, subtype, _} ->
-        {row, subtype, "—", "—"}
+        {row, subtype, "—", "—", "—"}
 
       {:error, reason} ->
-        {row, "error: #{inspect(reason)}", "—", "—"}
+        {row, "error: #{inspect(reason)}", "—", "—", "—"}
     end
   end)
 
@@ -172,26 +196,30 @@ IO.puts(
   String.pad_trailing("task", 11) <>
     String.pad_trailing("model asked", 13) <>
     String.pad_trailing("model in pod", 14) <>
+    String.pad_trailing("cache", 7) <>
     String.pad_trailing("ms", 7) <>
     String.pad_trailing("status", 8) <> "pod"
 )
 
-IO.puts(String.duplicate("-", 96))
+IO.puts(String.duplicate("-", 103))
 
-for {row, status, pod, model_seen} <- rows do
+for {row, status, pod, model_seen, cache} <- rows do
   IO.puts(
     String.pad_trailing(row.id, 11) <>
       String.pad_trailing(row.model, 13) <>
       String.pad_trailing(model_seen, 14) <>
+      String.pad_trailing(cache, 7) <>
       String.pad_trailing(to_string(row.ms), 7) <>
       String.pad_trailing(status, 8) <> pod
   )
 end
 
-ok = Enum.count(rows, fn {_, status, _, _} -> status == "ok" end)
+ok = Enum.count(rows, fn {_, status, _, _, _} -> status == "ok" end)
 
 mismatched =
-  Enum.count(rows, fn {row, status, _, seen} -> status == "ok" and seen != row.model end)
+  Enum.count(rows, fn {row, status, _, seen, _} -> status == "ok" and seen != row.model end)
+
+cache_hits = Enum.count(rows, fn {_, _, _, _, cache} -> cache == "hit" end)
 
 serial = report |> Enum.map(& &1.ms) |> Enum.sum()
 
@@ -201,7 +229,8 @@ IO.puts("""
 #{serial} ms if run one at a time, so #{Float.round(serial / max(wall, 1), 1)}x from concurrency
 peak sandboxes alive: #{Peak.peak()} (limit #{max_concurrency})
 tasks whose pod reported a different model than asked: #{mismatched}
-distinct pods: #{rows |> Enum.map(fn {_, _, pod, _} -> pod end) |> Enum.uniq() |> length()}\
+shared-cache hits: #{cache_hits} (a second task for the same model finding the first task's entry)
+distinct pods: #{rows |> Enum.map(fn {_, _, pod, _, _} -> pod end) |> Enum.uniq() |> length()}\
 """)
 
 {:ok, live} = CrowdControl.Backend.Kubernetes.list_live(owner: owner)
