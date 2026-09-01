@@ -1,7 +1,12 @@
 defmodule CrowdControl.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  # The last published release. CI rewrites this from the tag before it builds
+  # the package (.github/workflows/ci.yml, "Set version from tag"), so the tag
+  # is what Hex sees — but git and path dependencies read the literal, and a
+  # local `mix hex.publish --dry-run` reports it. Left stale at 0.1.0 after
+  # 0.1.1 shipped, both of those lied.
+  @version "0.1.1"
   @source_url "https://github.com/nyo16/CrowdControl"
 
   def project do

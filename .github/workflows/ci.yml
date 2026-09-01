@@ -98,6 +98,57 @@ jobs:
       - name: Compile with warnings as errors
         run: mix compile --warnings-as-errors
 
+  optional_deps:
+    name: Consumer without optional deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      # Every other job resolves the full dep tree, so :req, :kubereq and
+      # :gcp_compute are always present and a missing @compile
+      # {:no_warn_undefined, _} is invisible here. It is not invisible to
+      # someone who installs this package and uses only Backend.Local: 0.1.0
+      # shipped a `Kubereq.Connect` warning that way, and 0.1.1 shipped three
+      # more for `Req.Request` and `:telemetry`. Both were found by a human
+      # installing the release, which is too late and twice too often.
+      #
+      # This builds a scratch project that depends on the checkout and nothing
+      # optional, and fails on any warning at all.
+      - name: Compile as a consumer with no optional dependencies
+        run: |
+          mkdir -p /tmp/consumer/lib
+          cd /tmp/consumer
+          cat > mix.exs <<EOF
+          defmodule Consumer.MixProject do
+            use Mix.Project
+
+            def project do
+              [app: :consumer, version: "0.0.0", elixir: "~> 1.19", deps: deps()]
+            end
+
+            def application, do: [extra_applications: [:logger]]
+
+            defp deps, do: [{:crowd_control, path: "$GITHUB_WORKSPACE"}]
+          end
+          EOF
+          mix deps.get
+          for d in req kubereq gcp_compute; do
+            if [ -d "deps/$d" ]; then
+              echo "::error::$d resolved, so this job is not testing what it claims"
+              exit 1
+            fi
+          done
+          mix compile --force 2>&1 | tee /tmp/consumer-compile.txt
+          if grep -qi warning /tmp/consumer-compile.txt; then
+            echo "::error::a consumer without optional deps sees compile warnings"
+            exit 1
+          fi
+
   format:
     name: Formatting
     runs-on: ubuntu-latest

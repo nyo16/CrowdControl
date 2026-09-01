@@ -34,6 +34,24 @@
   plumbing shows up as one model repeated; and the peak counter tracks the
   limit it is given (measured at 1, 3 and 6) rather than reporting it.
 
+### Fixed
+
+- **Three more compile warnings for consumers without the optional
+  dependencies.** `@compile {:no_warn_undefined, Req}` does not cover
+  `Req.Request` — a distinct module to the compiler — so `ReqAdapter.put/2` and
+  the Kubernetes API client warned in every project that does not pull `:req`,
+  and `Provider.Gce`'s telemetry emit warned without `:telemetry`. Same defect
+  as 0.1.1's `Kubereq.Connect`, found the same way: installing the package
+  somewhere it is not already satisfied.
+- **CI now compiles the library as a consumer with no optional dependencies**
+  and fails on any warning. Every other job resolves the full tree, which is
+  precisely why this class shipped twice; the guard was verified to fail by
+  reverting one of the fixes.
+- **`@version` in `mix.exs` tracked 0.1.0 after 0.1.1 shipped.** CI rewrites it
+  from the tag when publishing, so Hex was correct, but git and path
+  dependencies read the literal and `mix hex.publish --dry-run` reported
+  building a version that already existed.
+
 ## 0.1.1 — 2026-08-31
 
 Two defects in 0.1.0, both found by smoke-testing the *published* release rather

@@ -51,7 +51,13 @@ defmodule CrowdControl.Backend.Kubernetes.API do
      Kubereq.Kubeconfig,
      Kubereq.Kubeconfig.Default,
      Kubereq.PodExec,
-     Kubereq.PodLogs
+     Kubereq.PodLogs,
+     # `Req` and `Req.Request` are separate modules to the compiler, and
+     # listing only the first left `client/2` and `exec_client/1` warning for
+     # exactly the consumers this list exists to protect. Same lesson as
+     # `Kubereq.Connect`, one release later.
+     Req,
+     Req.Request
    ]}
 
   @default_timeout 30_000

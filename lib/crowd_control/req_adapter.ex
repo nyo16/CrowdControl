@@ -27,7 +27,9 @@ defmodule CrowdControl.ReqAdapter do
   # it: no %Req.Request{} struct patterns anywhere below (struct expansion needs
   # the module at compile time; plain map patterns do not), same rule as
   # CrowdControl.Backend.Docker.API.
-  @compile {:no_warn_undefined, Req}
+  # `Req.Request` is a distinct module to the compiler: listing only `Req` left
+  # `put/2` warning in every project that does not pull the optional dep.
+  @compile {:no_warn_undefined, [Req, Req.Request]}
 
   @typedoc "The seam: a `Req` adapter function, an adapter module, or nothing."
   @type t ::
