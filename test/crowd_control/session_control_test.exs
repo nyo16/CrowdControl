@@ -36,6 +36,12 @@ defmodule CrowdControl.SessionControlTest do
     {:ok, %{"continue" => true}}
   end
 
+  # What Mox and Ecto sandbox allowances look up from inside the callback.
+  def report_callers(request, context, test) do
+    send(test, {:callers, context.request_id, Process.get(:"$callers")})
+    {:allow, request["input"]}
+  end
+
   def echo(%{"text" => text}, test) do
     send(test, {:tool_ran, text})
     {:ok, text}
@@ -1253,6 +1259,20 @@ defmodule CrowdControl.SessionControlTest do
       TestHelpers.wait_until(fn -> answers(ctl, "race2") != [] end)
       assert :ok = Session.respond(pid, "race2", {:deny, "too late"})
       assert [%{"behavior" => "allow"}] = answers(ctl, "race2")
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a callback runs with the session in its $callers (S-A1)" do
+      ctl = start_supervised!({Mock, events: []})
+
+      {:ok, pid} =
+        start(ctl, timeout: 60_000, can_use_tool: {__MODULE__, :report_callers, [me()]})
+
+      push(ctl, can_use_tool_frame("callers"))
+      assert_receive {:callers, "callers", callers}, 2_000
+      assert is_list(callers)
+      assert pid in callers
 
       TestHelpers.stop_session(pid)
     end

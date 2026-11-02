@@ -1443,11 +1443,22 @@ defmodule CrowdControl.Session do
   # exits), and a reattached one runs its unanswered requests again: without
   # this a blocked callback would live on beside its replacement. The task
   # traps exits so a cancel (terminate_child) reaches the inner process too.
+  #
+  # The inner process is a bare spawn_link, so it inherits no `$callers`; it is
+  # given the task's own chain (which Task.Supervisor already started with the
+  # session), so Mox and Ecto sandbox allowances granted to the session, or to
+  # whoever started it, reach the user's callback.
   defp run_callback(session, key, fun) do
     Process.flag(:trap_exit, true)
     session_ref = Process.monitor(session)
     task = self()
-    inner = spawn_link(fn -> send(task, {:callback_done, self(), capture(fun)}) end)
+    callers = [task | Process.get(:"$callers", [])]
+
+    inner =
+      spawn_link(fn ->
+        Process.put(:"$callers", callers)
+        send(task, {:callback_done, self(), capture(fun)})
+      end)
 
     receive do
       {:callback_done, ^inner, {:ok, result}} -> send(session, {:control_result, key, result})
