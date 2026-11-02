@@ -380,6 +380,14 @@ defmodule CrowdControl.Session do
   @doc """
   Switch the permission mode (`"default"`, `"acceptEdits"`, `"plan"`,
   `"bypassPermissions"`, ...). See `control/3`.
+
+  The session's SDK tool gate follows the new mode only once the CLI accepts
+  it. When the CLI answers with an error (or none arrives in time), the gate
+  keeps its previous mode and this returns `{:error, _}`. For a tightening, such
+  as `"bypassPermissions"` to `"default"`, that leaves the gate looser than
+  asked, and the error reply may be forged by whatever can write to the CLI's
+  control channel inside the sandbox. Treat a session whose tightening returned
+  `{:error, _}` as untightened: retry, or stop it.
   """
   @spec set_permission_mode(session(), String.t()) :: {:ok, map()} | {:error, term()}
   def set_permission_mode(session, mode) when is_binary(mode) do
