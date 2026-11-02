@@ -33,8 +33,11 @@ defmodule CrowdControl.SdkMcp do
     * `:name` - required, unique within the server
     * `:call` - required, an MFA `{module, function, extra_args}`, called as
       `apply(module, function, [arguments | extra_args])` with the tool's
-      JSON arguments (a string-keyed map). Funs are refused: session options
-      are persisted, and a closure cannot be.
+      JSON arguments (a string-keyed map). Funs are refused, and so are funs,
+      pids, references and ports anywhere inside `extra_args`: session options
+      are persisted to `CrowdControl.Store`, and none of those survive a
+      restart. For the same reason `extra_args` must not hold secrets; look a
+      credential up inside the called function instead.
     * `:description` - optional, defaults to `""`
     * `:input_schema` - optional JSON Schema, defaults to an empty object schema
     * `:idempotent` - optional, defaults to `false`. A session that reattaches
@@ -49,13 +52,18 @@ defmodule CrowdControl.SdkMcp do
     * `{:ok, %{} = result}` - a complete MCP `CallToolResult`, sent as-is
     * `{:error, text}` - a tool error the model sees (`isError: true`)
 
-  A call that raises, throws or exits, or returns anything else, becomes the
-  JSON-RPC error `-32603`.
+  A call that raises, throws or exits (logged with its stacktrace), returns
+  anything else, or returns a result that cannot be encoded as JSON, becomes
+  the JSON-RPC error `-32603`.
 
   `handle/2` is the whole protocol: `initialize`, `ping`, `tools/list`,
   `tools/call`, and an empty acknowledgement for notifications. It touches no
   process state, so a session can run it wherever it likes.
   """
+
+  require Logger
+
+  alias CrowdControl.Session.Control
 
   @enforce_keys [:name, :tools]
   defstruct [:name, :tools, version: "1.0.0"]
@@ -116,6 +124,8 @@ defmodule CrowdControl.SdkMcp do
               "got: #{inspect(call)}"
     end
 
+    Control.check_extra_args!(elem(call, 2), "tool #{inspect(name)} :call")
+
     unless is_binary(description),
       do: raise(ArgumentError, "tool #{name} :description must be a binary")
 
@@ -172,13 +182,42 @@ defmodule CrowdControl.SdkMcp do
   """
   @spec idempotent?(t(), jsonrpc()) :: boolean()
   def idempotent?(%__MODULE__{} = server, %{"method" => "tools/call"} = message) do
-    case find_tool(server, get_in_params(message, "name")) do
+    {name, _arguments} = tool_call(message)
+
+    case find_tool(server, name) do
       %{idempotent: true} -> true
       _other -> false
     end
   end
 
   def idempotent?(%__MODULE__{}, _message), do: true
+
+  @doc """
+  The tool name and arguments of a `tools/call` message: `{name, arguments}`,
+  with `name` nil when the message names no tool and `arguments` `%{}` when it
+  carries none.
+
+      iex> CrowdControl.SdkMcp.tool_call(%{"params" => %{"name" => "echo", "arguments" => %{"a" => 1}}})
+      {"echo", %{"a" => 1}}
+  """
+  @spec tool_call(jsonrpc()) :: {String.t() | nil, map()}
+  def tool_call(message) do
+    params =
+      case message do
+        %{"params" => %{} = params} -> params
+        _other -> %{}
+      end
+
+    name = with name when not is_binary(name) <- Map.get(params, "name"), do: nil
+
+    arguments =
+      case params do
+        %{"arguments" => args} when is_map(args) -> args
+        _other -> %{}
+      end
+
+    {name, arguments}
+  end
 
   @doc """
   A JSON-RPC error response for `id`.
@@ -221,20 +260,11 @@ defmodule CrowdControl.SdkMcp do
   end
 
   defp request(server, "tools/call", id, params) do
-    name = if is_map(params), do: Map.get(params, "name")
+    {name, arguments} = tool_call(%{"params" => params})
 
     case find_tool(server, name) do
-      nil ->
-        error_response(id, @invalid_params, "Unknown tool: #{inspect(name)}")
-
-      tool ->
-        arguments =
-          case params do
-            %{"arguments" => args} when is_map(args) -> args
-            _ -> %{}
-          end
-
-        call_tool(tool, id, arguments)
+      nil -> error_response(id, @invalid_params, "Unknown tool: #{inspect(name)}")
+      tool -> call_tool(tool, id, arguments)
     end
   end
 
@@ -259,14 +289,16 @@ defmodule CrowdControl.SdkMcp do
         error_response(id, @internal_error, "tool #{tool.name} returned an invalid result")
     end
   catch
-    _kind, _reason -> error_response(id, @internal_error, "tool #{tool.name} crashed")
+    kind, reason ->
+      Logger.error(
+        "SDK MCP tool #{tool.name} crashed: " <> Exception.format(kind, reason, __STACKTRACE__)
+      )
+
+      error_response(id, @internal_error, "tool #{tool.name} crashed")
   end
 
   defp result(id, result), do: %{"jsonrpc" => "2.0", "id" => id, "result" => result}
 
   defp find_tool(_server, name) when not is_binary(name), do: nil
   defp find_tool(server, name), do: Enum.find(server.tools, &(&1.name == name))
-
-  defp get_in_params(%{"params" => %{} = params}, key), do: Map.get(params, key)
-  defp get_in_params(_message, _key), do: nil
 end

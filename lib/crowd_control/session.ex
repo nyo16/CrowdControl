@@ -30,7 +30,9 @@ defmodule CrowdControl.Session do
       `:executable` when omitted.
     * `:backend` - `CrowdControl.Backend` implementation, either a module or a
       `{module, config}` tuple whose config is merged into these opts. Defaults
-      to `CrowdControl.Backend.Local`.
+      to `CrowdControl.Backend.Local`. What a reattachable backend persists is
+      scrubbed by `CrowdControl.Store.scrub_opts/1`: credentials, service `:env`
+      and `:files` are dropped at every level, including inside this tuple.
     * `:prompt` - initial prompt sent once the CLI starts (optional)
     * `:timeout` - ceiling in ms on a single **turn**, after which the session
       self-expires and broadcasts `{:timeout, :session_expired}`. The timer is
@@ -61,7 +63,11 @@ defmodule CrowdControl.Session do
   callback is an MFA tuple `{module, function, extra_args}`, called as
   `apply(module, function, [request, context | extra_args])`. Funs are refused
   at start with `ArgumentError`, because session options are persisted and a
-  closure cannot be.
+  closure cannot be; so are funs, pids, references and ports anywhere inside
+  `extra_args`. `extra_args` are persisted to `CrowdControl.Store` as given, so
+  they **must not hold secrets**: look a credential up inside the callback. The
+  options may be given at top level or inside a `backend: {module, config}`
+  tuple; either way a reattached session keeps them.
 
     * `:can_use_tool` - answers the CLI's tool-permission requests. `request` is
       the `can_use_tool` request map (`"tool_name"`, `"input"`,
@@ -72,7 +78,16 @@ defmodule CrowdControl.Session do
     * `:hooks` - hook callbacks, see `CrowdControl.Agent.ClaudeCode`. Each
       returns `{:ok, hook_output}`, `{:error, message}` or `:defer`.
     * `:sdk_mcp_servers` - a map of name to `CrowdControl.SdkMcp.tool_server/2`
-      spec, answered in-BEAM.
+      spec, answered in-BEAM. With `:can_use_tool` configured, a `tools/call`
+      runs only if the tool is pre-approved (it matches an `:allowed_tools`
+      entry -- `"mcp__<server>__<tool>"`, `"mcp__<server>"` or
+      `"mcp__<server>__*"` --, `:permission_mode` is `"bypassPermissions"`, or a
+      `{:allow, input, updates}` granted it an `addRules` allow rule this
+      session), or if a `can_use_tool` allow for `"mcp__<server>__<tool>"` was
+      answered earlier in the turn with exactly the call's arguments as its
+      input; each such allow covers one call. Any other call is refused with
+      the JSON-RPC error `-32001` `"tool call not approved"` and a decision
+      event with `source: :gate`.
     * `:on_control_request` - any other CLI request subtype; returns
       `{:ok, response}`, `{:error, message}` or `:defer`. Without it such a
       request is answered with an error, so the CLI never waits.
@@ -82,11 +97,20 @@ defmodule CrowdControl.Session do
       agent is first sent `interrupt`, and the sandbox is destroyed only if no
       result arrives within this many ms. Defaults to `30_000` for sessions using
       a control feature and to `0` (destroy at the deadline) otherwise.
+    * `:max_pending_control` - how many CLI control requests may wait on an
+      answer at once. Past it a new request is answered at once with an error
+      (a deny for a permission request, a JSON-RPC error for an MCP message)
+      and is not persisted. Defaults to `64`.
+    * `:reattach_reply_timeout` - test-only. ms a reattached session waits for
+      its `initialize` reply before it falls back to the permission requests it
+      persisted. Defaults to `60_000`.
 
   `context` is `%{session: pid, store_key: key, request_id: id, subtype: subtype}`.
   Callbacks run under `CrowdControl.CallbackSupervisor`, so one that blocks on a
-  human never stalls the session. A callback that crashes, or returns anything
-  else, is answered as a failure (a deny for a permission request).
+  human never stalls the session, and a callback still running when its session
+  dies, however it dies, is killed with it. A callback that crashes, or returns
+  anything else -- including a decision that cannot be encoded as JSON -- is
+  answered as a failure (a deny for a permission request).
 
   A callback that returns `:defer` leaves the request pending; subscribers get
   `{:control_request, request_id, subtype, request}` (again on every later
@@ -104,7 +128,10 @@ defmodule CrowdControl.Session do
   `CrowdControl.CLI.min_version/0`: `CrowdControl.Backend.Local` checks
   `--version` before spawning (start fails with `{:cli_version, have, need}`),
   and every backend checks the `system/init` frame, broadcasting
-  `{:error, {:cli_version, have, need}}` and stopping.
+  `{:error, {:cli_version, have, need}}` and stopping. A version that cannot be
+  read (no Claude Code `--version` banner, or an unparsable one) passes the
+  gate with a logged warning (D8): refusing would lock out a CLI whose banner
+  merely changed shape.
   """
 
   # :transient, not :temporary. `:temporary` is right when the OS process dies
@@ -118,6 +145,7 @@ defmodule CrowdControl.Session do
   require Logger
 
   alias CrowdControl.{Agent, Backend, CLI, Protocol, Result, SdkMcp, Store, Telemetry}
+  alias CrowdControl.Backend.Shell
   alias CrowdControl.Session.Control
 
   @default_timeout 300_000
@@ -133,6 +161,19 @@ defmodule CrowdControl.Session do
   # falls back to the permission requests it persisted.
   @reattach_reply_timeout 60_000
   @version_check_timeout 10_000
+
+  # Control opts a reattached session needs at top level of its record; see
+  # persisted_opts/2.
+  @control_opts [
+    :can_use_tool,
+    :hooks,
+    :sdk_mcp_servers,
+    :on_control_request,
+    :permission_timeout,
+    :interrupt_grace,
+    :max_pending_control,
+    :reattach_reply_timeout
+  ]
 
   defstruct [
     :agent,
@@ -170,8 +211,11 @@ defmodule CrowdControl.Session do
     messages: [],
     message_count: 0,
     prompt_seq: 0,
-    # Monotonic times of prompts still waiting on their result, oldest first.
-    turn_starts: [],
+    # Monotonic start of the turn in flight, and how many more prompts are
+    # queued behind it: a queued prompt's turn starts when the one before it
+    # ends. O(1) however many prompts never see a result.
+    turn_started_at: nil,
+    queued_turns: 0,
     control: %Control{}
   ]
 
@@ -200,6 +244,12 @@ defmodule CrowdControl.Session do
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
+
+  # The `:timeout` a session runs with when given none; `CrowdControl.run/2`
+  # sizes its backstop from it.
+  @doc false
+  @spec default_timeout() :: pos_integer()
+  def default_timeout, do: @default_timeout
 
   @doc """
   Send a user prompt to the CLI subprocess.
@@ -262,10 +312,17 @@ defmodule CrowdControl.Session do
     GenServer.call(session, :get_messages)
   end
 
-  @doc "Gracefully stop the session."
+  @doc """
+  Gracefully stop the session: destroy its sandbox, then exit.
+
+  Returns once the backend's `destroy/1` has, so it waits as long as teardown
+  takes; no client-side timeout cuts it short. That is bounded by the backend:
+  a Kubernetes sandbox with drained sidecars waits out each Pod's termination
+  grace before deleting its network policies, which can take most of a minute.
+  """
   @spec stop(session()) :: :ok
   def stop(session) do
-    GenServer.call(session, :stop, 10_000)
+    GenServer.call(session, :stop, :infinity)
   end
 
   @doc """
@@ -274,7 +331,12 @@ defmodule CrowdControl.Session do
   `decision` is a `t:CrowdControl.Protocol.permission_decision/0` for
   `can_use_tool` and `{:ok, map} | {:error, message}` for any other subtype. A
   callback still running for the request is cancelled. An unknown (or already
-  answered) `request_id` is a no-op returning `:ok`.
+  answered) `request_id` is a no-op returning `:ok`, so of a `respond/3` and a
+  callback racing for one request the first answer wins.
+
+  A decision of the wrong shape, or one that cannot be encoded as JSON (a pid,
+  a tuple, ...), returns `{:error, {:invalid_decision, decision}}` and leaves
+  the request pending.
   """
   @spec respond(session(), Protocol.request_id(), decision()) ::
           :ok | {:error, :unsupported | {:invalid_decision, term()}}
@@ -319,8 +381,10 @@ defmodule CrowdControl.Session do
   `request` carries its `"subtype"`; the session mints the `request_id`
   (`req_<n>_<hex>`). Returns `{:ok, response}` or `{:error, message}` as the CLI
   answered, `{:error, :timeout}` after `timeout` ms, `{:error, {:write_failed,
-  reason}}`, `{:error, :closed}` when the session tears down first, or
-  `{:error, :unsupported}` for an agent without the `:control` capability.
+  reason}}`, `{:error, :closed}` when the session tears down first,
+  `{:error, {:invalid_request, request}}` for a request that cannot be encoded
+  as JSON, or `{:error, :unsupported}` for an agent without the `:control`
+  capability.
   """
   @spec control(session(), map(), timeout()) :: {:ok, map()} | {:error, term()}
   def control(session, %{"subtype" => subtype} = request, timeout \\ @control_timeout)
@@ -371,6 +435,10 @@ defmodule CrowdControl.Session do
     with {:ok, handle} <- backend.reattach(record.handle, cursor),
          {:ok, reader} <- reader_or_destroy(backend, handle, cursor) do
       agent = Agent.resolve(record.opts)
+      # The record holds the scrubbed opts, `backend: {mod, config}` tuple
+      # included, so merging them again yields what init/1 ran with, minus the
+      # credentials. Control opts given inside the tuple live there too.
+      {_backend, merged} = Backend.resolve(record.opts)
 
       state = %__MODULE__{
         agent: agent,
@@ -381,10 +449,10 @@ defmodule CrowdControl.Session do
         owner: record.owner,
         session_id: record.session_id,
         persist?: Backend.reattachable?(backend),
-        opts: record.opts,
-        # The merged list is not persisted, so the record's opts are the best
-        # available. Backend config is re-applied by the reattach path itself.
-        agent_opts: record.opts,
+        # Scrubbed again so a record written before the scrub recursed into
+        # `backend:` loses its nested credentials on the next write.
+        opts: Store.scrub_opts(record.opts),
+        agent_opts: merged,
         timeout: Keyword.get(record.opts, :timeout, @default_timeout),
         max_prompt_size: Keyword.get(record.opts, :max_prompt_size),
         max_line_bytes: bound_opt!(record.opts, :max_line_bytes, @default_max_line_bytes),
@@ -401,7 +469,7 @@ defmodule CrowdControl.Session do
         # Callers re-subscribe/1; this is expected, not a gap.
         subscribers: [],
         status: :running,
-        control: record.opts |> Control.new(agent) |> Control.restore(Map.get(record, :control))
+        control: merged |> Control.new(agent) |> Control.restore(Map.get(record, :control))
       }
 
       # :reattach_control runs before any stdout cast, so the `initialize` is
@@ -448,7 +516,7 @@ defmodule CrowdControl.Session do
     control = Control.new(backend_opts, agent)
     meta = %{store_key: store_key, agent: agent, backend: backend}
 
-    with :ok <- check_cli_version(backend, control, executable, env),
+    with :ok <- check_cli_version(backend, control, executable, env, backend_opts),
          {:ok, handle, reader} <-
            start_backend(backend, backend_opts, executable, args, env, meta) do
       state = %__MODULE__{
@@ -459,7 +527,7 @@ defmodule CrowdControl.Session do
         store_key: store_key,
         owner: owner,
         persist?: Backend.reattachable?(backend),
-        opts: opts,
+        opts: persisted_opts(opts, backend_opts),
         agent_opts: backend_opts,
         timeout: Keyword.get(opts, :timeout, @default_timeout),
         max_prompt_size: Keyword.get(opts, :max_prompt_size),
@@ -473,6 +541,17 @@ defmodule CrowdControl.Session do
     else
       {:error, reason} -> {:stop, reason}
     end
+  end
+
+  # The opts a reattach starts from, computed once rather than per store write.
+  # Control opts may have come from inside `backend: {mod, config}`; they are
+  # lifted to the top level so the record names them wherever they were given
+  # (they are MFA-only, so plain data -- see Control.check_extra_args!/2).
+  # Then the whole list, tuple included, is scrubbed of credentials.
+  defp persisted_opts(opts, backend_opts) do
+    opts
+    |> Keyword.merge(Keyword.take(backend_opts, @control_opts))
+    |> Store.scrub_opts()
   end
 
   # A failed handshake is fatal, not something to discover via the inactivity
@@ -535,14 +614,39 @@ defmodule CrowdControl.Session do
   # A local CLI can be asked its version before anything exists, so a too-old
   # one fails the start instead of failing mid-session. Remote CLIs live in the
   # sandbox image and are checked at `system/init` instead.
-  defp check_cli_version(Backend.Local, %Control{features?: true}, executable, env) do
-    case local_cli_version(executable, env) do
-      {:ok, have} -> version_gate(have)
-      :unknown -> :ok
+  defp check_cli_version(Backend.Local, %Control{features?: true}, executable, env, opts) do
+    case local_cli_version(executable, probe_env(env, opts)) do
+      {:ok, have} ->
+        version_gate(have)
+
+      :unknown ->
+        Logger.warning("Could not read the Claude Code version; skipping the version gate")
+        :ok
     end
   end
 
-  defp check_cli_version(_backend, _control, _executable, _env), do: :ok
+  defp check_cli_version(_backend, _control, _executable, _env, _opts), do: :ok
+
+  # The probe runs the same binary the session is about to spawn, so it gets
+  # the same release scrub `CrowdControl.Backend.Local` applies: `System.cmd/3`
+  # only adds to the inherited environment, so each scrubbed name is unset
+  # (`{name, nil}`) and the release-free `PATH` exported. An explicit `:env`
+  # entry still wins, as under Local. Anything but `release_env: :inherit`
+  # scrubs; Local refuses an unknown value at provision.
+  defp probe_env(env, opts) do
+    scrub =
+      case Keyword.get(opts, :release_env, :scrub) do
+        :inherit ->
+          %{}
+
+        _scrub ->
+          {unset, path} = Shell.release_scrub(System.get_env())
+          scrubbed = Map.new(unset, &{&1, nil})
+          if path, do: Map.put(scrubbed, "PATH", path), else: scrubbed
+      end
+
+    scrub |> Map.merge(env) |> Map.to_list()
+  end
 
   # `:unknown` (no binary, no Claude Code banner, a hang) skips the gate: the
   # spawn then fails, or system/init decides.
@@ -550,7 +654,7 @@ defmodule CrowdControl.Session do
     task =
       Task.async(fn ->
         try do
-          System.cmd(executable, ["--version"], stderr_to_stdout: true, env: Map.to_list(env))
+          System.cmd(executable, ["--version"], stderr_to_stdout: true, env: env)
         rescue
           _ in [ErlangError, ArgumentError] -> :error
         end
@@ -575,6 +679,7 @@ defmodule CrowdControl.Session do
           else: :ok
 
       :error ->
+        Logger.warning("Unparsable Claude Code version #{inspect(have)}; skipping the gate")
         :ok
     end
   end
@@ -585,7 +690,7 @@ defmodule CrowdControl.Session do
       :ok ->
         case state.status do
           status when status in [:starting, :running] ->
-            state = state |> do_send_prompt(prompt) |> schedule_timeout()
+            state = state |> accept_prompt(prompt) |> schedule_timeout()
             persist(state)
             {:reply, :ok, state}
 
@@ -595,7 +700,7 @@ defmodule CrowdControl.Session do
           # impossible for every CLI that outlives its first result. Only an
           # exited subprocess (`exited: true`, set on EOF) is really terminal.
           :completed when not state.exited ->
-            state = %{state | status: :running} |> do_send_prompt(prompt) |> schedule_timeout()
+            state = %{state | status: :running} |> accept_prompt(prompt) |> schedule_timeout()
             persist(state)
             {:reply, :ok, state}
 
@@ -638,13 +743,16 @@ defmodule CrowdControl.Session do
     do: {:reply, {:error, :unsupported}, state}
 
   def handle_call({:respond, request_id, decision}, _from, state) do
+    # Validated and encoded before anything is written, so a decision the
+    # CLI could not receive is the caller's error and the request stays open.
     with {key, entry} <- Control.find(state.control, request_id),
-         reply when is_tuple(reply) <- Control.reply(entry, decision) do
-      state = state |> answer(key, reply, :respond) |> settle()
+         reply when is_tuple(reply) <- Control.reply(entry, decision),
+         {:ok, frame} <- encode_reply(state, request_id, reply) do
+      state = state |> deliver(key, entry, reply, frame, :respond) |> settle()
       {:reply, :ok, state}
     else
       nil -> {:reply, :ok, state}
-      _defer_or_invalid -> {:reply, {:error, {:invalid_decision, decision}}, state}
+      _defer_invalid_or_unencodable -> {:reply, {:error, {:invalid_decision, decision}}, state}
     end
   end
 
@@ -653,11 +761,11 @@ defmodule CrowdControl.Session do
       {id, control} = Control.next_request_id(state.control)
       state = put_control(state, control)
 
-      case write_frame(
-             state,
-             state.agent.encode_control({:request, id, request}, state.agent_opts)
-           ) do
-        :ok -> {:noreply, track_outbound(state, id, from, timeout)}
+      with {:ok, frame} <- encode_frame(state, {:request, id, request}),
+           :ok <- write_frame(state, frame) do
+        {:noreply, track_outbound(state, id, from, timeout, requested_mode(request))}
+      else
+        :error -> {:reply, {:error, {:invalid_request, request}}, state}
         {:error, reason} -> {:reply, {:error, {:write_failed, reason}}, state}
       end
     else
@@ -800,6 +908,13 @@ defmodule CrowdControl.Session do
     end
   end
 
+  # A stray message (a late reply to a call that timed out, a monitor nobody
+  # asked about) is not worth the sandbox: crashing here would destroy it.
+  def handle_info(message, state) do
+    Logger.debug("Session ignored an unexpected message: #{inspect(message, limit: 10)}")
+    {:noreply, state}
+  end
+
   @impl true
   def terminate(reason, state) do
     state = destroy_backend(state)
@@ -860,6 +975,10 @@ defmodule CrowdControl.Session do
     end)
   end
 
+  # A prompt accepted while the deadline's interrupt grace runs starts a new
+  # turn with a fresh deadline; the old grace timer must not destroy it.
+  defp accept_prompt(state, prompt), do: state |> clear_grace() |> do_send_prompt(prompt)
+
   defp do_send_prompt(state, prompt) do
     encoded = state.agent.encode_prompt(prompt, state.prompt_seq, state.agent_opts)
     state = %{state | prompt_seq: state.prompt_seq + 1}
@@ -910,11 +1029,12 @@ defmodule CrowdControl.Session do
         backend: state.backend,
         # Both the handle and the opts are scrubbed of credentials before they
         # touch the store -- a record can outlive the VM on disk, and nothing
-        # about reattaching needs an API key.
+        # about reattaching needs an API key. `state.opts` was scrubbed once,
+        # by persisted_opts/2 (or came scrubbed from a record).
         handle: Backend.scrub(state.backend, state.backend_state),
         byte_offset: state.byte_offset,
         buffer: state.buffer,
-        opts: Store.scrub_opts(state.opts),
+        opts: state.opts,
         owner: state.owner,
         control: Control.to_store(state.control)
       )
@@ -1034,7 +1154,7 @@ defmodule CrowdControl.Session do
   # number of prompts written, which is exactly the turn number.
   defp handle_message(state, {:result, subtype, map}) do
     msg = {:result, subtype, Map.put(map, "turn", state.prompt_seq)}
-    state = state |> clear_grace() |> turn_stopped(msg)
+    state = state |> clear_grace() |> end_turn() |> turn_stopped(msg)
     state = accumulate(%{state | status: :completed}, msg)
     broadcast(state, msg)
     state
@@ -1126,13 +1246,43 @@ defmodule CrowdControl.Session do
   defp receive_request(state, id, subtype, request, offset) do
     control = state.control
 
-    # The same line replayed from the capture, or a duplicate delivery of a
-    # request still in flight (the ids are unique among in-flight requests).
-    if Map.has_key?(control.pending, {id, offset}) or Control.find(control, id) do
-      Logger.debug("Session ignored a repeated control request #{id}")
+    cond do
+      # The same line replayed from the capture, or a duplicate delivery of a
+      # request still in flight (the ids are unique among in-flight requests).
+      Map.has_key?(control.pending, {id, offset}) or Control.find(control, id) ->
+        Logger.debug("Session ignored a repeated control request #{id}")
+        state
+
+      map_size(control.pending) >= control.max_pending ->
+        refuse_over_cap(state, id, %{subtype: subtype, request: request, status: :received})
+
+      true ->
+        add_request(state, {id, offset}, subtype, request)
+    end
+  end
+
+  # The capture is writable from inside the sandbox, so requests can be forged
+  # in bulk; past the cap they are answered at once and never persisted, which
+  # bounds both memory and Store writes.
+  defp refuse_over_cap(state, id, entry) do
+    reply = Control.failure(entry, "too many pending control requests")
+
+    case encode_reply(state, id, reply) do
+      {:ok, frame} -> write_reply(state, id, entry, frame)
+      :error -> :ok
+    end
+
+    decision_event(state, id, entry, reply, :cap)
+
+    if state.control.cap_logged_turn == state.prompt_seq do
       state
     else
-      add_request(state, {id, offset}, subtype, request)
+      Logger.warning(
+        "Session has #{state.control.max_pending} control requests pending " <>
+          "(max_pending_control); refusing more this turn"
+      )
+
+      put_control(state, %{state.control | cap_logged_turn: state.prompt_seq})
     end
   end
 
@@ -1167,10 +1317,10 @@ defmodule CrowdControl.Session do
     end
   end
 
-  defp dispatch(state, key, %{subtype: "mcp_message", request: request}) do
+  defp dispatch(state, key, %{subtype: "mcp_message", request: request} = entry) do
     case Map.fetch(state.control.sdk_servers, request["server_name"]) do
       {:ok, server} ->
-        dispatch_mcp(state, key, server, request["message"])
+        dispatch_mcp(state, key, entry, server, request["message"])
 
       :error ->
         error =
@@ -1191,11 +1341,34 @@ defmodule CrowdControl.Session do
     end
   end
 
-  # Only a tool call runs user code; the rest of MCP is answered inline.
-  defp dispatch_mcp(state, key, server, %{"method" => "tools/call"} = message),
-    do: start_task(state, key, fn -> SdkMcp.handle(server, message) end)
+  # Only a tool call runs user code, and only one the gate lets through; the
+  # rest of MCP is answered inline.
+  defp dispatch_mcp(state, key, entry, server, %{"method" => "tools/call"} = message) do
+    case Control.gate(state.control, entry, entry.request["server_name"], message) do
+      {:ok, control, entry} ->
+        control = %{control | pending: Map.put(control.pending, key, entry)}
 
-  defp dispatch_mcp(state, key, server, message),
+        state
+        |> put_control(control)
+        |> start_task(key, fn -> SdkMcp.handle(server, message) end)
+
+      {:refused, tool_name} ->
+        Logger.warning(
+          "Session refused an unapproved SDK tool call #{elem(key, 0)}: #{inspect(tool_name)}"
+        )
+
+        error =
+          SdkMcp.error_response(
+            Control.jsonrpc_id(entry.request),
+            -32_001,
+            "tool call not approved"
+          )
+
+        answer(state, key, Control.mcp_reply(error), :gate)
+    end
+  end
+
+  defp dispatch_mcp(state, key, _entry, server, message),
     do: answer(state, key, Control.mcp_reply(SdkMcp.handle(server, message)), :callback)
 
   # The CLI's own wording for a subtype nobody handles, so it never waits.
@@ -1224,7 +1397,7 @@ defmodule CrowdControl.Session do
     session = self()
 
     case Task.Supervisor.start_child(CrowdControl.CallbackSupervisor, fn ->
-           send(session, {:control_result, key, fun.()})
+           run_callback(session, key, fun)
          end) do
       {:ok, pid} ->
         control = state.control
@@ -1246,6 +1419,46 @@ defmodule CrowdControl.Session do
           :callback
         )
     end
+  end
+
+  # The task runs the user's code in a linked inner process and watches the
+  # session, so the callback dies with its session however the session dies.
+  # A session killed outright never reaches terminate/2 (it does not trap
+  # exits), and a reattached one runs its unanswered requests again: without
+  # this a blocked callback would live on beside its replacement. The task
+  # traps exits so a cancel (terminate_child) reaches the inner process too.
+  defp run_callback(session, key, fun) do
+    Process.flag(:trap_exit, true)
+    session_ref = Process.monitor(session)
+    task = self()
+    inner = spawn_link(fn -> send(task, {:callback_done, self(), capture(fun)}) end)
+
+    receive do
+      {:callback_done, ^inner, {:ok, result}} -> send(session, {:control_result, key, result})
+      # Re-raised as the task's own exit, so the session sees the crash.
+      {:callback_done, ^inner, {:crashed, reason}} -> exit(reason)
+      {:EXIT, ^inner, reason} -> exit(reason)
+      {:DOWN, ^session_ref, :process, _pid, _reason} -> stop_inner(inner, :shutdown)
+      {:EXIT, _supervisor, reason} -> stop_inner(inner, reason)
+    end
+  end
+
+  defp capture(fun) do
+    {:ok, fun.()}
+  catch
+    :error, reason ->
+      {:crashed, {Exception.normalize(:error, reason, __STACKTRACE__), __STACKTRACE__}}
+
+    :exit, reason ->
+      {:crashed, reason}
+
+    :throw, value ->
+      {:crashed, {{:nocatch, value}, __STACKTRACE__}}
+  end
+
+  defp stop_inner(inner, reason) do
+    Process.exit(inner, :kill)
+    exit(reason)
   end
 
   defp arm_permission_timer(state, key) do
@@ -1291,8 +1504,15 @@ defmodule CrowdControl.Session do
             defer(state, key, entry)
 
           :invalid ->
-            Logger.error("Control callback for #{elem(key, 0)} returned #{inspect(result)}")
-            answer(state, key, Control.failure(entry, "invalid callback decision"), :callback)
+            failure = Control.failure(entry, "invalid callback decision")
+
+            # The decision itself may carry tool input or secrets: not logged.
+            Logger.error(
+              "Control callback for #{elem(key, 0)} (#{entry.subtype}) returned an " <>
+                "invalid decision; answering #{Control.behavior(failure)}"
+            )
+
+            answer(state, key, failure, :callback)
 
           reply ->
             answer(state, key, reply, :callback)
@@ -1330,13 +1550,47 @@ defmodule CrowdControl.Session do
   # request_ids it is not waiting on"), so recovery may answer twice.
   defp answer(state, {id, _offset} = key, reply, source) do
     entry = Map.fetch!(state.control.pending, key)
-    write_reply(state, id, entry, reply)
-    decision_event(state, id, entry, reply, source)
-    drop_entry(state, key)
+    {reply, frame} = encode_answer(state, id, entry, reply)
+    deliver(state, key, entry, reply, frame, source)
   end
 
-  defp write_reply(state, id, entry, reply) do
-    case write_frame(state, encode_reply(state, id, reply)) do
+  defp deliver(state, {id, _offset} = key, entry, reply, frame, source) do
+    write_reply(state, id, entry, frame)
+    decision_event(state, id, entry, reply, source)
+    state = drop_entry(state, key)
+    put_control(state, Control.answered(state.control, entry, reply))
+  end
+
+  # A decision the CLI cannot receive (a tuple or pid inside it, a malformed
+  # permission update, a tool result holding either) must not crash the
+  # session -- terminate/2 would destroy the sandbox -- so it becomes the
+  # failure answer for its request.
+  defp encode_answer(state, id, entry, reply) do
+    case encode_reply(state, id, reply) do
+      {:ok, frame} ->
+        {reply, frame}
+
+      :error ->
+        message =
+          if entry.subtype == "mcp_message",
+            do: "tool returned an unencodable result",
+            else: "unencodable decision"
+
+        failure = Control.failure(entry, message)
+
+        Logger.error(
+          "Control answer for #{id} (#{entry.subtype}) cannot be encoded as JSON; " <>
+            "answering #{Control.behavior(failure)}"
+        )
+
+        # Built from the request's own decoded JSON, so it always encodes.
+        {:ok, frame} = encode_reply(state, id, failure)
+        {failure, frame}
+    end
+  end
+
+  defp write_reply(state, id, entry, frame) do
+    case write_frame(state, frame) do
       :ok ->
         :ok
 
@@ -1352,8 +1606,10 @@ defmodule CrowdControl.Session do
             "tool result too large for the session's transport"
           )
 
+        {:ok, fallback} = encode_reply(state, id, Control.mcp_reply(error))
+
         state
-        |> write_frame(encode_reply(state, id, Control.mcp_reply(error)))
+        |> write_frame(fallback)
         |> write_failed(state)
 
       error ->
@@ -1369,10 +1625,24 @@ defmodule CrowdControl.Session do
   end
 
   defp encode_reply(state, id, {:permission, decision}),
-    do: state.agent.encode_control({:permission, id, decision}, state.agent_opts)
+    do: encode_frame(state, {:permission, id, decision})
 
   defp encode_reply(state, id, {:response, result}),
-    do: state.agent.encode_control({:response, id, result}, state.agent_opts)
+    do: encode_frame(state, {:response, id, result})
+
+  # The adapters encode with `JSON.encode!/1`, which raises on a term JSON has
+  # no form for; every frame built from caller data goes through here instead.
+  defp encode_frame(state, message) do
+    {:ok, state.agent.encode_control(message, state.agent_opts)}
+  rescue
+    _ in [
+      Elixir.Protocol.UndefinedError,
+      ArgumentError,
+      FunctionClauseError,
+      ErlangError
+    ] ->
+      :error
+  end
 
   defp drop_entry(state, key) do
     control = state.control
@@ -1420,13 +1690,20 @@ defmodule CrowdControl.Session do
 
   # --- Control protocol: host-originated requests ---
 
-  defp track_outbound(state, id, from, timeout) do
+  # `mode` is the mode a `set_permission_mode` asks for; once the CLI accepts
+  # it, the SDK tool gate follows (bypassPermissions pre-approves every tool).
+  defp track_outbound(state, id, from, timeout, mode \\ nil) do
     timer =
       if is_integer(timeout), do: :erlang.start_timer(timeout, self(), {:control_timeout, id})
 
-    outbound = Map.put(state.control.outbound, id, %{from: from, timer: timer})
+    outbound = Map.put(state.control.outbound, id, %{from: from, timer: timer, mode: mode})
     put_control(state, %{state.control | outbound: outbound})
   end
+
+  defp requested_mode(%{"subtype" => "set_permission_mode", "mode" => mode}) when is_binary(mode),
+    do: mode
+
+  defp requested_mode(_request), do: nil
 
   # Registers a written handshake frame's request id, so its reply is consumed
   # (and a rejection logged) rather than dropped unread.
@@ -1451,10 +1728,14 @@ defmodule CrowdControl.Session do
       {nil, _outbound} ->
         state
 
-      {%{from: from, timer: timer}, outbound} ->
+      {%{from: from, timer: timer} = sent, outbound} ->
         cancel_timer(timer)
-        state = put_control(state, %{state.control | outbound: outbound})
-        route_response(state, from, result, envelope)
+        control = %{state.control | outbound: outbound}
+
+        control =
+          if match?({:ok, _}, result), do: Control.set_mode(control, sent.mode), else: control
+
+        route_response(put_control(state, control), from, result, envelope)
     end
   end
 
@@ -1504,7 +1785,8 @@ defmodule CrowdControl.Session do
   defp write_reattach_frame(frame, state) do
     with :ok <- write_frame(state, frame),
          id when is_binary(id) <- control_request_id(frame) do
-      state = track_outbound(state, id, :reattach, @reattach_reply_timeout)
+      timeout = Keyword.get(state.opts, :reattach_reply_timeout, @reattach_reply_timeout)
+      state = track_outbound(state, id, :reattach, timeout)
       put_control(state, %{state.control | reconciling: true})
     else
       nil ->
@@ -1705,6 +1987,8 @@ defmodule CrowdControl.Session do
     put_control(state, %{control | grace_ref: nil})
   end
 
+  defp end_turn(state), do: put_control(state, Control.end_turn(state.control))
+
   # Teardown: every callback is cancelled and every waiter answered, so nothing
   # outlives the CLI it was talking to.
   defp shutdown_control(%{control: control} = state) do
@@ -1778,7 +2062,9 @@ defmodule CrowdControl.Session do
       Map.put(meta(state), :turn, state.prompt_seq)
     )
 
-    %{state | turn_starts: state.turn_starts ++ [now]}
+    if is_nil(state.turn_started_at),
+      do: %{state | turn_started_at: now},
+      else: %{state | queued_turns: state.queued_turns + 1}
   end
 
   # Claude Code's `total_cost_usd` is cumulative for the process, so a turn's
@@ -1793,11 +2079,11 @@ defmodule CrowdControl.Session do
 
     state = %{state | last_cost_usd: cost || state.last_cost_usd}
 
-    case state.turn_starts do
-      [] ->
+    case state.turn_started_at do
+      nil ->
         state
 
-      [started | rest] ->
+      started ->
         now = System.monotonic_time()
 
         error_kind =
@@ -1818,9 +2104,14 @@ defmodule CrowdControl.Session do
           })
         )
 
-        %{state | turn_starts: rest}
+        next_turn(state, now)
     end
   end
+
+  defp next_turn(%{queued_turns: 0} = state, _now), do: %{state | turn_started_at: nil}
+
+  defp next_turn(state, now),
+    do: %{state | turn_started_at: now, queued_turns: state.queued_turns - 1}
 
   # The audit trail for permission decisions: answers are written to stdin and
   # never reach the capture, so this event is the only record of them.
@@ -1834,6 +2125,23 @@ defmodule CrowdControl.Session do
         tool_name: request["tool_name"],
         behavior: Control.behavior(reply),
         source: source
+      }
+    )
+  end
+
+  # A refused SDK tool call is a permission decision the CLI never saw.
+  defp decision_event(state, id, %{subtype: "mcp_message", request: request}, _reply, :gate) do
+    {tool, _arguments} = SdkMcp.tool_call(request["message"])
+
+    Telemetry.execute(
+      [:crowd_control, :control, :decision],
+      %{system_time: System.system_time()},
+      %{
+        store_key: state.store_key,
+        request_id: id,
+        tool_name: "mcp__#{request["server_name"]}__#{tool}",
+        behavior: :deny,
+        source: :gate
       }
     )
   end

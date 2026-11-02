@@ -678,7 +678,7 @@ defmodule CrowdControl.SessionTest do
   # claude 2.1.292 was observed to (research/verify-control.md).
   describe "control protocol" do
     test "a sync allow runs the tool with the input the callback returned" do
-      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :allow_edited, [self()]})
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :allow_edited, [me()]})
       Session.subscribe(pid)
       :ok = Session.send_prompt(pid, "go")
 
@@ -716,7 +716,7 @@ defmodule CrowdControl.SessionTest do
     end
 
     test ":defer surfaces the request to subscribers and respond/3 answers it" do
-      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [self()]})
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [me()]})
       Session.subscribe(pid)
       :ok = Session.send_prompt(pid, "go")
 
@@ -771,7 +771,7 @@ defmodule CrowdControl.SessionTest do
     end
 
     test "interrupt/1 withdraws the pending request and the turn ends aborted" do
-      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [self()]})
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [me()]})
       Session.subscribe(pid)
       :ok = Session.send_prompt(pid, "go")
 
@@ -789,7 +789,7 @@ defmodule CrowdControl.SessionTest do
     test "two permission prompts in one turn are asked one after the other" do
       {:ok, pid} =
         start_control_session(
-          can_use_tool: {__MODULE__, :allow, [self()]},
+          can_use_tool: {__MODULE__, :allow, [me()]},
           env: %{"FAKE_CC_TOOLS" => "2"}
         )
 
@@ -807,7 +807,7 @@ defmodule CrowdControl.SessionTest do
     end
 
     test "host requests round-trip through control/3 and its shorthands" do
-      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [self()]})
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [me()]})
 
       assert {:ok, %{}} = Session.set_model(pid, "sonnet")
       assert {:ok, %{"mode" => "plan"}} = Session.set_permission_mode(pid, "plan")
@@ -884,7 +884,7 @@ defmodule CrowdControl.SessionTest do
           backend: {Mock, mock: ctl},
           executable: "claude",
           timeout: 10_000,
-          can_use_tool: {__MODULE__, :defer, [self()]}
+          can_use_tool: {__MODULE__, :defer, [me()]}
         )
 
       assert_receive {:asked, "perm-2", _request}, 2_000
@@ -923,6 +923,44 @@ defmodule CrowdControl.SessionTest do
 
       TestHelpers.stop_session(pid)
     end
+
+    test "a hook callback's output is the CLI's answer (W-18)" do
+      {:ok, pid} = start_hook_session({__MODULE__, :hook_ok, [me()]})
+
+      assert_receive {:hook_ran, _id, %{"hook_event_name" => "PreToolUse"}}, 5_000
+      assert hook_answer(pid) == %{"continue" => true, "suppressOutput" => true}
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a hook_callback naming no registered hook is an error answer (W-18)" do
+      {:ok, pid} =
+        start_hook_session({__MODULE__, :hook_ok, [me()]}, "hook_PostToolUse_0_0")
+
+      assert hook_answer(pid) == %{"error" => ~s(unknown hook callback: "hook_PostToolUse_0_0")}
+      refute_received {:hook_ran, _, _}
+
+      TestHelpers.stop_session(pid)
+    end
+
+    @tag :capture_log
+    test "a crashing hook is an error answer, and the session lives (W-18)" do
+      {:ok, pid} = start_hook_session({__MODULE__, :crash, []})
+
+      assert hook_answer(pid) == %{"error" => "callback crashed"}
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    @tag :capture_log
+    test "a hook returning anything else is an error answer (W-18)" do
+      {:ok, pid} = start_hook_session({__MODULE__, :hook_invalid, []})
+
+      assert hook_answer(pid) == %{"error" => "invalid callback decision"}
+
+      TestHelpers.stop_session(pid)
+    end
   end
 
   defp start_fake_session(extra_opts \\ []) do
@@ -944,6 +982,25 @@ defmodule CrowdControl.SessionTest do
     )
   end
 
+  # fake_control_cli.exs in hook mode: a prompt makes it call `hook_id`, and
+  # the turn's result carries the answer it got, JSON-encoded.
+  defp start_hook_session(callback, hook_id \\ "hook_PreToolUse_0_0") do
+    {:ok, pid} =
+      start_control_session(
+        hooks: %{"PreToolUse" => [%{matcher: "Bash", hooks: [callback]}]},
+        env: %{"FAKE_CC_MODE" => "hook", "FAKE_CC_HOOK_ID" => hook_id}
+      )
+
+    Session.subscribe(pid)
+    :ok = Session.send_prompt(pid, "go")
+    {:ok, pid}
+  end
+
+  defp hook_answer(pid) do
+    assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
+    JSON.decode!(result["result"])
+  end
+
   # The content of the first tool_result the CLI reported.
   defp tool_result_text(pid) do
     Enum.find_value(Session.get_messages(pid), fn
@@ -963,6 +1020,20 @@ defmodule CrowdControl.SessionTest do
   end
 
   # --- control callbacks: apply(m, f, [request, context | extra]) ---
+
+  # Callback extra_args are persisted, so a pid is refused there; callbacks
+  # reach the test process by a registered name instead.
+  defp me do
+    case Process.info(self(), :registered_name) do
+      {:registered_name, name} when is_atom(name) ->
+        name
+
+      _unregistered ->
+        name = :"#{__MODULE__}.#{System.unique_integer([:positive])}"
+        Process.register(self(), name)
+        name
+    end
+  end
 
   def allow(request, context, test) do
     send(test, {:asked, context.request_id, request})
@@ -986,4 +1057,11 @@ defmodule CrowdControl.SessionTest do
   end
 
   def crash(_request, _context), do: raise("callback bug")
+
+  def hook_ok(request, context, test) do
+    send(test, {:hook_ran, context.request_id, request["input"]})
+    {:ok, %{"continue" => true, "suppressOutput" => true}}
+  end
+
+  def hook_invalid(_request, _context), do: :maybe
 end

@@ -20,15 +20,15 @@
 #     `pending_permission_requests`, plus `session_state`; for each declared
 #     `sdkMcpServers` name it sends an MCP `initialize` (`mcp_message`, id 0).
 #   * a late answer for a withdrawn or unknown request_id is ignored.
+#   * mcp_permission mode: an SDK MCP tool is asked first, as a `can_use_tool`
+#     named `mcp__<server>__<tool>` (the naming Claude Code gives SDK tools),
+#     and only an allow is followed by the `tools/call`, whose arguments are
+#     the allow's updatedInput.
 #
 # Environment:
 #   FAKE_CC_VERSION      version for `--version` and system/init (2.1.292)
-#   FAKE_CC_SESSION_ID   the session id
-#   FAKE_CC_MODE         permission (default) | mcp | hook | plain
+#   FAKE_CC_MODE         permission (default) | mcp | mcp_permission | hook
 #   FAKE_CC_TOOLS        tool calls per turn in permission mode (1)
-#   FAKE_CC_MCP_SERVER   mcp mode: server name (app)
-#   FAKE_CC_MCP_TOOL     mcp mode: tool name (echo)
-#   FAKE_CC_MCP_ARGS     mcp mode: JSON arguments ({"text":"hi"})
 #   FAKE_CC_HOOK_ID      hook mode: callback_id to call
 #   FAKE_CC_LOG          append every stdin line to this file
 
@@ -45,7 +45,7 @@ defmodule FakeControlCli do
 
     loop(%{
       inited: false,
-      session_id: System.get_env("FAKE_CC_SESSION_ID", "fake-control-#{System.pid()}"),
+      session_id: "fake-control-#{System.pid()}",
       mode: System.get_env("FAKE_CC_MODE", "permission"),
       tools: String.to_integer(System.get_env("FAKE_CC_TOOLS", "1")),
       turns: 0,
@@ -126,8 +126,8 @@ defmodule FakeControlCli do
     state = %{state | turns: state.turns + 1, denials: [], outputs: []}
 
     case state.mode do
-      "plain" -> finish(state)
       "mcp" -> ask_mcp(state)
+      "mcp_permission" -> ask_mcp_permission(state)
       "hook" -> ask_hook(state)
       _permission -> ask_tool(0, state)
     end
@@ -165,10 +165,7 @@ defmodule FakeControlCli do
   end
 
   defp ask_mcp(state) do
-    server = System.get_env("FAKE_CC_MCP_SERVER", "app")
-    tool = System.get_env("FAKE_CC_MCP_TOOL", "echo")
-    args = JSON.decode!(System.get_env("FAKE_CC_MCP_ARGS", ~s({"text":"hi"})))
-    id = uuid()
+    {server, tool, args} = mcp_tool()
 
     emit(
       assistant([
@@ -180,6 +177,15 @@ defmodule FakeControlCli do
         }
       ])
     )
+
+    call_mcp(server, tool, args, state)
+  end
+
+  # mcp modes always call the `echo` tool of the `app` server.
+  defp mcp_tool, do: {"app", "echo", %{"text" => "hi"}}
+
+  defp call_mcp(server, tool, args, state) do
+    id = uuid()
 
     emit(%{
       "type" => "control_request",
@@ -197,6 +203,33 @@ defmodule FakeControlCli do
     })
 
     %{state | waiting: %{kind: :mcp, id: id}}
+  end
+
+  defp ask_mcp_permission(state) do
+    {server, tool, args} = mcp_tool()
+    name = "mcp__#{server}__#{tool}"
+
+    emit(
+      assistant([%{"type" => "tool_use", "id" => "toolu_mcp", "name" => name, "input" => args}])
+    )
+
+    frame = %{
+      "type" => "control_request",
+      "request_id" => uuid(),
+      "request" => %{
+        "subtype" => "can_use_tool",
+        "tool_name" => name,
+        "display_name" => tool,
+        "input" => args,
+        "permission_suggestions" => [],
+        "blocked_path" => nil,
+        "tool_use_id" => "toolu_mcp"
+      }
+    }
+
+    emit(frame)
+    waiting = %{kind: :mcp_permission, id: frame["request_id"], frame: frame, mcp: {server, tool}}
+    %{state | waiting: waiting}
   end
 
   defp ask_hook(state) do
@@ -218,6 +251,24 @@ defmodule FakeControlCli do
     })
 
     %{state | waiting: %{kind: :hook, id: id}}
+  end
+
+  defp answered(%{kind: :mcp_permission, mcp: {server, tool}}, response, state) do
+    case response do
+      %{
+        "subtype" => "success",
+        "response" => %{"behavior" => "allow", "updatedInput" => %{} = input}
+      } ->
+        call_mcp(server, tool, input, state)
+
+      %{"subtype" => "success", "response" => %{"behavior" => "deny"} = deny} ->
+        emit(tool_result("toolu_mcp", deny["message"] || "", true))
+        finish(%{state | outputs: ["denied: #{deny["message"]}"]})
+
+      other ->
+        emit(tool_result("toolu_mcp", "permission request failed", true))
+        finish(%{state | outputs: ["failed: #{JSON.encode!(other)}"]})
+    end
   end
 
   defp answered(%{kind: :permission} = waiting, %{"subtype" => "success"} = response, state) do
@@ -256,14 +307,28 @@ defmodule FakeControlCli do
   end
 
   defp answered(%{kind: kind}, response, state) when kind in [:mcp, :hook] do
-    payload =
-      case response do
-        %{"subtype" => "success"} -> Map.get(response, "response", %{})
-        %{"error" => error} -> %{"error" => error}
-      end
+    case response do
+      %{"subtype" => "success"} ->
+        mcp_or_hook_answered(kind, Map.get(response, "response", %{}), state)
 
+      %{"error" => error} ->
+        mcp_or_hook_answered(kind, %{"error" => error}, state)
+
+      # A malformed host answer ends the turn with an explained error.
+      other ->
+        malformed_answer(other, state)
+    end
+  end
+
+  defp mcp_or_hook_answered(kind, payload, state) do
     emit(tool_result("toolu_#{kind}", JSON.encode!(payload), false))
     finish(%{state | outputs: [JSON.encode!(payload)]})
+  end
+
+  defp malformed_answer(response, state) do
+    errors = ["malformed control_response: #{JSON.encode!(response)}"]
+    emit(result("error_during_execution", state, %{"errors" => errors}))
+    state
   end
 
   defp next_tool(index, state) do
@@ -316,8 +381,11 @@ defmodule FakeControlCli do
   defp host_request(id, %{"subtype" => "initialize"} = request, state) do
     {pending, session_state} =
       case state.waiting do
-        %{kind: :permission, frame: frame} -> {[frame], "requires_action"}
-        _other -> {[], "idle"}
+        %{kind: kind, frame: frame} when kind in [:permission, :mcp_permission] ->
+          {[frame], "requires_action"}
+
+        _other ->
+          {[], "idle"}
       end
 
     emit(%{

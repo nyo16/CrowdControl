@@ -1238,26 +1238,14 @@ defmodule CrowdControl.Provider.Compose do
 
   @impl true
   def scrub(%__MODULE__{} = handle) do
-    # `Store.scrub_opts/1` drops the top-level credential keys. It cannot see
-    # into `:services`, and a service spec's `:env` is exactly where a proxy's
-    # upstream key or a database password lives — so the specs are stripped too.
-    # Store records are written to disk and outlive the VM, and reconnecting
-    # needs none of it: every container already holds the environment it was
-    # started with.
-    %{handle | config: handle.config |> Store.scrub_opts() |> scrub_services()}
+    # `Store.scrub_opts/1` drops the top-level credential keys and strips `:env`
+    # and `:files` from the `:services` specs: a service spec's `:env` is
+    # exactly where a proxy's upstream key or a database password lives. Store
+    # records are written to disk and outlive the VM, and reconnecting needs
+    # none of it: every container already holds the environment it was started
+    # with.
+    %{handle | config: Store.scrub_opts(handle.config)}
   end
-
-  defp scrub_services(config) do
-    case config[:services] do
-      specs when is_list(specs) -> Keyword.put(config, :services, Enum.map(specs, &drop_env/1))
-      _ -> config
-    end
-  end
-
-  # `:files` too: configuration rather than credentials by contract, but up to
-  # 1 MiB per service that nothing after `acquire/1` reads.
-  defp drop_env(spec) when is_map(spec), do: Map.drop(spec, [:env, :files])
-  defp drop_env(spec), do: spec
 
   # --- validation gates ---
 

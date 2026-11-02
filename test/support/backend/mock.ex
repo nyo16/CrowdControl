@@ -32,9 +32,13 @@ defmodule CrowdControl.Backend.Mock do
       `:eof`, or `{:sleep, ms}`
     * `:live` - handles returned by `list_live/1`
     * `:reattachable` - whether `reattachable?/0` reports true (default `true`)
-    * `:fail` - map of `callback_name => reason` to force `{:error, reason}`
+    * `:fail` - map of `callback_name => reason` to force `{:error, reason}`;
+      a reason of `{:raise, message}` raises `RuntimeError` instead, for a
+      backend that crashes rather than fails
     * `:max_write_bytes` - a frame limit: larger writes return
       `{:error, :frame_too_large}`, as `CrowdControl.Backend.Docker` does
+    * `:destroy_delay` - ms `destroy/1` blocks before returning, as a
+      Kubernetes destroy waiting out a Pod's termination grace does
   """
   @spec start_link(keyword()) :: {:ok, ctl()} | {:error, term()}
   def start_link(opts \\ []) do
@@ -45,6 +49,7 @@ defmodule CrowdControl.Backend.Mock do
         reattachable: Keyword.get(opts, :reattachable, true),
         fail: Keyword.get(opts, :fail, %{}),
         max_write_bytes: Keyword.get(opts, :max_write_bytes),
+        destroy_delay: Keyword.get(opts, :destroy_delay, 0),
         calls: [],
         writes: [],
         destroyed: []
@@ -123,7 +128,11 @@ defmodule CrowdControl.Backend.Mock do
     with :ok <- check_fail(ctl, :start_reader) do
       # spawn_link, per the Backend reader contract: a dead reader must take
       # the session down rather than leave it silently deaf.
-      {:ok, spawn_link(fn -> reader_loop(ctl, session_pid, cursor) end)}
+      {:ok,
+       spawn_link(fn ->
+         # A session that exits :normal does not take a linked reader with it.
+         reader_loop(ctl, session_pid, Process.monitor(session_pid), cursor)
+       end)}
     end
   end
 
@@ -131,13 +140,18 @@ defmodule CrowdControl.Backend.Mock do
   def write(%__MODULE__{ctl: ctl}, data) do
     record(ctl, :write)
     data = IO.iodata_to_binary(data)
-    Agent.update(ctl, &%{&1 | writes: [data | &1.writes]})
 
-    with :ok <- check_fail(ctl, :write) do
-      case Agent.get(ctl, & &1.max_write_bytes) do
-        max when is_integer(max) and byte_size(data) > max -> {:error, :frame_too_large}
-        _ -> :ok
-      end
+    # Only accepted writes are recorded: a refused one never reached the CLI.
+    with :ok <- check_fail(ctl, :write),
+         :ok <- check_size(ctl, data) do
+      Agent.update(ctl, &%{&1 | writes: [data | &1.writes]})
+    end
+  end
+
+  defp check_size(ctl, data) do
+    case Agent.get(ctl, & &1.max_write_bytes) do
+      max when is_integer(max) and byte_size(data) > max -> {:error, :frame_too_large}
+      _ -> :ok
     end
   end
 
@@ -156,6 +170,12 @@ defmodule CrowdControl.Backend.Mock do
   @impl true
   def destroy(%__MODULE__{ctl: ctl, id: id}) do
     record(ctl, :destroy)
+
+    case Agent.get(ctl, & &1.destroy_delay) do
+      0 -> :ok
+      ms -> Process.sleep(ms)
+    end
+
     Agent.update(ctl, &%{&1 | destroyed: [id | &1.destroyed]})
     :ok
   end
@@ -195,31 +215,38 @@ defmodule CrowdControl.Backend.Mock do
   defp check_fail(ctl, name) do
     case Agent.get(ctl, & &1.fail)[name] do
       nil -> :ok
+      {:raise, message} -> raise message
       reason -> {:error, reason}
     end
   end
 
   # Drains scripted events, polling so a test can push more after the session
-  # has already started.
-  defp reader_loop(ctl, session_pid, cursor) do
+  # has already started. Stops once the session is gone.
+  defp reader_loop(ctl, session_pid, monitor, cursor) do
     case Agent.get_and_update(ctl, fn
            %{events: []} = s -> {nil, s}
            %{events: [e | rest]} = s -> {e, %{s | events: rest}}
          end) do
       nil ->
-        Process.sleep(@poll_interval)
-        reader_loop(ctl, session_pid, cursor)
+        pause_then_loop(ctl, session_pid, monitor, cursor, @poll_interval)
 
       {:sleep, ms} ->
-        Process.sleep(ms)
-        reader_loop(ctl, session_pid, cursor)
+        pause_then_loop(ctl, session_pid, monitor, cursor, ms)
 
       :eof ->
         GenServer.cast(session_pid, :eof)
 
       {:stdout_data, data} ->
         GenServer.cast(session_pid, {:stdout_data, data})
-        reader_loop(ctl, session_pid, cursor)
+        reader_loop(ctl, session_pid, monitor, cursor)
+    end
+  end
+
+  defp pause_then_loop(ctl, session_pid, monitor, cursor, ms) do
+    receive do
+      {:DOWN, ^monitor, :process, _pid, _reason} -> :ok
+    after
+      ms -> reader_loop(ctl, session_pid, monitor, cursor)
     end
   end
 end

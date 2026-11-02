@@ -1,7 +1,15 @@
 defmodule CrowdControlTest do
   use ExUnit.Case, async: false
 
+  alias CrowdControl.Backend.Mock
   alias CrowdControl.{Session, TestHelpers}
+
+  # A permission callback that takes longer than the run's :timeout, like a
+  # human taking their time.
+  def slow_allow(request, _context, ms) do
+    Process.sleep(ms)
+    {:allow, request["input"]}
+  end
 
   describe "start_session/1" do
     test "returns {:ok, pid} for a valid session" do
@@ -161,15 +169,12 @@ defmodule CrowdControlTest do
                )
     end
 
-    test "times out on an absolute deadline under a steady non-result stream" do
+    test "times out at the session's deadline under a steady non-result stream" do
       # A continuous stream of assistant (non-result) messages must not keep
-      # pushing the deadline out. Discrimination window:
-      #   * fixed (absolute) deadline  -> returns at ~1000ms (1x the timeout)
-      #   * regressed resetting window -> the session self-expires at 1000ms and
-      #     stops the stream; the last timer reset is that expiry message, so the
-      #     stale window fires ~1000ms later, i.e. ~2000ms (2x).
-      # Both are real monotonic timers (no large drift), so the 1500ms midpoint
-      # cleanly separates correct (<1500ms) from regressed (~2000ms).
+      # pushing the deadline out: the session's turn timer is not refreshed by
+      # output, so it expires at ~1000ms and run/2 returns on that expiry. A
+      # regression (a wait restarted per message, or a session timer refreshed
+      # by output) would return much later; 1500ms separates the two.
       {elapsed_us, result} =
         :timer.tc(fn ->
           CrowdControl.run("go",
@@ -184,11 +189,42 @@ defmodule CrowdControlTest do
       assert div(elapsed_us, 1_000) < 1_500,
              "expected timeout near the 1000ms deadline, took #{div(elapsed_us, 1_000)}ms"
     end
+
+    test "a can_use_tool held longer than :timeout still returns the result (W-4)" do
+      frame = %{
+        "type" => "control_request",
+        "request_id" => "slow-1",
+        "request" => %{"subtype" => "can_use_tool", "tool_name" => "Bash", "input" => %{}}
+      }
+
+      ctl = start_supervised!({Mock, events: [{:stdout_data, JSON.encode!(frame) <> "\n"}]})
+
+      task =
+        Task.async(fn ->
+          CrowdControl.run("go",
+            backend: {Mock, mock: ctl},
+            executable: "claude",
+            timeout: 300,
+            can_use_tool: {__MODULE__, :slow_allow, [600]}
+          )
+        end)
+
+      # The session's turn timer is paused while the request waits, so the
+      # turn still has time left once the answer is written.
+      TestHelpers.wait_until(fn ->
+        Enum.any?(Mock.writes(ctl), &(&1 =~ ~s("behavior":"allow")))
+      end)
+
+      result = JSON.encode!(%{"type" => "result", "subtype" => "success", "is_error" => false})
+      Mock.push_events(ctl, [{:stdout_data, result <> "\n"}])
+
+      assert {:result, "success", _map} = Task.await(task, 5_000)
+    end
   end
 
   describe "run!/2" do
-    test "returns {:ok, map} for a successful turn" do
-      assert {:ok, %{"result" => "done:hi"}} =
+    test "returns the bare result map for a successful turn" do
+      assert %{"result" => "done:hi"} =
                CrowdControl.run!("hi", executable: TestHelpers.fake_cli_path(), timeout: 5_000)
     end
 

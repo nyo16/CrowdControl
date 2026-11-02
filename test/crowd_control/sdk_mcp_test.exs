@@ -128,9 +128,16 @@ defmodule CrowdControl.SdkMcpTest do
       assert message =~ "nope"
     end
 
-    test "a crashing or misbehaving tool is -32603" do
-      assert %{"error" => %{"code" => -32_603, "message" => "tool boom crashed"}} =
-               call("boom", %{})
+    test "a crashing or misbehaving tool is -32603, and a crash is logged with its stacktrace" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{"error" => %{"code" => -32_603, "message" => "tool boom crashed"}} =
+                   call("boom", %{})
+        end)
+
+      assert log =~ "SDK MCP tool boom crashed"
+      assert log =~ "(RuntimeError) tool bug"
+      assert log =~ "sdk_mcp_test.exs"
 
       assert %{"error" => %{"code" => -32_603}} = call("junk", %{})
     end

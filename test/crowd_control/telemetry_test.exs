@@ -5,7 +5,7 @@ defmodule CrowdControl.TelemetryTest do
   use ExUnit.Case, async: false
 
   alias CrowdControl.Backend.Mock
-  alias CrowdControl.{Session, TestHelpers}
+  alias CrowdControl.{SdkMcp, Session, TestHelpers}
 
   @events [
     [:crowd_control, :session, :start],
@@ -31,6 +31,7 @@ defmodule CrowdControl.TelemetryTest do
 
   def defer(_request, _context), do: :defer
   def allow(request, _context), do: {:allow, request["input"]}
+  def echo(_args), do: {:ok, "ran"}
 
   defp line(map), do: JSON.encode!(map) <> "\n"
 
@@ -130,21 +131,38 @@ defmodule CrowdControl.TelemetryTest do
   @tag :capture_log
   test "a crashed session emits exception instead of stop" do
     Process.flag(:trap_exit, true)
-    ctl = start_supervised!({Mock, events: []})
+    # A backend whose write raises: the session crashes in handle_call, and
+    # terminate/2 runs.
+    ctl = start_supervised!({Mock, events: [], fail: %{write: {:raise, "transport bug"}}})
 
     {:ok, pid} =
       Session.start_link(backend: {Mock, mock: ctl}, executable: "claude", timeout: 10_000)
 
     key = :sys.get_state(pid).store_key
 
-    # No handle_info clause matches: the session crashes through terminate/2.
-    send(pid, :unexpected)
-    assert_receive {:EXIT, ^pid, _reason}, 2_000
+    assert {{%RuntimeError{message: "transport bug"}, _stack}, _call} =
+             catch_exit(Session.send_prompt(pid, "hi"))
+
+    assert_receive {:EXIT, ^pid, {%RuntimeError{}, _stack}}, 2_000
 
     assert_receive {:event, [:crowd_control, :session, :exception], _,
-                    %{store_key: ^key, kind: :exit}}
+                    %{store_key: ^key, kind: :exit, reason: {%RuntimeError{}, _}}}
 
     refute_received {:event, [:crowd_control, :session, :stop], _, %{store_key: ^key}}
+    assert Mock.destroy_count(ctl) == 1
+  end
+
+  test "a stray message no longer crashes the session" do
+    ctl = start_supervised!({Mock, events: []})
+
+    {:ok, pid} =
+      Session.start_link(backend: {Mock, mock: ctl}, executable: "claude", timeout: 10_000)
+
+    send(pid, :unexpected)
+    assert Session.get_status(pid) == :starting
+    assert Mock.destroy_count(ctl) == 0
+
+    TestHelpers.stop_session(pid)
   end
 
   test "a failed provision is reported by the span" do
@@ -219,6 +237,64 @@ defmodule CrowdControl.TelemetryTest do
     for id <- ~w(d-respond d-cancel d-timeout d-callback) do
       refute_received {:event, [:crowd_control, :control, :decision], _, %{request_id: ^id}}
     end
+
+    TestHelpers.stop_session(pid)
+  end
+
+  @tag :capture_log
+  test "a gate refusal and an over-cap request are reported as decisions too" do
+    server = SdkMcp.tool_server("app", [%{name: "echo", call: {__MODULE__, :echo, []}}])
+    ctl = start_supervised!({Mock, events: []})
+
+    {:ok, pid} =
+      Session.start_link(
+        backend: {Mock, mock: ctl},
+        executable: "claude",
+        timeout: 10_000,
+        max_pending_control: 1,
+        can_use_tool: {__MODULE__, :defer, []},
+        sdk_mcp_servers: %{"app" => server}
+      )
+
+    key = :sys.get_state(pid).store_key
+
+    tool_call = %{
+      "type" => "control_request",
+      "request_id" => "d-gate",
+      "request" => %{
+        "subtype" => "mcp_message",
+        "server_name" => "app",
+        "message" => %{
+          "jsonrpc" => "2.0",
+          "id" => 1,
+          "method" => "tools/call",
+          "params" => %{"name" => "echo", "arguments" => %{}}
+        }
+      }
+    }
+
+    Mock.push_events(ctl, [{:stdout_data, line(tool_call)}])
+
+    assert_receive {:event, [:crowd_control, :control, :decision], _,
+                    %{
+                      store_key: ^key,
+                      request_id: "d-gate",
+                      tool_name: "mcp__app__echo",
+                      behavior: :deny,
+                      source: :gate
+                    }},
+                   2_000
+
+    Mock.push_events(ctl, [
+      {:stdout_data, can_use_tool("d-held")},
+      {:stdout_data, can_use_tool("d-cap")}
+    ])
+
+    assert_receive {:event, [:crowd_control, :control, :decision], _,
+                    %{request_id: "d-cap", tool_name: "Bash", behavior: :deny, source: :cap}},
+                   2_000
+
+    refute_received {:event, [:crowd_control, :control, :decision], _, %{request_id: "d-held"}}
 
     TestHelpers.stop_session(pid)
   end

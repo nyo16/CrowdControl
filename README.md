@@ -490,12 +490,13 @@ CrowdControl.run_many("Refactor this module for clarity", [
 
 ### Typed errors
 
-`run!/2` returns `{:ok, map}` or raises `CrowdControl.Error`; `classify/1`
-does the same without raising, for a result you already have:
+`run!/2` returns the result map or raises `CrowdControl.Error`; `classify/1`
+returns `{:ok, map}` or `{:error, error}` without raising, for a result you
+already have:
 
 ```elixir
 try do
-  {:ok, %{"result" => text}} = CrowdControl.run!("Summarize this repo")
+  %{"result" => text} = CrowdControl.run!("Summarize this repo")
   text
 rescue
   e in CrowdControl.Error ->
@@ -1709,7 +1710,7 @@ options — see `CrowdControl.Agent.Omp`.
 | Function | Description |
 |----------|-------------|
 | `run(prompt, opts)` | Single-shot: start session, send prompt, collect result, stop |
-| `run!(prompt, opts)` | As `run/2`, returning `{:ok, map}` or raising `CrowdControl.Error` |
+| `run!(prompt, opts)` | As `run/2`, returning the result map or raising `CrowdControl.Error` |
 | `classify(result)` | `{:ok, map}` or `{:error, %CrowdControl.Error{}}` for a `{:result, subtype, map}` |
 | `run_many(prompt, opts_list)` | Same prompt across N sessions with different options |
 | `start_session(opts)` | Start one supervised session (returns `{:error, :max_sessions_reached}` at limit) |
