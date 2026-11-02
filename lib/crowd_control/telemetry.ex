@@ -40,7 +40,9 @@ defmodule CrowdControl.Telemetry do
       settled, measurements `%{system_time}`, metadata `%{store_key, request_id,
       tool_name, behavior, source}`. `behavior` is `:allow`, `:deny`, `:error`
       (no handler) or `:cancelled`; `source` is `:callback`, `:respond`,
-      `:timeout` (`:permission_timeout`) or `:cancel` (withdrawn by the CLI).
+      `:timeout` (`:permission_timeout`), `:cancel` (withdrawn by the CLI),
+      `:gate` (an SDK tool call refused because no allow approved it) or `:cap`
+      (answered at once past `:max_pending_control`).
       Answers are written to the CLI's stdin and never reach the output
       capture, so this event is their audit trail.
     * `[:crowd_control, :gce, :phase]`: one per `CrowdControl.Provider.Gce`
