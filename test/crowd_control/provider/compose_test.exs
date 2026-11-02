@@ -359,6 +359,9 @@ defmodule CrowdControl.Provider.ComposeTest do
           name: "sidecar",
           image: @agent_image,
           egress: :none,
+          # python:3.13-slim defaults to root, which a sidecar must declare;
+          # this one needs no privilege at all.
+          user: "65534:65534",
           entrypoint: ["python3"],
           command: ["-c", @server, "SIDECAR-OK", "text/plain"]
         }
