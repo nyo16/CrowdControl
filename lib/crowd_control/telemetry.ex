@@ -42,7 +42,8 @@ defmodule CrowdControl.Telemetry do
       (no handler) or `:cancelled`; `source` is `:callback`, `:respond`,
       `:timeout` (`:permission_timeout`), `:cancel` (withdrawn by the CLI),
       `:gate` (an SDK tool call refused because no allow approved it) or `:cap`
-      (answered at once past `:max_pending_control`).
+      (a `can_use_tool` denied at once past `:max_pending_control`; other
+      subtypes refused over the cap get an error answer but no event).
       Answers are written to the CLI's stdin and never reach the output
       capture, so this event is their audit trail.
     * `[:crowd_control, :gce, :phase]`: one per `CrowdControl.Provider.Gce`
