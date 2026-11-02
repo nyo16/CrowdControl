@@ -12,9 +12,16 @@ defmodule Mix.Tasks.CrowdControl.ContractTest do
   setup do
     Mix.shell(Mix.Shell.Process)
 
+    # CC_CONTRACT_* steer the task itself, so a developer's own exports would
+    # leak into every test. Clear them for the test and put them back after.
+    saved = contract_env()
+    Enum.each(saved, fn {name, _} -> System.delete_env(name) end)
+
     on_exit(fn ->
       Mix.shell(Mix.Shell.IO)
       Enum.each(@fake_env, &System.delete_env/1)
+      Enum.each(contract_env(), fn {name, _} -> System.delete_env(name) end)
+      System.put_env(saved)
     end)
 
     listed =
@@ -85,5 +92,9 @@ defmodule Mix.Tasks.CrowdControl.ContractTest do
              "first initialize: no pending_permission_requests list at envelope level"
 
     assert error.message =~ "repeated initialize"
+  end
+
+  defp contract_env do
+    for {name, _} = pair <- System.get_env(), String.starts_with?(name, "CC_CONTRACT_"), do: pair
   end
 end

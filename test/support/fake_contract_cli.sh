@@ -57,7 +57,9 @@ case " $* " in
 esac
 
 while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  # The FIRST request_id is the envelope's; a greedy `.*` prefix would pick a
+  # nested one from the payload instead.
+  id=$(printf '%s' "$line" | awk '{ i = index($0, "\"request_id\":\""); if (i) { r = substr($0, i + 14); print substr(r, 1, index(r, "\"") - 1) } }')
 
   case "$line" in
     *'"subtype":"initialize"'*)
