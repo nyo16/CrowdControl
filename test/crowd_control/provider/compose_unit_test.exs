@@ -514,10 +514,18 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
 
     test "an explicit :session_token is used rather than a minted one", %{specs: specs} do
       {_handle, _endpoint, requests} =
-        acquire!(services: specs, proxy_service: "proxy", session_token: "sess-123")
+        acquire!(services: specs, proxy_service: "proxy", session_token: "ccst_sess-123")
 
-      assert "CC_SESSION_TOKEN=sess-123" in container_body(requests, "proxy")["Env"]
-      assert "ANTHROPIC_API_KEY=sess-123" in container_body(requests, "sandbox")["Env"]
+      assert "CC_SESSION_TOKEN=ccst_sess-123" in container_body(requests, "proxy")["Env"]
+      assert "ANTHROPIC_API_KEY=ccst_sess-123" in container_body(requests, "sandbox")["Env"]
+    end
+
+    test "an explicit :session_token without the ccst_ prefix is refused before any HTTP",
+         %{specs: specs} do
+      for token <- ["sess-123", "CCST_x", " ccst_x", :ccst_x] do
+        assert {:error, {:compose, {:bad_session_token, :prefix}}} =
+                 gate(services: specs, proxy_service: "proxy", session_token: token)
+      end
     end
 
     test "with no :proxy_service the environment is untouched, real key included" do
@@ -700,6 +708,132 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
     test "a service with no mounts gets no Binds key at all" do
       {_handle, _endpoint, requests} = acquire!([])
       refute Map.has_key?(container_body(requests, "sandbox")["HostConfig"], "Binds")
+    end
+  end
+
+  describe "the capture file (blocker: a sidecar rewriting the transcript)" do
+    setup do
+      sandbox = %{name: "sandbox", volumes: [%{name: "cclog", target: "/var/log/cc"}]}
+      {:ok, sandbox: sandbox}
+    end
+
+    test "a read-only mount of the capture volume is accepted", %{sandbox: sandbox} do
+      shipper = %{
+        name: "vector",
+        image: "vector:1",
+        egress: :none,
+        volumes: [%{name: "cclog", target: "/in", read_only: true}]
+      }
+
+      {_handle, _endpoint, requests} =
+        acquire!(services: [sandbox, shipper], volumes: [%{name: "cclog"}])
+
+      assert container_body(requests, "vector")["HostConfig"]["Binds"] == [
+               "#{@project}-cclog:/in:ro"
+             ]
+    end
+
+    test "a writable mount of the capture source is refused, at any target",
+         %{sandbox: sandbox} do
+      for target <- ["/var/log/cc", "/elsewhere"] do
+        shipper = %{
+          name: "vector",
+          image: "vector:1",
+          egress: :none,
+          volumes: [%{name: "cclog", target: target}]
+        }
+
+        assert {:error, {:compose, {:capture_mount_writable, "vector"}}} =
+                 gate(services: [sandbox, shipper], volumes: [%{name: "cclog"}])
+      end
+    end
+
+    test "a writable host path shared with the sandbox's capture is refused" do
+      sandbox = %{name: "sandbox", volumes: [%{host_path: "/srv/cap", target: "/var/log/cc"}]}
+
+      shipper = %{
+        name: "vector",
+        image: "vector:1",
+        egress: :none,
+        volumes: [%{host_path: "/srv/cap", target: "/in"}],
+        weaken: [:host_path]
+      }
+
+      assert {:error, {:compose, {:capture_mount_writable, "vector"}}} =
+               gate(services: [sandbox, shipper])
+
+      ro = put_in(shipper, [:volumes], [%{host_path: "/srv/cap", target: "/in", read_only: true}])
+      assert {{:ok, _, _}, _} = acquire(services: [sandbox, ro])
+    end
+
+    test "the check follows a custom :capture_path" do
+      sandbox = %{name: "sandbox", volumes: [%{name: "cclog", target: "/cap"}]}
+
+      shipper = %{
+        name: "vector",
+        image: "vector:1",
+        egress: :none,
+        volumes: [%{name: "cclog", target: "/in"}]
+      }
+
+      opts = [services: [sandbox, shipper], volumes: [%{name: "cclog"}]]
+
+      assert {{:ok, _, _}, _} = acquire(opts)
+
+      assert {:error, {:compose, {:capture_mount_writable, "vector"}}} =
+               gate([capture_path: "/cap/out.jsonl"] ++ opts)
+    end
+
+    test ":files staged into the capture volume are refused, on any service",
+         %{sandbox: sandbox} do
+      file = %{path: "/in/out.jsonl", content: "{}\n"}
+
+      # A sidecar's writable mount is refused first; a read-only one cannot
+      # take files at all. Either way nothing is staged into the capture.
+      writer = %{
+        name: "seed",
+        image: "seed:1",
+        egress: :none,
+        volumes: [%{name: "cclog", target: "/in"}],
+        files: [file]
+      }
+
+      assert {:error, {:compose, {:capture_mount_writable, "seed"}}} =
+               gate(services: [sandbox, writer], volumes: [%{name: "cclog"}])
+
+      seeded = Map.put(sandbox, :files, [%{path: "/var/log/cc/out.jsonl", content: "{}\n"}])
+
+      assert {:error, {:compose, {:capture_mount_writable, "sandbox"}}} =
+               gate(services: [seeded], volumes: [%{name: "cclog"}])
+    end
+
+    test "with no capture mount, the sandbox still may not pre-seed the capture" do
+      seeded = %{name: "sandbox", files: [%{path: "/var/log/cc/out.jsonl", content: "{}\n"}]}
+
+      assert {:error, {:compose, {:capture_mount_writable, "sandbox"}}} =
+               gate(services: [seeded])
+    end
+  end
+
+  describe "host paths (blocker: a sidecar with the host filesystem, undeclared)" do
+    test "a sidecar host_path mount needs weaken: [:host_path], read-only or not" do
+      for read_only <- [false, true] do
+        spec = %{
+          name: "db",
+          image: "db:1",
+          egress: :none,
+          volumes: [%{host_path: "/srv/in", target: "/in", read_only: read_only}]
+        }
+
+        assert {:error, {:compose, {:weakening_not_declared, {"db", :host_path}}}} =
+                 gate(services: [spec])
+
+        {_handle, _endpoint, requests} =
+          acquire!(services: [Map.put(spec, :weaken, [:host_path])])
+
+        suffix = if read_only, do: ":ro", else: ""
+        assert container_body(requests, "db")["HostConfig"]["Binds"] == ["/srv/in:/in" <> suffix]
+      end
     end
   end
 
@@ -1162,7 +1296,7 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
         # Read-only only for this service.
         {[], %{readonly_rootfs: true}, []},
         # Under a tmpfs, which hides the file once it mounts.
-        {[], %{tmpfs: %{"/cfg" => "rw"}}, []}
+        {[], %{tmpfs: %{"/cfg" => "rw,noexec,nosuid"}}, []}
       ]
 
       for {stack, host_config, volumes} <- cases do
@@ -1460,6 +1594,53 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
           ] do
         assert {:error, {:compose, {:privileged_refused, "browser"}}} = gate(services: [spec])
       end
+    end
+
+    test "a root user in any spelling needs weaken: [:user]; a non-root uid does not" do
+      for user <- ["0", "00", "000:1000", "root", "root:root"] do
+        spec = %{name: "browser", image: "b:1", egress: :none, user: user}
+
+        assert {:error, {:compose, {:weakening_not_declared, {"browser", :user}}}} =
+                 gate(services: [spec])
+
+        {_handle, _endpoint, requests} = acquire!(services: [Map.put(spec, :weaken, [:user])])
+        assert container_body(requests, "browser")["User"] == user
+      end
+
+      {_handle, _endpoint, requests} =
+        acquire!(services: [%{name: "browser", image: "b:1", egress: :none, user: "1000"}])
+
+      assert container_body(requests, "browser")["User"] == "1000"
+    end
+
+    test "a user the runtime might still read as root is invalid, declared or not" do
+      for user <- ["+0", " 0", "0 ", "-0", "0\n"] do
+        spec = %{name: "browser", image: "b:1", egress: :none, user: user, weaken: [:user]}
+        assert {:error, {:compose, {:bad_service, {"browser", :user}}}} = gate(services: [spec])
+      end
+    end
+
+    test "a tmpfs without noexec,nosuid needs weaken: [:tmpfs_exec]" do
+      spec = %{
+        name: "browser",
+        image: "b:1",
+        egress: :none,
+        host_config: %{tmpfs: %{"/tmp" => "rw,nosuid,size=512m"}}
+      }
+
+      assert {:error, {:compose, {:weakening_not_declared, {"browser", :tmpfs_exec}}}} =
+               gate(services: [spec])
+
+      {_handle, _endpoint, requests} =
+        acquire!(services: [Map.put(spec, :weaken, [:tmpfs_exec])])
+
+      assert container_body(requests, "browser")["HostConfig"]["Tmpfs"]["/tmp"] ==
+               "rw,nosuid,size=512m"
+    end
+
+    test "an env key that would corrupt KEY=value is refused before any HTTP" do
+      spec = %{name: "browser", image: "b:1", egress: :none, env: %{"A=B" => "c"}}
+      assert {:error, {:compose, {:bad_service, {"browser", :env}}}} = gate(services: [spec])
     end
   end
 

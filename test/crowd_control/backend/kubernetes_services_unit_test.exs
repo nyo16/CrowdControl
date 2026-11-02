@@ -230,7 +230,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     ready: %{tcp_port: 8931},
     user: "10001:10001",
     env: %{"PW_WS_TOKEN" => "ccpw_0123456789abcdef"},
-    host_config: %{shm_size: 1_073_741_824, tmpfs: %{"/tmp" => "rw,nosuid,size=512m"}},
+    host_config: %{shm_size: 1_073_741_824, tmpfs: %{"/tmp" => "rw,noexec,nosuid,size=512m"}},
     placement: :separate
   }
 
@@ -252,7 +252,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     command: ["--config", "/etc/vector/vector.yaml"],
     volumes: [%{name: "capture", target: "/var/log/cc", read_only: true}],
     files: [%{path: "/etc/vector/vector.yaml", content: "data_dir: x\n", mode: 0o444}],
-    host_config: %{tmpfs: %{"/var/lib/vector" => "rw,size=8m"}},
+    host_config: %{tmpfs: %{"/var/lib/vector" => "rw,noexec,nosuid,size=8m"}},
     user: "65532:65532",
     drain: 3_000,
     shutdown_limit: 20,
@@ -804,6 +804,75 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
                Kubernetes.sweep_orphans([owner: "node-a"] ++ config)
 
       refute Enum.any?(log.(), &(&1.method == :delete))
+    end
+  end
+
+  describe "posture shared with Compose (blocker: a root or host-mounting sidecar, undeclared)" do
+    setup do
+      handle = handle([])
+      %{ctx: Kubernetes.service_context(handle)}
+    end
+
+    test "a uid that is numerically 0 needs weaken: [:user] and renders as root",
+         %{ctx: ctx} do
+      for {user, gid} <- [{"0", nil}, {"00", nil}, {"000:1000", 1000}] do
+        browser = %{@browser | user: user}
+
+        assert {:error, {:k8s, {:weakening_not_declared, {"browser", :user}}}} =
+                 normalize([browser])
+
+        {:ok, [service]} = normalize([Map.put(browser, :weaken, [:user])])
+        [container] = Services.pod_manifest(ctx, service, [])["spec"]["containers"]
+        context = container["securityContext"]
+
+        assert context["runAsUser"] == 0
+        assert context["runAsGroup"] == gid
+        assert context["runAsNonRoot"] == false
+      end
+    end
+
+    test "\"root\" needs weaken: [:user] like uid 0, and even declared stays non-numeric" do
+      browser = %{@browser | user: "root"}
+
+      assert {:error, {:k8s, {:weakening_not_declared, {"browser", :user}}}} =
+               normalize([browser])
+
+      assert {:error, {:k8s, {:bad_user, {"browser", "root"}}}} =
+               normalize([Map.put(browser, :weaken, [:user])])
+    end
+
+    test "a spelling the runtime might still read as root is invalid, declared or not" do
+      for user <- ["+0", " 0"] do
+        assert {:error, {:k8s, {:bad_service, {"browser", :user}}}} =
+                 normalize([Map.merge(@browser, %{user: user, weaken: [:user]})])
+      end
+    end
+
+    test "a non-root uid needs no declaration and renders runAsNonRoot", %{ctx: ctx} do
+      {:ok, [service]} = normalize([%{@browser | user: "1000"}])
+      [container] = Services.pod_manifest(ctx, service, [])["spec"]["containers"]
+
+      assert container["securityContext"]["runAsUser"] == 1000
+      assert container["securityContext"]["runAsNonRoot"] == true
+    end
+
+    test "a host_path mount needs weaken: [:host_path]" do
+      mounted =
+        Map.put(@browser, :volumes, [%{host_path: "/srv", target: "/srv", read_only: true}])
+
+      assert {:error, {:k8s, {:weakening_not_declared, {"browser", :host_path}}}} =
+               normalize([mounted])
+
+      assert {:ok, [_]} = normalize([Map.put(mounted, :weaken, [:host_path])])
+    end
+
+    test "a tmpfs without noexec,nosuid needs weaken: [:tmpfs_exec]" do
+      exec = put_in(@browser, [:host_config, :tmpfs], %{"/tmp" => "rw,nosuid,size=512m"})
+
+      assert {:error, {:k8s, {:weakening_not_declared, {"browser", :tmpfs_exec}}}} =
+               normalize([exec])
+
+      assert {:ok, [_]} = normalize([Map.put(exec, :weaken, [:tmpfs_exec])])
     end
   end
 

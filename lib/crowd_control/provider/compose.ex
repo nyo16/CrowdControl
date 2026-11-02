@@ -94,8 +94,10 @@ defmodule CrowdControl.Provider.Compose do
   keys (`:shm_size`, `:init`, `:pids_limit`, `:memory`, `:cpus`, `:tmpfs`)
   need no declaration — a browser needs a large `/dev/shm` and an init, and
   neither weakens anything. A key that *weakens* the hardened default —
-  `:cap_add`, `no_new_privileges: false`, `readonly_rootfs: false`, or a root
-  `user:` — must also be named in the service's `weaken: [...]` list, or
+  `:cap_add`, `no_new_privileges: false`, `readonly_rootfs: false`, a root
+  `user:`, a `host_path` mount on a sidecar (`:host_path`), or a `tmpfs`
+  without `noexec,nosuid` (`:tmpfs_exec`) — must also be named in the
+  service's `weaken: [...]` list (see `CrowdControl.Service`), or
   `acquire/1` refuses with
   `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`. `privileged`
   is refused outright (`{:privileged_refused, service}`), declared or not.
@@ -106,6 +108,16 @@ defmodule CrowdControl.Provider.Compose do
   browser (root, added capabilities, no `no-new-privileges`) is the most
   valuable target a compromised sandbox can reach. Hence per key, written
   down, never inferred.
+
+  ### The capture file is the sandbox's alone
+
+  A sidecar that reads the transcript (a log shipper) mounts the volume the
+  sandbox mounts at `Path.dirname(:capture_path)`. It must mount it
+  `read_only: true`: a writable mount of the same source (named volume or host
+  path) could append to, truncate or rotate the capture and break every
+  persisted byte offset. Nor may any service stage `:files` into it, since a
+  pre-seeded capture is a forged transcript. Either is refused with
+  `{:error, {:compose, {:capture_mount_writable, service}}}`.
 
   ### Service spec
 
@@ -128,7 +140,7 @@ defmodule CrowdControl.Provider.Compose do
         port: 8080,                         # only read for :proxy_service
         networks: ["brw"],                  # default ["sbx"]
         host_config: %{shm_size: 1_073_741_824, init: true},
-        weaken: [],                         # see above
+        weaken: [:host_path],               # for the host_path mount; see above
         drain: 3_000,                       # ms; log shippers, see "Teardown"
         shutdown_limit: 20                  # s; with :drain
       }
@@ -215,7 +227,9 @@ defmodule CrowdControl.Provider.Compose do
   no-proxy posture — the sandbox holds a real provider credential — and it is
   what makes the removal above observable rather than notional. `:api_key` and
   `:session_token` are both in `CrowdControl.Store.secret_keys/0`, so neither
-  survives `scrub/1` into a Store record.
+  survives `scrub/1` into a Store record. A caller-supplied `:session_token`
+  must start with `ccst_`, the prefix `CrowdControl.Preset.LogShipper` redacts,
+  or `acquire/1` refuses with `{:error, {:compose, {:bad_session_token, :prefix}}}`.
 
   Unlike `CrowdControl.Backend.Docker`, this provider needs no explicit
   `:network_mode` to make the proxy enforcing. There is no `bridge` to
@@ -261,6 +275,7 @@ defmodule CrowdControl.Provider.Compose do
 
   @default_agent_port 8080
   @default_capture "/var/log/cc/out.jsonl"
+  @session_token_prefix "ccst_"
   @default_ready_timeout 30_000
   @default_health_timeout 60_000
   @default_sandbox_service "sandbox"
@@ -347,6 +362,7 @@ defmodule CrowdControl.Provider.Compose do
     # version gate is last: it is the one gate that may make a request, and it
     # only does when a gated feature is in use.
     with :ok <- ensure_req!(),
+         :ok <- validate_session_token(opts),
          {:ok, session_key} <- fetch_session_key(opts),
          {:ok, project} <- fetch_project(opts, session_key),
          {:ok, network} <- fetch_network(opts),
@@ -356,6 +372,7 @@ defmodule CrowdControl.Provider.Compose do
          :ok <- validate_mounts(services, volumes),
          :ok <- validate_memberships(opts, services, networks),
          :ok <- validate_files(opts, services),
+         :ok <- validate_capture(opts, services),
          :ok <- validate_ready(opts, services),
          :ok <- validate_proxy(opts, services),
          {:ok, ordered} <- order_services(services),
@@ -846,9 +863,19 @@ defmodule CrowdControl.Provider.Compose do
   # The `ccst_` prefix is what lets a log shipper find it: 32 random bytes have
   # no shape a redaction regex can match, and the sandbox prints its environment
   # into the transcript as readily as anything else.
-  # `CrowdControl.Preset.LogShipper` redacts `ccst_` by default.
+  # `CrowdControl.Preset.LogShipper` redacts `ccst_` by default, which is why a
+  # caller-supplied token must carry the prefix too (`validate_session_token/1`).
   defp mint_session_token do
-    "ccst_" <> (32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false))
+    @session_token_prefix <>
+      (32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false))
+  end
+
+  defp validate_session_token(opts) do
+    case opts[:session_token] do
+      nil -> :ok
+      @session_token_prefix <> _rest -> :ok
+      _other -> {:error, {:compose, {:bad_session_token, :prefix}}}
+    end
   end
 
   # --- labels ---
@@ -1552,6 +1579,50 @@ defmodule CrowdControl.Provider.Compose do
         mount -> not mount.read_only
       end
   end
+
+  # Invariant 6: the capture file is never written by a sidecar. The capture
+  # source is whatever the sandbox mounts over the capture file (a named
+  # volume or a host path); every other mount of that source must be
+  # read-only, and no service may stage files into it. With no such mount the
+  # capture lives in the sandbox's own filesystem, out of every sidecar's
+  # reach, and only the sandbox's own `:files` could pre-seed it.
+  defp validate_capture(opts, services) do
+    capture_path = opts[:capture_path] || @default_capture
+    sandbox = Enum.find(services, &(&1.role == :sandbox))
+
+    case covering_mount(sandbox, capture_path) do
+      nil ->
+        capture_dir = Path.dirname(capture_path)
+
+        if Enum.any?(sandbox.files, &under?(&1.path, capture_dir)),
+          do: {:error, {:compose, {:capture_mount_writable, sandbox.name}}},
+          else: :ok
+
+      capture ->
+        each_ok(services, &capture_untouched(&1, sandbox, capture))
+    end
+  end
+
+  defp capture_untouched(service, sandbox, capture) do
+    writable_mount? =
+      service.name != sandbox.name and
+        Enum.any?(service.volumes, &(same_source?(&1, capture) and not &1.read_only))
+
+    staged? =
+      Enum.any?(service.files, fn file ->
+        case covering_mount(service, file.path) do
+          nil -> false
+          mount -> same_source?(mount, capture)
+        end
+      end)
+
+    if writable_mount? or staged?,
+      do: {:error, {:compose, {:capture_mount_writable, service.name}}},
+      else: :ok
+  end
+
+  defp same_source?(mount, capture),
+    do: {mount.kind, mount.source} == {capture.kind, capture.source}
 
   # Docker's embedded DNS on internal networks forwarded queries upstream —
   # an exfiltration path out of a network with no route — until 25.0.5 /
