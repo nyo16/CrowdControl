@@ -113,7 +113,9 @@ defmodule CrowdControl.Agent.Omp do
 
   Claude-Code-only options (`:mcp_config`, `:strict_mcp_config`, `:agents`,
   `:plugin_dir`, `:settings`, `:settings_file`, `:settings_json`,
-  `:setting_sources`, `:max_budget_usd`, `:session_id`, `:bare`) have no omp
+  `:setting_sources`, `:max_budget_usd`, `:session_id`, `:bare`, and the
+  control-protocol options `:permission_prompt_tool`, `:permission_prompts`,
+  `:can_use_tool`, `:sdk_mcp_servers` and a map-valued `:hooks`) have no omp
   equivalent and raise `ArgumentError` rather than being dropped silently.
   `:include_partial_messages` is accepted and ignored: RPC mode always streams
   deltas as `message_update` frames.
@@ -254,7 +256,12 @@ defmodule CrowdControl.Agent.Omp do
     bare: "omp has no bare mode",
     auth_token:
       "omp has no ANTHROPIC_AUTH_TOKEN equivalent; use :custom_provider for a " <>
-        "self-hosted endpoint, or :oauth_token for a Claude subscription"
+        "self-hosted endpoint, or :oauth_token for a Claude subscription",
+    permission_prompt_tool: "omp has no permission-prompt host; use :approval_mode",
+    permission_prompts: "omp has no permission-prompt host; use :approval_mode",
+    can_use_tool:
+      "omp speaks no control protocol, so tool approval cannot be answered from the host",
+    sdk_mcp_servers: "omp speaks no control protocol, so it cannot reach an in-BEAM MCP server"
   ]
 
   @impl true
@@ -808,6 +815,14 @@ defmodule CrowdControl.Agent.Omp do
                 "#{inspect(key)} is a Claude Code option with no omp equivalent (#{hint})"
       end
     end)
+
+    # omp's own :hooks is a path (or list of paths) to hook files; a map is
+    # Claude Code's in-BEAM hook callbacks, which need the control protocol.
+    if is_map(opts[:hooks]) do
+      raise ArgumentError,
+            ":hooks as a map of callbacks is a Claude Code option with no omp equivalent " <>
+              "(omp speaks no control protocol; omp's :hooks takes hook file paths)"
+    end
   end
 
   defp optional_args(opts) do

@@ -85,7 +85,54 @@ defmodule CrowdControl.Agent do
   """
   @callback sandbox_files(keyword()) :: [sandbox_file()]
 
-  @optional_callbacks sandbox_files: 1
+  @typedoc """
+  An optional feature an adapter declares through `c:capabilities/0`.
+
+    * `:control` - speaks the stream-json control protocol (`c:encode_control/2`)
+    * `:interrupt` - can stop a running turn without killing the CLI
+    * `:sdk_mcp` - can host in-BEAM MCP servers over the control channel
+  """
+  @type capability :: :control | :interrupt | :sdk_mcp
+
+  @typedoc """
+  A control frame for `c:encode_control/2`:
+
+    * `{:request, request_id, request}` - a host-originated request; `request`
+      carries its `"subtype"`
+    * `{:response, request_id, {:ok, map} | {:error, message}}` - the answer to
+      a CLI-originated request
+    * `{:permission, request_id, decision}` - the answer to `can_use_tool`; see
+      `t:CrowdControl.Protocol.permission_decision/0`
+  """
+  @type control ::
+          {:request, CrowdControl.Protocol.request_id(), map()}
+          | {:response, CrowdControl.Protocol.request_id(),
+             CrowdControl.Protocol.control_result()}
+          | {:permission, CrowdControl.Protocol.request_id(),
+             CrowdControl.Protocol.permission_decision()}
+
+  @doc """
+  The optional features this adapter supports. Optional; an adapter that does
+  not implement it supports none (`CrowdControl.Agent.Omp`).
+  """
+  @callback capabilities() :: [capability()]
+
+  @doc """
+  Encodes a control frame for the CLI's stdin. Optional; required with the
+  `:control` capability.
+  """
+  @callback encode_control(control(), keyword()) :: binary()
+
+  @doc """
+  Frames to write when a session reattaches to a CLI that is still running.
+  Optional; an adapter that does not implement it writes nothing.
+
+  They must re-register exactly what `c:init_frames/1` registered for the same
+  opts, so they are deterministic in the opts and carry no fresh ids.
+  """
+  @callback reattach_frames(keyword()) :: [binary()]
+
+  @optional_callbacks sandbox_files: 1, capabilities: 0, encode_control: 2, reattach_frames: 1
 
   @doc """
   The sandbox files `module` needs, or `[]` when it declares none.
@@ -95,12 +142,32 @@ defmodule CrowdControl.Agent do
   """
   @spec sandbox_files(module(), keyword()) :: [sandbox_file()]
   def sandbox_files(module, opts) when is_atom(module) and is_list(opts) do
-    if Code.ensure_loaded?(module) and function_exported?(module, :sandbox_files, 1) do
-      module.sandbox_files(opts)
-    else
-      []
-    end
+    if exports?(module, :sandbox_files, 1), do: module.sandbox_files(opts), else: []
   end
+
+  @doc """
+  Whether `module` declares `capability` through `c:capabilities/0`.
+
+      iex> CrowdControl.Agent.capable?(CrowdControl.Agent.ClaudeCode, :control)
+      true
+      iex> CrowdControl.Agent.capable?(CrowdControl.Agent.Omp, :control)
+      false
+  """
+  @spec capable?(module(), capability()) :: boolean()
+  def capable?(module, capability) when is_atom(module) and is_atom(capability) do
+    exports?(module, :capabilities, 0) and capability in module.capabilities()
+  end
+
+  @doc """
+  The frames `module` writes on reattach, or `[]` when it declares none.
+  """
+  @spec reattach_frames(module(), keyword()) :: [binary()]
+  def reattach_frames(module, opts) when is_atom(module) and is_list(opts) do
+    if exports?(module, :reattach_frames, 1), do: module.reattach_frames(opts), else: []
+  end
+
+  defp exports?(module, fun, arity),
+    do: Code.ensure_loaded?(module) and function_exported?(module, fun, arity)
 
   @aliases %{
     claude: CrowdControl.Agent.ClaudeCode,
