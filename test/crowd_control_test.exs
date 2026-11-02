@@ -3,6 +3,7 @@ defmodule CrowdControlTest do
 
   alias CrowdControl.Backend.Mock
   alias CrowdControl.{Session, TestHelpers}
+  alias CrowdControl.Session.Control
 
   # A permission callback that takes longer than the run's :timeout, like a
   # human taking their time.
@@ -241,7 +242,7 @@ defmodule CrowdControlTest do
     end
 
     test "the backstop grace: backend: config over top level, then the default (S-A2)" do
-      default = CrowdControl.Session.Control.default_interrupt_grace()
+      default = Control.default_interrupt_grace()
 
       assert CrowdControl.run_grace([]) == default
       assert CrowdControl.run_grace(interrupt_grace: 45_000) == 45_000
