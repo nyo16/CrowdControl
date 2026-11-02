@@ -1304,6 +1304,47 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
                )
     end
 
+    test ":orphan_margin_ms replaces the minute, in the stamp and in the sweep's floor" do
+      {config, log} = recorder(&cluster/1)
+      before = System.system_time(:millisecond)
+      opts = [provision_timeout: 5_000, orphan_margin_ms: 1_000] ++ provision_opts(config, @stack)
+      assert {:ok, _handle} = Kubernetes.provision(opts)
+
+      for %{method: :post, body: %{"metadata" => metadata}} <- log.() do
+        stamp = String.to_integer(metadata["annotations"]["crowd_control.sweep_after_ms"])
+        assert stamp in (before + 6_000)..(System.system_time(:millisecond) + 6_000)
+      end
+
+      created = System.system_time(:millisecond) - 10_000
+
+      by_kind = %{
+        pods: [object("cc-gone-browser", "gone", "service", created)],
+        services: [],
+        networkpolicies: [],
+        configmaps: [],
+        secrets: []
+      }
+
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: path} ->
+            {200, %{"items" => by_kind[kind(path)], "metadata" => %{}}}
+
+          %{method: :delete} ->
+            {200, %{}}
+        end)
+
+      # 10 s old: young under the default 120 s + 60 s, past 5 s + 1 s.
+      assert {:ok, 0} = Kubernetes.sweep_orphans([owner: "node-a"] ++ config)
+
+      assert {:ok, 1} =
+               Kubernetes.sweep_orphans(
+                 [owner: "node-a", provision_timeout: 5_000, orphan_margin_ms: 1_000] ++ config
+               )
+
+      assert [_one_delete] = for(%{method: :delete} = req <- log.(), do: req)
+    end
+
     test "a deny-all gone before the sandbox Pod fails the provision and rolls back" do
       {config, log} =
         recorder(fn
