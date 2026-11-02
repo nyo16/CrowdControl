@@ -101,7 +101,7 @@ defmodule CrowdControl.Reaper do
   `timeout` is `:infinity` because a sweep runs every orphan's `destroy/1`
   in turn, and a destroy may block for as long as its backend needs to tear
   down safely — `CrowdControl.Backend.Kubernetes` waits out a drained Pod's
-  grace plus 10 s (about 38 s for the log shipper's defaults) before it
+  grace plus 10 s (about 50 s for the log shipper's defaults) before it
   deletes the Pod's NetworkPolicy. A fixed bound would expire mid-sweep,
   exit the caller and leave the sweep running anyway. Pass a finite
   `timeout` to bound the wait instead.
