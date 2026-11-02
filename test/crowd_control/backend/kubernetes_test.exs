@@ -735,8 +735,9 @@ defmodule CrowdControl.Backend.KubernetesTest do
 
     test "destroy removes the Pod, is idempotent, and takes the managed policy with it",
          %{opts: opts, owner: owner} do
-      # network_probe: false because OrbStack does not enforce NetworkPolicy and
-      # the preflight would refuse to provision at all — see the :deny_all test.
+      # network_probe: false because OrbStack fails the enforcement probe (its
+      # policies do not cover the API-server path the probe tests) and the
+      # preflight would refuse to provision at all — see the :deny_all test.
       opts = opts ++ [network: :deny_all, network_probe: false]
       {:ok, handle} = Kubernetes.provision(opts)
       assert Kubernetes.alive?(handle)
@@ -906,11 +907,12 @@ defmodule CrowdControl.Backend.KubernetesTest do
   describe "network posture" do
     test "deny_all refuses to provision on a cluster that does not enforce NetworkPolicy",
          %{opts: opts} do
-      # OrbStack accepts NetworkPolicy objects and enforces none of them, so the
-      # D5 preflight must refuse rather than report a boundary that is not
-      # there. The result is cached in :persistent_term per cluster URL, so this
-      # may or may not actually run a probe Pod — the returned error is the
-      # assertion either way.
+      # OrbStack enforces pod-to-pod and internet policy but lets a deny-all
+      # Pod reach the API server, which is what the probe tests, so the D5
+      # preflight must refuse rather than vouch for a boundary that does not
+      # hold on every path. The result is cached in :persistent_term per
+      # cluster URL, so this may or may not actually run a probe Pod — the
+      # returned error is the assertion either way.
       assert {:error, {:k8s, :network_policy_not_enforced}} =
                Kubernetes.provision(opts ++ [network: :deny_all])
     end

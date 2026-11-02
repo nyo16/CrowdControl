@@ -57,7 +57,10 @@ defmodule CrowdControl.Preset.LogShipper do
       `{:http, uri: url}` or `{:loki, endpoint: url}`. On Kubernetes
       (`placement: :pod`) only `{:vector, address: url}` is accepted, because
       the sidecar shares the sandbox's network namespace: any egress it has,
-      the sandbox has. The aggregator holds the real sink's credentials.
+      the sandbox has. The aggregator holds the real sink's credentials. The
+      vector address is `host:port` or `http://host:port`, rendered with the
+      `http://` Vector needs to connect; `https://` is refused, since there
+      are no TLS settings to honour it with.
     * `:aggregator` — Kubernetes, required: the `{:external, target}`
       selector or CIDR the aggregator matches (see
       `CrowdControl.Backend.Kubernetes.Services`). With no DNS in the sandbox
@@ -142,6 +145,7 @@ defmodule CrowdControl.Preset.LogShipper do
   @spec spec(keyword()) :: map()
   def spec(opts) do
     cfg = options!(opts)
+    user = Keyword.get(opts, :user, @default_user)
 
     %{
       name: Keyword.get(opts, :name, @default_name),
@@ -151,8 +155,8 @@ defmodule CrowdControl.Preset.LogShipper do
       env: %{"VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS" => Integer.to_string(cfg.shutdown_limit)},
       files: [%{path: @config_path, content: render(cfg), mode: 0o444}],
       volumes: volumes(cfg),
-      host_config: %{tmpfs: %{@data_dir => "rw,noexec,nosuid,size=8m"}},
-      user: Keyword.get(opts, :user, @default_user),
+      host_config: %{tmpfs: %{@data_dir => "rw,noexec,nosuid,size=8m" <> data_dir_owner(user)}},
+      user: user,
       drain: cfg.drain,
       shutdown_limit: cfg.shutdown_limit
     }
@@ -274,8 +278,11 @@ defmodule CrowdControl.Preset.LogShipper do
   defp address!(address) when is_binary(address) do
     url = if String.contains?(address, "://"), do: address, else: "http://" <> address
 
+    # Rendered as plain-text `http://`; the preset has no TLS settings, so an
+    # `https://` address would be silently downgraded.
     case URI.parse(url) do
-      %URI{host: host, port: port} when is_binary(host) and host != "" and is_integer(port) ->
+      %URI{scheme: "http", host: host, port: port}
+      when is_binary(host) and host != "" and is_integer(port) ->
         {host, port}
 
       _ ->
@@ -455,6 +462,18 @@ defmodule CrowdControl.Preset.LogShipper do
 
   # --- spec ---
 
+  # Docker copies the image's directory up into a tmpfs, and the Vector image
+  # ships `/var/lib/vector` as root 0755, so a non-root Vector could not
+  # create its checkpoints and refused to start. The mount is handed to the
+  # user instead (Kubernetes' `emptyDir` ignores these options).
+  defp data_dir_owner(user) do
+    case Regex.run(~r/\A(\d+)(?::(\d+))?\z/, to_string(user)) do
+      [_, uid] -> ",uid=#{uid},mode=0700"
+      [_, uid, gid] -> ",uid=#{uid},gid=#{gid},mode=0700"
+      nil -> ",mode=1777"
+    end
+  end
+
   defp volumes(cfg) do
     capture = %{
       name: cfg.capture_volume,
@@ -601,8 +620,12 @@ defmodule CrowdControl.Preset.LogShipper do
     ]
   end
 
+  # With a bare `host:port`, Vector 0.61's vector sink cannot connect at all
+  # ("HTTP request failed: client error (Connect)", measured against a vector
+  # source); the scheme makes it plain-text gRPC.
   defp sink({:vector, host, port}, inputs) do
-    [{"type", "vector"}, {"inputs", inputs}, {"address", "#{host}:#{port}"}]
+    host = if String.contains?(host, ":"), do: "[#{host}]", else: host
+    [{"type", "vector"}, {"inputs", inputs}, {"address", "http://#{host}:#{port}"}]
   end
 
   defp sink({:http, uri}, inputs) do

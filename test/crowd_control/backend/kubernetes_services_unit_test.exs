@@ -429,6 +429,9 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       # And with no services it is still the canonical deny-all.
       refute Map.has_key?(policy["spec"], "egress")
       refute Map.has_key?(policy["spec"], "ingress")
+
+      # The raw owner, which the orphan sweep checks before deleting it.
+      assert policy["metadata"]["annotations"] == %{"crowd_control.owner" => "node-a"}
     end
 
     test "only the named allows: browser and aggregator out, browser in to the app ports" do
@@ -734,7 +737,14 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       by_kind = %{
         pods: pods,
         services: [object("cc-dead-browser", "dead", "service", old)],
-        networkpolicies: [object("cc-dead-browser", "dead", "service", old)],
+        # The sandbox's own deny-all is created before its Pod (role sandbox):
+        # a crash orphans it like any service object (regression, found by
+        # kubernetes_browser_test.exs), while a live sandbox keeps its own.
+        networkpolicies: [
+          object("cc-dead-browser", "dead", "service", old),
+          object("cc-dead-deny-all", "dead", "sandbox", nil, created: old),
+          object("cc-live-deny-all", "live", "sandbox", nil, created: old)
+        ],
         configmaps: [object("cc-dead-proxy-files", "dead", "service-config", nil, created: old)]
       }
 
@@ -747,7 +757,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
             {200, %{}}
         end)
 
-      assert {:ok, 5} =
+      assert {:ok, 6} =
                Kubernetes.sweep_orphans([owner: "node-a", provision_timeout: 1_000] ++ config)
 
       requests = log.()
@@ -758,6 +768,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       assert Enum.sort(deleted) == [
                {:configmaps, "cc-dead-proxy-files"},
                {:networkpolicies, "cc-dead-browser"},
+               {:networkpolicies, "cc-dead-deny-all"},
                {:pods, "cc-dead-browser"},
                {:pods, "cc-done-browser"},
                {:services, "cc-dead-browser"}
@@ -771,6 +782,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
 
       assert {:pods, "crowd_control.owner_hash=#{hash}"} in lists
       assert {:services, "crowd_control.owner_hash=#{hash},crowd_control.role=service"} in lists
+      assert {:networkpolicies, "crowd_control.owner_hash=#{hash}"} in lists
 
       assert {:configmaps, "crowd_control.owner_hash=#{hash},crowd_control.role=service-config"} in lists
     end

@@ -88,8 +88,10 @@ backend =
     #     CC_K8S_NETWORK=deny_all mix run examples/kubernetes_task.exs
     #
     # On a stock local cluster that fails with {:k8s, :network_policy_not_enforced}
-    # -- orbstack, kind and Docker Desktop ship no policy controller, so a
-    # NetworkPolicy there is an object the API server stores and nothing obeys.
+    # -- kind and Docker Desktop ship no policy controller, so a NetworkPolicy
+    # there is an object the API server stores and nothing obeys; OrbStack
+    # enforces pod-to-pod and internet policy but not on the probe's API
+    # server path, so it fails the probe too.
     # The refusal is the feature; see SECURITY.md#the-kubernetes-backend.
     network: String.to_atom(System.get_env("CC_K8S_NETWORK", "unrestricted")),
     provision_timeout: 180_000,

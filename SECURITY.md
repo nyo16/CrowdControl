@@ -268,9 +268,10 @@ Omitting `:network` while setting `:proxy_url` or `:api_url` returns
 backend refuses to infer `bridge`.
 
 **A declaration is not enforcement.** Any API server accepts a NetworkPolicy
-object; only a CNI with a policy controller acts on one. OrbStack accepts them
-and enforces nothing — verified: a deny-all policy selecting the probe Pod, and
-egress still succeeded. A backend that created the object and reported the
+object; only a CNI with a policy controller acts on one, and not necessarily on
+every path. OrbStack's Kubernetes (1.36) is the measured example: it enforces
+pod-to-pod and internet egress policy, yet a probe Pod under a deny-all policy
+still reaches the API server. A backend that created the object and reported the
 sandbox contained would be describing a boundary that does not exist. So
 `:deny_all` runs a one-time per-cluster enforcement probe (a throwaway Pod under
 a deny-all policy attempting egress) and refuses to provision with

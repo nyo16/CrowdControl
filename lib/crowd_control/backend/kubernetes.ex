@@ -130,8 +130,9 @@ defmodule CrowdControl.Backend.Kubernetes do
   refuses to infer `bridge`.
 
   A declaration is not enforcement. NetworkPolicy objects are accepted by any
-  API server, but only enforced by a CNI with a policy controller — OrbStack,
-  for instance, accepts them and enforces nothing. So `:deny_all` runs a
+  API server, but only enforced by a CNI with a policy controller, and not
+  necessarily on every path — OrbStack's enforces pod-to-pod and internet
+  policy, yet a deny-all Pod still reaches the API server. So `:deny_all` runs a
   one-time per-cluster enforcement probe (a throwaway Pod under a deny-all
   policy attempting egress) and refuses to start on
   `{:error, {:k8s, :network_policy_not_enforced}}`. Reporting a boundary that
@@ -1993,16 +1994,17 @@ defmodule CrowdControl.Backend.Kubernetes do
   @doc """
   Delete the session objects a crash left behind, for `CrowdControl.Reaper`.
 
-  `provision/1` creates a session's ConfigMaps, NetworkPolicies, Services and
-  service Pods *before* its sandbox Pod, and `destroy/1` finds them through
-  the sandbox Pod's annotation — so a VM dying between the two leaves objects
-  nothing will ever name. This finds them by label instead: every object with
-  `crowd_control.role` `service` or `service-config` and this owner's hash,
-  whose session has no live sandbox Pod (Pending or Running, not being
-  deleted), whose raw `crowd_control.owner` annotation matches exactly (the
-  hash is a selector, not proof), and that is older than
-  `:provision_timeout` plus a minute, so an in-flight provision is never
-  swept from under itself.
+  `provision/1` creates a session's ConfigMaps, NetworkPolicies (the
+  sandbox's own `<pod>-deny-all` among them), Services and service Pods
+  *before* its sandbox Pod, and `destroy/1` finds them through the sandbox
+  Pod's annotation — so a VM dying between the two leaves objects nothing
+  will ever name. This finds them by label instead: every object with
+  `crowd_control.role` `service` or `service-config` (or `sandbox`, for a
+  NetworkPolicy) and this owner's hash, whose session has no live sandbox Pod
+  (Pending or Running, not being deleted), whose raw `crowd_control.owner`
+  annotation matches exactly (the hash is a selector, not proof), and that is
+  older than `:provision_timeout` plus a minute, so an in-flight provision is
+  never swept from under itself.
 
   All four lists must succeed before anything is deleted; any failure is
   returned and nothing is touched. Returns how many objects were deleted
@@ -2016,7 +2018,7 @@ defmodule CrowdControl.Backend.Kubernetes do
 
     with {:ok, pods} <- API.list_all(config, nil, label_selectors: by_owner),
          {:ok, services} <- API.list_services(config, services_role),
-         {:ok, policies} <- API.list_network_policies(config, services_role),
+         {:ok, policies} <- API.list_network_policies(config, by_owner),
          {:ok, config_maps} <-
            API.list_config_maps(config, by_owner ++ [{"crowd_control.role", "service-config"}]) do
       {service_pods, sandboxes} = Enum.split_with(pods, &(role(&1) == "service"))
@@ -2026,7 +2028,10 @@ defmodule CrowdControl.Backend.Kubernetes do
       swept =
         (Enum.map(service_pods, &{:pod, &1}) ++
            Enum.map(services, &{:service, &1}) ++
-           Enum.map(policies, &{:network_policy, &1}) ++
+           Enum.map(
+             Enum.filter(policies, &(role(&1) in ["service", "sandbox"])),
+             &{:network_policy, &1}
+           ) ++
            Enum.map(config_maps, &{:config_map, &1}))
         |> Enum.filter(fn {_kind, object} -> orphan?(object, live, owner, floor) end)
         |> Enum.count(&sweep_object(config, &1))
@@ -2269,7 +2274,10 @@ defmodule CrowdControl.Backend.Kubernetes do
           "crowd_control.session" => handle.session_key,
           "crowd_control.owner_hash" => owner_label(handle.owner),
           "crowd_control.role" => "sandbox"
-        }
+        },
+        # What `sweep_orphans/1` checks before deleting: the policy exists
+        # before the sandbox Pod, so a crash between them orphans it too.
+        "annotations" => %{"crowd_control.owner" => to_string(handle.owner)}
       },
       # Empty rule lists under both policy types is the canonical deny-all: the
       # Pod is selected, so the default-allow no longer applies, and nothing is
@@ -2316,10 +2324,11 @@ defmodule CrowdControl.Backend.Kubernetes do
   end
 
   # A declaration is not enforcement. Any API server accepts a NetworkPolicy
-  # object; only a CNI with a policy controller acts on one. OrbStack, for
-  # instance, accepts them and enforces nothing -- so a `:deny_all` sandbox
-  # there would report a boundary that does not exist. Prove it once per
-  # cluster, cache the answer either way, and refuse to start if it is absent.
+  # object; only a CNI with a policy controller acts on one, and possibly not
+  # on every path (OrbStack enforces pod-to-pod and internet policy but lets a
+  # deny-all Pod reach the API server) -- so a `:deny_all` sandbox there would
+  # report a boundary that does not hold. Prove it once per cluster, cache the
+  # answer either way, and refuse to start if it is absent.
   #
   # A `:separate` service's posture is its own NetworkPolicy, so it needs the
   # same proof whatever the sandbox's `:network` is.

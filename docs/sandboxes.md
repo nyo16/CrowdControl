@@ -489,10 +489,17 @@ gets the capture directory **read-only** and nothing else of the sandbox's:
   unless it is `read_only: true`. A `:separate` service cannot see it at all.
 
 Vector's checkpoints live on a Vector-only in-memory `/var/lib/vector`, never on the
-sandbox-writable volume, so code in the sandbox cannot rewrite them to skip lines. Lines up to
+sandbox-writable volume, so code in the sandbox cannot rewrite them to skip lines. (On Compose
+that tmpfs is mounted `uid=,gid=` the Vector user, mode `0700`: the image ships the directory
+root-owned, and a non-root Vector could not start on it.) Lines up to
 `:max_line_bytes` (the session's own 1 MiB cap) are shipped, and acknowledgements are on, so a
 checkpoint advances only once the sink accepted the line. A sidecar never writes, truncates or
 rotates the capture; that is a plan invariant, not a preset default.
+
+On Kubernetes the only sink is `{:vector, address: "10.96.12.7:6000"}`, an in-cluster aggregator
+the sandbox's policy names. It is rendered as `http://<host>:<port>` — Vector 0.61's vector sink
+never connects to a bare `host:port` — and an `https://` address is refused, since the preset
+has no TLS settings to honour it with.
 
 **Drain.** The sandbox's last bytes land just before teardown, so a shipper killed at the same
 moment loses roughly the last two seconds. A service with `drain:` (ms; the preset sets `3_000`)

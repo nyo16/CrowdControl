@@ -60,16 +60,20 @@
   `{:external, target}` — NetworkPolicy edges from `networks:`, DNS-free peer
   discovery through `hostAliases`, and `:sandbox_ports`.
   `Kubernetes.sweep_orphans/1`, called by the reaper (reported as `swept`),
-  removes service objects a crash left behind.
+  removes service objects, and the sandbox's own `<pod>-deny-all` policy, that
+  a crash before the sandbox Pod left behind.
 - **`CrowdControl.VersionGate`** — version floors checked before anything is
   created: Kubernetes 1.29 for `:pod` sidecars, 1.30 for `preStop` sleep,
   Docker Engine 25.0.5 for per-service networks and `egress: :allow` sidecars
   (`{:error, {:version, component, have, need}}`).
 - **Presets** — `CrowdControl.Preset.browser_stack/1`, `Preset.Browser`
   (Playwright), `Preset.EgressProxy` (Smokescreen) and `Preset.LogShipper`
-  (Vector, redacting by default), returning plain service specs.
-- **Images** — a `sandbox-browser` Dockerfile stage and example
-  `examples/images/browser` and `examples/images/smokescreen` images.
+  (Vector, redacting by default), returning plain service specs. The
+  `{:vector, address:}` sink is plain-text gRPC (`http://`); an `https://`
+  address is refused rather than downgraded.
+- **Images and examples** — a `sandbox-browser` Dockerfile stage, example
+  `examples/images/browser` and `examples/images/smokescreen` images, and
+  `examples/compose_browser_stack.exs` / `examples/kubernetes_browser_stack.exs`.
 
 ### Changed
 
