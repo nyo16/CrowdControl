@@ -129,11 +129,11 @@ defmodule CrowdControl.Backend.Kubernetes.Files do
   @spec payload_size([%{required(:content) => binary(), optional(atom()) => term()}]) ::
           non_neg_integer()
   def payload_size(files) do
-    files
-    |> Enum.map(fn %{content: content} ->
-      if String.valid?(content), do: byte_size(content), else: 4 * div(byte_size(content) + 2, 3)
+    Enum.reduce(files, 0, fn %{content: content}, total ->
+      if String.valid?(content),
+        do: total + byte_size(content),
+        else: total + 4 * div(byte_size(content) + 2, 3)
     end)
-    |> Enum.sum()
   end
 
   @doc """

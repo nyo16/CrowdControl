@@ -1456,6 +1456,7 @@ defmodule CrowdControl.Session do
       {:crashed, {{:nocatch, value}, __STACKTRACE__}}
   end
 
+  @spec stop_inner(pid(), term()) :: no_return()
   defp stop_inner(inner, reason) do
     Process.exit(inner, :kill)
     exit(reason)
