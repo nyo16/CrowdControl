@@ -1455,7 +1455,7 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       browser = container_body(requests, "browser")["HostConfig"]
       assert browser["ShmSize"] == 1_073_741_824
       assert browser["Init"] == true
-      assert browser["Tmpfs"]["/tmp"] == "rw,nosuid,size=512m"
+      assert browser["Tmpfs"]["/tmp"] == "rw,noexec,nosuid,size=512m"
 
       connects =
         for r <- requests,
