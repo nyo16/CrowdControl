@@ -823,7 +823,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       refute Map.has_key?(security(ctx, Map.put(base, :weaken, [:user])), "runAsNonRoot")
     end
 
-    test "root is numeric: \"00\" and \"000:1000\" are uid 0, and need weaken: [:user]",
+    test ~s(root is numeric: "00" and "000:1000" are uid 0, and need weaken: [:user]),
          %{ctx: ctx, base: base} do
       for user <- ["00", "000:1000"] do
         assert {:error, {:k8s, {:weakening_not_declared, {"svc", :user}}}} =
