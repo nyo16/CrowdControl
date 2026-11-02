@@ -218,6 +218,33 @@ defmodule CrowdControl do
     end
   end
 
+  @doc """
+  Like `run/2`, but returns `{:ok, result_map}` for a successful turn and raises
+  `CrowdControl.Error` otherwise.
+
+  A result that classifies as an error (see `CrowdControl.Result.classify/1`)
+  raises with that error's kind. A run that produced no result at all (a start
+  failure, a timeout, the session exiting) raises with kind `:session_error`
+  and the `run/2` error term as its `reason`.
+  """
+  @spec run!(binary(), opts()) :: {:ok, map()}
+  def run!(prompt, opts \\ []) do
+    case run(prompt, opts) do
+      {:result, _, _} = result ->
+        case classify(result) do
+          {:ok, map} -> {:ok, map}
+          {:error, error} -> raise error
+        end
+
+      {:error, reason} ->
+        raise CrowdControl.Error, kind: :session_error, reason: reason
+    end
+  end
+
+  @doc "Classify a `{:result, subtype, map}` message. See `CrowdControl.Result.classify/1`."
+  @spec classify(result_message()) :: {:ok, map()} | {:error, CrowdControl.Error.t()}
+  defdelegate classify(result), to: CrowdControl.Result
+
   @doc "Start N sessions with different options but the same prompt; collect all results."
   @spec run_many(binary(), [opts()]) ::
           [{session(), result_message()}]

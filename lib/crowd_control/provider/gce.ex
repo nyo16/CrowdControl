@@ -187,13 +187,6 @@ defmodule CrowdControl.Provider.Gce do
 
   @behaviour CrowdControl.Provider
 
-  # `:telemetry` is not a dependency of this library. It arrives transitively
-  # with `:gcp_compute` (req -> finch -> telemetry), which every caller who can
-  # reach `phase/3` necessarily has, so the emit is safe where it runs. Without
-  # that optional dep the module still compiles, and this keeps it from warning
-  # in projects that never touch the GCE provider.
-  @compile {:no_warn_undefined, :telemetry}
-
   require Logger
 
   alias CrowdControl.Backend.Sandboxd.API, as: AgentAPI
@@ -396,7 +389,7 @@ defmodule CrowdControl.Provider.Gce do
     result = fun.()
     duration = System.monotonic_time(:millisecond) - started
 
-    :telemetry.execute(
+    CrowdControl.Telemetry.execute(
       [:crowd_control, :gce, :phase],
       %{duration_ms: duration},
       %{

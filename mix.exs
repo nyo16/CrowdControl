@@ -110,7 +110,13 @@ defmodule CrowdControl.MixProject do
         Guides: ~r/^docs\//
       ],
       groups_for_modules: [
-        Core: [CrowdControl, CrowdControl.Session],
+        Core: [
+          CrowdControl,
+          CrowdControl.Session,
+          CrowdControl.Result,
+          CrowdControl.Error,
+          CrowdControl.Telemetry
+        ],
         Agents: [
           CrowdControl.Agent,
           CrowdControl.Agent.ClaudeCode,
@@ -186,6 +192,11 @@ defmodule CrowdControl.MixProject do
       # inside it, so this still adds no runtime dep the tree lacks. It is also
       # the reason the Elixir lower bound moved to ~> 1.19.
       {:gcp_compute, "~> 0.3", optional: true},
+      # Optional, for the same one-runtime-dep reason. Every emit goes through
+      # CrowdControl.Telemetry, which no-ops when it is absent; a caller who
+      # attaches a handler has it by definition. It is already in the tree
+      # transitively via :req and :gcp_compute.
+      {:telemetry, "~> 1.0", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:stream_data, "~> 1.1", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
