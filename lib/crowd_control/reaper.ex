@@ -97,7 +97,14 @@ defmodule CrowdControl.Reaper do
   @doc """
   Run a reconciliation sweep now and return what it did.
 
-  Synchronous; mainly for tests and operational pokes.
+  Synchronous; mainly for tests and operational pokes. The default
+  `timeout` is `:infinity` because a sweep runs every orphan's `destroy/1`
+  in turn, and a destroy may block for as long as its backend needs to tear
+  down safely — `CrowdControl.Backend.Kubernetes` waits out a drained Pod's
+  grace plus 10 s (about 38 s for the log shipper's defaults) before it
+  deletes the Pod's NetworkPolicy. A fixed bound would expire mid-sweep,
+  exit the caller and leave the sweep running anyway. Pass a finite
+  `timeout` to bound the wait instead.
   """
   @spec sweep(GenServer.server(), timeout()) :: %{
           reattached: non_neg_integer(),
@@ -106,7 +113,7 @@ defmodule CrowdControl.Reaper do
           skipped: non_neg_integer(),
           swept: non_neg_integer()
         }
-  def sweep(server \\ __MODULE__, timeout \\ 30_000) do
+  def sweep(server \\ __MODULE__, timeout \\ :infinity) do
     GenServer.call(server, :sweep, timeout)
   end
 
