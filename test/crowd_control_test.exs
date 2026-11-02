@@ -186,6 +186,44 @@ defmodule CrowdControlTest do
     end
   end
 
+  describe "run!/2" do
+    test "returns {:ok, map} for a successful turn" do
+      assert {:ok, %{"result" => "done:hi"}} =
+               CrowdControl.run!("hi", executable: TestHelpers.fake_cli_path(), timeout: 5_000)
+    end
+
+    test "raises the classified error for an error result" do
+      error =
+        assert_raise CrowdControl.Error, fn ->
+          CrowdControl.run!("hi",
+            executable: TestHelpers.fake_cli_path(),
+            env: %{"FAKE_CLI_ERROR_SUBTYPE" => "error_max_turns", "FAKE_CLI_SESSION_ID" => "s-1"},
+            timeout: 5_000
+          )
+        end
+
+      assert %CrowdControl.Error{
+               kind: :max_turns_exceeded,
+               subtype: "error_max_turns",
+               session_id: "s-1",
+               reason: %{num_turns: 1}
+             } = error
+    end
+
+    test "raises :session_error when no result arrives" do
+      error =
+        assert_raise CrowdControl.Error, fn ->
+          CrowdControl.run!("slow",
+            executable: TestHelpers.fake_cli_path(),
+            env: %{"FAKE_CLI_SLEEP" => "5"},
+            timeout: 300
+          )
+        end
+
+      assert %CrowdControl.Error{kind: :session_error, reason: :timeout} = error
+    end
+  end
+
   describe "run_many/2" do
     test "fans out the same prompt across configurations" do
       opts_list = for _ <- 1..2, do: [executable: TestHelpers.fake_cli_path(), timeout: 5_000]
