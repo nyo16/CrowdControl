@@ -23,8 +23,8 @@ defmodule Mix.Tasks.CrowdControl.Contract do
     2. Every flag in `CrowdControl.CLI.contract_flags/0` is listed by `--help`,
        or, for a hidden flag, the parser answers its bare use with an
        "argument missing" error rather than "unknown option".
-    3. A live control probe. The binary is started with the argv
-       `CrowdControl.Agent.ClaudeCode.build_command/1` emits for a session with
+    3. A live control probe. The binary is started with the argv the Claude
+       Code adapter builds for a session with
        `:can_use_tool`, `:hooks` and `:sdk_mcp_servers`, and is sent that
        session's `initialize` frame twice, then an `interrupt`. Both
        `initialize` replies must succeed with `pending_permission_requests` at
