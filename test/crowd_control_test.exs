@@ -220,6 +220,40 @@ defmodule CrowdControlTest do
 
       assert {:result, "success", _map} = Task.await(task, 5_000)
     end
+
+    # Asserting this through run/2 would need a session answering later than
+    # :timeout + 30 s + the margin, so the backstop's grace is unit-tested.
+    test "the backstop grace is the one the session resolves, backend: config included (S-A2)" do
+      ctl = start_supervised!({Mock, events: []})
+
+      opts = [
+        backend: {Mock, mock: ctl, interrupt_grace: 45_000},
+        executable: "claude",
+        timeout: 60_000,
+        can_use_tool: {__MODULE__, :slow_allow, [0]}
+      ]
+
+      assert CrowdControl.run_grace(opts) == 45_000
+
+      {:ok, pid} = Session.start_link(opts)
+      assert :sys.get_state(pid).control.interrupt_grace == CrowdControl.run_grace(opts)
+      TestHelpers.stop_session(pid)
+    end
+
+    test "the backstop grace: backend: config over top level, then the default (S-A2)" do
+      default = CrowdControl.Session.Control.default_interrupt_grace()
+
+      assert CrowdControl.run_grace([]) == default
+      assert CrowdControl.run_grace(interrupt_grace: 45_000) == 45_000
+      assert CrowdControl.run_grace(backend: {Mock, interrupt_grace: 45_000}) == 45_000
+
+      assert CrowdControl.run_grace(
+               interrupt_grace: 1_000,
+               backend: {Mock, interrupt_grace: 45_000}
+             ) == 45_000
+
+      assert CrowdControl.run_grace(interrupt_grace: 45_000, backend: Mock) == 45_000
+    end
   end
 
   describe "run!/2" do

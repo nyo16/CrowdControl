@@ -13,7 +13,6 @@ defmodule CrowdControl.Session.Control do
   alias CrowdControl.{Agent, SdkMcp}
   alias CrowdControl.Agent.ClaudeCode
 
-  @default_interrupt_grace 30_000
   @default_max_pending 64
 
   @typedoc "An MFA callback: called as `apply(m, f, [request, context | extra])`."
@@ -115,6 +114,14 @@ defmodule CrowdControl.Session.Control do
       permission_mode: permission_mode(opts)
     }
   end
+
+  @doc """
+  The `:interrupt_grace`, in ms, of a session that uses a control feature on an
+  interruptible agent and sets none. The one source for this default: Session
+  resolves it through `new/2`, and `CrowdControl.run/2` sizes its backstop by it.
+  """
+  @spec default_interrupt_grace() :: pos_integer()
+  def default_interrupt_grace, do: 30_000
 
   # The options that make ClaudeCode send `initialize`: the ones that need a
   # control-protocol CLI.
@@ -226,13 +233,13 @@ defmodule CrowdControl.Session.Control do
   end
 
   # Only an agent that can stop a turn without dying gets a grace period; for
-  # the rest a deadline destroys at once, as it always has. The 30 s default
-  # applies to sessions that use control features, so a plain Claude session's
+  # the rest a deadline destroys at once, as it always has. The default applies
+  # to sessions that use control features, so a plain Claude session's
   # deadline is unchanged unless it asks for a grace explicitly.
   defp interrupt_grace!(opts, features, interruptible) do
     case Keyword.get(opts, :interrupt_grace) do
       nil when features and interruptible ->
-        @default_interrupt_grace
+        default_interrupt_grace()
 
       nil ->
         0

@@ -10,7 +10,8 @@ defmodule CrowdControl do
   `CrowdControl.Agent.Omp` (omp) for the full list of session options.
   """
 
-  alias CrowdControl.Session
+  alias CrowdControl.{Backend, Session}
+  alias CrowdControl.Session.Control
 
   # Per-session start ceiling for `start_sessions/1`. Without a finite timeout,
   # `on_timeout: :kill_task` is dead code and a wedged start blocks the stream
@@ -222,7 +223,8 @@ defmodule CrowdControl do
   `run/2` then returns. A human-in-the-loop `:can_use_tool` may therefore hold
   the turn for longer than `:timeout`. `run/2` keeps one wall-clock backstop
   for a session that never reports anything: `:timeout` plus
-  `:interrupt_grace` (30 s when unset) plus #{div(@run_margin, 1_000)} s,
+  `:interrupt_grace` (given at the top level or in the `backend:` config,
+  #{div(Control.default_interrupt_grace(), 1_000)} s when unset) plus #{div(@run_margin, 1_000)} s,
   counted once the session has started. That backstop is not paused, so an
   approval held longer than it ends the run with `{:error, :timeout}`; for an
   open-ended human wait use `start_session/1` and `CrowdControl.Session`
@@ -251,12 +253,22 @@ defmodule CrowdControl do
   defp run_deadline(opts) do
     case Keyword.get(opts, :timeout, Session.default_timeout()) do
       timeout when is_integer(timeout) ->
-        grace = Keyword.get(opts, :interrupt_grace) || 30_000
-        System.monotonic_time(:millisecond) + timeout + grace + @run_margin
+        System.monotonic_time(:millisecond) + timeout + run_grace(opts) + @run_margin
 
       _nil_or_infinity ->
         :infinity
     end
+  end
+
+  # The grace run/2's backstop allows for. Resolved from the same opts the
+  # session resolves it from (Backend.resolve/1, so a `backend: {_, kw}` value
+  # wins over a top-level one), falling back to the default a control-feature
+  # session gets: the backstop must never be shorter than the session's own.
+  @doc false
+  @spec run_grace(opts()) :: non_neg_integer()
+  def run_grace(opts) do
+    {_backend, resolved} = Backend.resolve(opts)
+    Keyword.get(resolved, :interrupt_grace) || Control.default_interrupt_grace()
   end
 
   @doc """
