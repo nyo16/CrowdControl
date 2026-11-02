@@ -410,7 +410,7 @@ defmodule CrowdControl.PresetTest do
       assert spec.depends_on == ["sandbox"]
       assert spec.volumes == [%{name: "cclog", target: "/var/log/cc", read_only: true}]
       assert spec.host_config.tmpfs["/var/lib/vector"] =~ "size=8m"
-      assert {spec.drain, spec.shutdown_limit} == {3_000, 20}
+      assert {spec.drain, spec.shutdown_limit} == {15_000, 20}
       assert spec.env == %{"VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS" => "20"}
       assert spec.command == ["--config", "/etc/vector/vector.yaml"]
       assert [%{path: "/etc/vector/vector.yaml", mode: 0o444}] = spec.files

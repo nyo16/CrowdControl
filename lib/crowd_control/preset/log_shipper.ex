@@ -45,11 +45,14 @@ defmodule CrowdControl.Preset.LogShipper do
 
   ## Draining
 
-  `drain: 3_000` and `shutdown_limit: 20` are set, so teardown waits for the
+  `drain: 15_000` and `shutdown_limit: 20` are set, so teardown waits for the
   file source to reach EOF before SIGTERM (a Kubernetes `preStop` sleep, or a
   Compose wait before `stop`) and then gives Vector its graceful-shutdown limit
-  (`VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS`) plus a margin. Without it the last
-  ~2 s of a session are lost.
+  (`VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS`) plus a margin. Without it the end of
+  a session is lost. The drain is how long Vector keeps reading after the
+  sandbox stops, so it must cover Vector's own latency: measured on
+  Kubernetes, a line written after a minute of idle took ~10 s to reach the
+  aggregator.
 
   ## Options
 
@@ -85,7 +88,7 @@ defmodule CrowdControl.Preset.LogShipper do
     * `:capture_path` — default `/var/log/cc/out.jsonl`.
     * `:image` — default `timberio/vector:0.61.0-distroless-libc`.
     * `:user` — default `"65532:65532"` (the image runs as root otherwise).
-    * `:drain`, `:shutdown_limit` — defaults `3_000` ms and `20` s.
+    * `:drain`, `:shutdown_limit` — defaults `15_000` ms and `20` s.
     * `:sandbox` — Compose: the sandbox service name, default `"sandbox"`;
       Vector `depends_on` it so the capture directory is copied up with the
       sandbox's ownership before Vector mounts it.
@@ -108,7 +111,7 @@ defmodule CrowdControl.Preset.LogShipper do
   @default_capture "/var/log/cc/out.jsonl"
   # Keep in step with `CrowdControl.Session`'s `:max_line_bytes` default.
   @default_max_line_bytes 1_048_576
-  @default_drain 3_000
+  @default_drain 15_000
   @default_shutdown_limit 20
   @default_network "log"
   @default_sandbox "sandbox"
