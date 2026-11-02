@@ -156,7 +156,7 @@ defmodule CrowdControl.PresetTest do
       assert spec.host_config == %{
                shm_size: 1_073_741_824,
                init: true,
-               tmpfs: %{"/tmp" => "rw,nosuid,size=512m"}
+               tmpfs: %{"/tmp" => "rw,noexec,nosuid,size=512m"}
              }
     end
 
@@ -175,6 +175,23 @@ defmodule CrowdControl.PresetTest do
                Browser.spec(@browser).env["PW_WS_TOKEN"]
 
       assert_raise ArgumentError, fn -> Browser.spec(@browser ++ [token: "short"]) end
+    end
+
+    test "a non-default name: MCP allows that Host, and the sandbox is pointed at it" do
+      spec = Browser.spec(@browser ++ [name: "web"])
+
+      assert spec.name == "web"
+      # The image passes this to `playwright mcp --allowed-hosts`; a Host of
+      # browser:8931 would get 403 from a browser named web.
+      assert spec.env["MCP_ALLOWED_HOSTS"] == "web:8931"
+
+      overrides = Browser.sandbox_overrides(spec)
+      endpoint = "ws://web:3000/" <> spec.env["PW_WS_TOKEN"]
+      assert overrides[:env]["PW_WS_ENDPOINT"] == endpoint
+      assert overrides[:env]["PW_TEST_CONNECT_WS_ENDPOINT"] == endpoint
+
+      assert overrides[:mcp_config]["mcpServers"]["playwright"]["url"] ==
+               "http://web:8931/mcp"
     end
 
     test "the sandbox wiring is valid CLI input: endpoint env, typed inline MCP, prompt line" do
@@ -403,7 +420,7 @@ defmodule CrowdControl.PresetTest do
     test "Compose: read-only capture, non-root, drained, after the sandbox" do
       spec = LogShipper.spec(sink: :console, capture_volume: "cclog")
 
-      assert spec.image == "timberio/vector:0.61.0-distroless-libc"
+      assert spec.image =~ ~r"\Atimberio/vector:0\.61\.0-distroless-libc@sha256:[0-9a-f]{64}\z"
       assert spec.user == "65532:65532"
       assert spec.egress == :none
       refute Map.has_key?(spec, :networks)
