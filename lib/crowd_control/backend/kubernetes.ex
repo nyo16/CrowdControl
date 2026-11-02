@@ -1889,22 +1889,11 @@ defmodule CrowdControl.Backend.Kubernetes do
     # outlive the VM, and reattaching needs none of this -- the Pod already
     # holds whatever environment it was started with.
     #
-    # `Store.scrub_opts/1` cannot see into `:services`, and a service's `:env`
-    # is where a credential would live, so the specs lose `:env` and `:files`
-    # too, as under `Provider.Compose.scrub/1`. Teardown needs neither: it
-    # works from the refs.
-    %{handle | config: handle.config |> Store.scrub_opts() |> scrub_services()}
+    # `Store.scrub_opts/1` also strips `:env` and `:files` from the `:services`
+    # specs, as under `Provider.Compose.scrub/1`: a service's `:env` is where a
+    # credential would live. Teardown needs neither: it works from the refs.
+    %{handle | config: Store.scrub_opts(handle.config)}
   end
-
-  defp scrub_services(config) do
-    case Keyword.get(config, :services) do
-      specs when is_list(specs) -> Keyword.put(config, :services, Enum.map(specs, &drop_env/1))
-      _ -> config
-    end
-  end
-
-  defp drop_env(spec) when is_map(spec), do: Map.drop(spec, [:env, :files])
-  defp drop_env(spec), do: spec
 
   @impl true
   def list_live(opts) do

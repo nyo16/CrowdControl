@@ -232,12 +232,60 @@ defmodule CrowdControl.Store do
   environment it was started with — so the key has no business being written
   down.
 
+  The scrub applies at every level a credential can hide:
+
+    * `secret_keys/0` are dropped from `opts`;
+    * a `backend: {module, keyword}` tuple, and a `provider: {module, keyword}`
+      tuple inside it, are scrubbed the same way, recursively;
+    * each `:services` spec loses `:env` and `:files` (see `scrub_services/1`).
+
+  Every other option is kept as is: a reattached session rebuilds itself from
+  what is left.
+
       iex> CrowdControl.Store.scrub_opts(api_key: "sk-real", timeout: 5000)
       [timeout: 5000]
+
+      iex> CrowdControl.Store.scrub_opts(
+      ...>   backend: {MyBackend, session_token: "ccst_x", provider: {MyProvider, api_key: "p", region: "eu"}},
+      ...>   timeout: 5000
+      ...> )
+      [backend: {MyBackend, provider: {MyProvider, region: "eu"}}, timeout: 5000]
   """
   @spec scrub_opts(keyword()) :: keyword()
-  def scrub_opts(opts) when is_list(opts), do: Keyword.drop(opts, secret_keys())
+  def scrub_opts(opts) when is_list(opts) do
+    opts
+    |> Keyword.drop(secret_keys())
+    |> Enum.map(&scrub_entry/1)
+  end
+
   def scrub_opts(other), do: other
+
+  defp scrub_entry({key, {module, config}})
+       when key in [:backend, :provider] and is_atom(module) and is_list(config),
+       do: {key, {module, scrub_opts(config)}}
+
+  defp scrub_entry({:services, specs}) when is_list(specs), do: {:services, scrub_services(specs)}
+  defp scrub_entry(entry), do: entry
+
+  @doc """
+  Strip `:env` and `:files` from each service spec in a `:services` list.
+
+  A service's `:env` is where a proxy's upstream key, a database password or a
+  browser capability token lives. `:files` is configuration rather than
+  credentials by contract, but it is up to 1 MiB per service that nothing after
+  provisioning reads. Neither is needed to reattach or tear down. Anything that
+  is not a map is kept unchanged; a `%CrowdControl.Service{}` keeps its shape,
+  with both fields emptied.
+
+      iex> CrowdControl.Store.scrub_services([%{name: "db", env: %{"PASSWORD" => "s"}, image: "pg:16"}])
+      [%{name: "db", image: "pg:16"}]
+  """
+  @spec scrub_services(list()) :: list()
+  def scrub_services(specs) when is_list(specs), do: Enum.map(specs, &scrub_service/1)
+
+  defp scrub_service(%CrowdControl.Service{} = service), do: %{service | env: %{}, files: []}
+  defp scrub_service(spec) when is_map(spec), do: Map.drop(spec, [:env, :files])
+  defp scrub_service(spec), do: spec
 
   @doc """
   Mint a new session key.

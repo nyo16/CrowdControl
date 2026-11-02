@@ -114,6 +114,20 @@ defmodule CrowdControl.SessionControlTest do
 
   defp unique_key, do: "ctl-" <> Store.new_key()
 
+  # Callback extra_args are persisted, so a pid is refused there; callbacks
+  # reach the test process by a registered name instead.
+  defp me do
+    case Process.info(self(), :registered_name) do
+      {:registered_name, name} when is_atom(name) ->
+        name
+
+      _unregistered ->
+        name = :"#{__MODULE__}.#{System.unique_integer([:positive])}"
+        Process.register(self(), name)
+        name
+    end
+  end
+
   describe "turn timer" do
     test "pauses while a permission request is pending and resumes with the remainder" do
       ctl = start_supervised!({Mock, events: []})
@@ -122,7 +136,7 @@ defmodule CrowdControl.SessionControlTest do
         start(ctl,
           timeout: 400,
           interrupt_grace: 0,
-          can_use_tool: {__MODULE__, :defer, [self()]}
+          can_use_tool: {__MODULE__, :defer, [me()]}
         )
 
       Session.subscribe(pid)
@@ -156,7 +170,7 @@ defmodule CrowdControl.SessionControlTest do
         start(ctl,
           timeout: 10_000,
           permission_timeout: 50,
-          can_use_tool: {__MODULE__, :defer, [self()]}
+          can_use_tool: {__MODULE__, :defer, [me()]}
         )
 
       TestHelpers.wait_until(fn -> answers(ctl, "p2") != [] end)
@@ -176,7 +190,7 @@ defmodule CrowdControl.SessionControlTest do
         start(ctl,
           timeout: 100,
           interrupt_grace: 300,
-          can_use_tool: {__MODULE__, :defer, [self()]}
+          can_use_tool: {__MODULE__, :defer, [me()]}
         )
 
       Session.subscribe(pid)
@@ -202,7 +216,7 @@ defmodule CrowdControl.SessionControlTest do
         start(ctl,
           timeout: 100,
           interrupt_grace: 100,
-          can_use_tool: {__MODULE__, :defer, [self()]}
+          can_use_tool: {__MODULE__, :defer, [me()]}
         )
 
       Session.subscribe(pid)
@@ -239,7 +253,7 @@ defmodule CrowdControl.SessionControlTest do
       ctl = start_supervised!({Mock, events: []})
 
       {:ok, pid} =
-        start(ctl, timeout: 60_000, can_use_tool: {__MODULE__, :block, [self()]})
+        start(ctl, timeout: 60_000, can_use_tool: {__MODULE__, :block, [me()]})
 
       key = :sys.get_state(pid).store_key
       Mock.push_events(ctl, [{:stdout_data, line(can_use_tool_frame("r1"))}])
@@ -286,7 +300,7 @@ defmodule CrowdControl.SessionControlTest do
             agent: ClaudeCode,
             executable: "claude",
             timeout: 60_000,
-            can_use_tool: {__MODULE__, :allow, [self()]}
+            can_use_tool: {__MODULE__, :allow, [me()]}
           ]
         )
 
@@ -320,7 +334,7 @@ defmodule CrowdControl.SessionControlTest do
           opts: [
             executable: "claude",
             timeout: 60_000,
-            can_use_tool: {__MODULE__, :defer, [self()]}
+            can_use_tool: {__MODULE__, :defer, [me()]}
           ],
           control: %{
             pending: %{{"gone", 10} => Map.put(entry, :status, :deferred)},
@@ -351,8 +365,8 @@ defmodule CrowdControl.SessionControlTest do
 
       server =
         SdkMcp.tool_server("app", [
-          %{name: "safe", call: {__MODULE__, :echo, [self()]}, idempotent: true},
-          %{name: "unsafe", call: {__MODULE__, :echo, [self()]}}
+          %{name: "safe", call: {__MODULE__, :echo, [me()]}, idempotent: true},
+          %{name: "unsafe", call: {__MODULE__, :echo, [me()]}}
         ])
 
       hook_request = %{"subtype" => "hook_callback", "callback_id" => "hook_PreToolUse_0_0"}
@@ -367,7 +381,7 @@ defmodule CrowdControl.SessionControlTest do
           opts: [
             executable: "claude",
             timeout: 60_000,
-            hooks: %{"PreToolUse" => [%{hooks: [{__MODULE__, :hook, [self()]}]}]},
+            hooks: %{"PreToolUse" => [%{hooks: [{__MODULE__, :hook, [me()]}]}]},
             sdk_mcp_servers: %{"app" => server}
           ],
           control: %{
@@ -439,7 +453,7 @@ defmodule CrowdControl.SessionControlTest do
 
     test "system/init below the minimum stops a control session with a typed error" do
       ctl = start_supervised!({Mock, events: []})
-      {:ok, pid} = start(ctl, timeout: 10_000, can_use_tool: {__MODULE__, :defer, [self()]})
+      {:ok, pid} = start(ctl, timeout: 10_000, can_use_tool: {__MODULE__, :defer, [me()]})
       Session.subscribe(pid)
       Mock.push_events(ctl, [{:stdout_data, init_line("2.1.200")}])
 
@@ -463,7 +477,7 @@ defmodule CrowdControl.SessionControlTest do
       assert {:error, {:cli_version, "2.1.0", "2.1.268"}} =
                Session.start_link(
                  executable: TestHelpers.fake_control_cli_path(),
-                 can_use_tool: {__MODULE__, :defer, [self()]},
+                 can_use_tool: {__MODULE__, :defer, [me()]},
                  env: %{"FAKE_CC_VERSION" => "2.1.0"}
                )
     end
@@ -471,7 +485,7 @@ defmodule CrowdControl.SessionControlTest do
 
   describe "SDK MCP servers" do
     test "a tool call is answered with the server's mcp_response" do
-      server = SdkMcp.tool_server("app", [%{name: "echo", call: {__MODULE__, :echo, [self()]}}])
+      server = SdkMcp.tool_server("app", [%{name: "echo", call: {__MODULE__, :echo, [me()]}}])
       frame = mcp_frame("m1", "app", "echo", %{"text" => "hi"})
       ctl = start_supervised!({Mock, events: [{:stdout_data, line(frame)}]})
 
@@ -531,7 +545,7 @@ defmodule CrowdControl.SessionControlTest do
     test "the fake CLI's own MCP initialize and a tool call are both answered" do
       log = Path.join(System.tmp_dir!(), "cc-fake-mcp-#{Store.new_key()}.log")
       on_exit(fn -> File.rm(log) end)
-      server = SdkMcp.tool_server("app", [%{name: "echo", call: {__MODULE__, :echo, [self()]}}])
+      server = SdkMcp.tool_server("app", [%{name: "echo", call: {__MODULE__, :echo, [me()]}}])
 
       {:ok, pid} =
         Session.start_link(

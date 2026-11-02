@@ -105,7 +105,10 @@ defmodule CrowdControl.Session.Control do
     end
   end
 
-  defp callback!({m, f, a} = mfa, _key) when is_atom(m) and is_atom(f) and is_list(a), do: mfa
+  defp callback!({m, f, a} = mfa, key) when is_atom(m) and is_atom(f) and is_list(a) do
+    check_extra_args!(a, inspect(key))
+    mfa
+  end
 
   defp callback!(fun, key) when is_function(fun) do
     raise ArgumentError,
@@ -117,6 +120,34 @@ defmodule CrowdControl.Session.Control do
     raise ArgumentError,
           "#{inspect(key)} must be an MFA tuple {module, function, extra_args}, got: #{inspect(other)}"
   end
+
+  @doc """
+  Raises `ArgumentError` when an MFA's `extra_args` hold a fun, pid,
+  reference or port, at any depth. Session options are persisted to
+  CrowdControl.Store, and none of those survive a restart -- a closure can also
+  capture a secret. `label` names the option in the message.
+  """
+  @spec check_extra_args!(list(), String.t()) :: :ok
+  def check_extra_args!(args, label) when is_list(args) do
+    case unpersistable(args) do
+      nil ->
+        :ok
+
+      bad ->
+        raise ArgumentError,
+              "#{label} extra_args must be plain data: they are persisted to " <>
+                "CrowdControl.Store, and #{inspect(bad)} cannot be"
+    end
+  end
+
+  defp unpersistable(term)
+       when is_function(term) or is_pid(term) or is_reference(term) or is_port(term),
+       do: term
+
+  defp unpersistable([head | tail]), do: unpersistable(head) || unpersistable(tail)
+  defp unpersistable(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> unpersistable()
+  defp unpersistable(map) when is_map(map), do: map |> Map.to_list() |> unpersistable()
+  defp unpersistable(_plain), do: nil
 
   defp hooks!(opts) do
     opts
@@ -131,8 +162,10 @@ defmodule CrowdControl.Session.Control do
 
       servers when is_map(servers) ->
         Enum.each(servers, fn
-          {_name, %SdkMcp{}} ->
-            :ok
+          {name, %SdkMcp{tools: tools}} ->
+            Enum.each(tools, fn %{name: tool, call: {_m, _f, args}} ->
+              check_extra_args!(args, "sdk_mcp_servers #{inspect(name)} tool #{inspect(tool)} :call")
+            end)
 
           {name, other} ->
             raise ArgumentError,

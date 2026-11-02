@@ -30,7 +30,9 @@ defmodule CrowdControl.Session do
       `:executable` when omitted.
     * `:backend` - `CrowdControl.Backend` implementation, either a module or a
       `{module, config}` tuple whose config is merged into these opts. Defaults
-      to `CrowdControl.Backend.Local`.
+      to `CrowdControl.Backend.Local`. What a reattachable backend persists is
+      scrubbed by `CrowdControl.Store.scrub_opts/1`: credentials, service `:env`
+      and `:files` are dropped at every level, including inside this tuple.
     * `:prompt` - initial prompt sent once the CLI starts (optional)
     * `:timeout` - ceiling in ms on a single **turn**, after which the session
       self-expires and broadcasts `{:timeout, :session_expired}`. The timer is
@@ -61,7 +63,11 @@ defmodule CrowdControl.Session do
   callback is an MFA tuple `{module, function, extra_args}`, called as
   `apply(module, function, [request, context | extra_args])`. Funs are refused
   at start with `ArgumentError`, because session options are persisted and a
-  closure cannot be.
+  closure cannot be; so are funs, pids, references and ports anywhere inside
+  `extra_args`. `extra_args` are persisted to `CrowdControl.Store` as given, so
+  they **must not hold secrets**: look a credential up inside the callback. The
+  options may be given at top level or inside a `backend: {module, config}`
+  tuple; either way a reattached session keeps them.
 
     * `:can_use_tool` - answers the CLI's tool-permission requests. `request` is
       the `can_use_tool` request map (`"tool_name"`, `"input"`,
@@ -118,6 +124,7 @@ defmodule CrowdControl.Session do
   require Logger
 
   alias CrowdControl.{Agent, Backend, CLI, Protocol, Result, SdkMcp, Store, Telemetry}
+  alias CrowdControl.Backend.Shell
   alias CrowdControl.Session.Control
 
   @default_timeout 300_000
@@ -133,6 +140,17 @@ defmodule CrowdControl.Session do
   # falls back to the permission requests it persisted.
   @reattach_reply_timeout 60_000
   @version_check_timeout 10_000
+
+  # Control opts a reattached session needs at top level of its record; see
+  # persisted_opts/2.
+  @control_opts [
+    :can_use_tool,
+    :hooks,
+    :sdk_mcp_servers,
+    :on_control_request,
+    :permission_timeout,
+    :interrupt_grace
+  ]
 
   defstruct [
     :agent,
@@ -371,6 +389,10 @@ defmodule CrowdControl.Session do
     with {:ok, handle} <- backend.reattach(record.handle, cursor),
          {:ok, reader} <- reader_or_destroy(backend, handle, cursor) do
       agent = Agent.resolve(record.opts)
+      # The record holds the scrubbed opts, `backend: {mod, config}` tuple
+      # included, so merging them again yields what init/1 ran with, minus the
+      # credentials. Control opts given inside the tuple live there too.
+      {_backend, merged} = Backend.resolve(record.opts)
 
       state = %__MODULE__{
         agent: agent,
@@ -381,10 +403,10 @@ defmodule CrowdControl.Session do
         owner: record.owner,
         session_id: record.session_id,
         persist?: Backend.reattachable?(backend),
-        opts: record.opts,
-        # The merged list is not persisted, so the record's opts are the best
-        # available. Backend config is re-applied by the reattach path itself.
-        agent_opts: record.opts,
+        # Scrubbed again so a record written before the scrub recursed into
+        # `backend:` loses its nested credentials on the next write.
+        opts: Store.scrub_opts(record.opts),
+        agent_opts: merged,
         timeout: Keyword.get(record.opts, :timeout, @default_timeout),
         max_prompt_size: Keyword.get(record.opts, :max_prompt_size),
         max_line_bytes: bound_opt!(record.opts, :max_line_bytes, @default_max_line_bytes),
@@ -401,7 +423,7 @@ defmodule CrowdControl.Session do
         # Callers re-subscribe/1; this is expected, not a gap.
         subscribers: [],
         status: :running,
-        control: record.opts |> Control.new(agent) |> Control.restore(Map.get(record, :control))
+        control: merged |> Control.new(agent) |> Control.restore(Map.get(record, :control))
       }
 
       # :reattach_control runs before any stdout cast, so the `initialize` is
@@ -448,7 +470,7 @@ defmodule CrowdControl.Session do
     control = Control.new(backend_opts, agent)
     meta = %{store_key: store_key, agent: agent, backend: backend}
 
-    with :ok <- check_cli_version(backend, control, executable, env),
+    with :ok <- check_cli_version(backend, control, executable, env, backend_opts),
          {:ok, handle, reader} <-
            start_backend(backend, backend_opts, executable, args, env, meta) do
       state = %__MODULE__{
@@ -459,7 +481,7 @@ defmodule CrowdControl.Session do
         store_key: store_key,
         owner: owner,
         persist?: Backend.reattachable?(backend),
-        opts: opts,
+        opts: persisted_opts(opts, backend_opts),
         agent_opts: backend_opts,
         timeout: Keyword.get(opts, :timeout, @default_timeout),
         max_prompt_size: Keyword.get(opts, :max_prompt_size),
@@ -473,6 +495,17 @@ defmodule CrowdControl.Session do
     else
       {:error, reason} -> {:stop, reason}
     end
+  end
+
+  # The opts a reattach starts from, computed once rather than per store write.
+  # Control opts may have come from inside `backend: {mod, config}`; they are
+  # lifted to the top level so the record names them wherever they were given
+  # (they are MFA-only, so plain data -- see Control.check_extra_args!/2).
+  # Then the whole list, tuple included, is scrubbed of credentials.
+  defp persisted_opts(opts, backend_opts) do
+    opts
+    |> Keyword.merge(Keyword.take(backend_opts, @control_opts))
+    |> Store.scrub_opts()
   end
 
   # A failed handshake is fatal, not something to discover via the inactivity
@@ -535,14 +568,35 @@ defmodule CrowdControl.Session do
   # A local CLI can be asked its version before anything exists, so a too-old
   # one fails the start instead of failing mid-session. Remote CLIs live in the
   # sandbox image and are checked at `system/init` instead.
-  defp check_cli_version(Backend.Local, %Control{features?: true}, executable, env) do
-    case local_cli_version(executable, env) do
+  defp check_cli_version(Backend.Local, %Control{features?: true}, executable, env, opts) do
+    case local_cli_version(executable, probe_env(env, opts)) do
       {:ok, have} -> version_gate(have)
       :unknown -> :ok
     end
   end
 
-  defp check_cli_version(_backend, _control, _executable, _env), do: :ok
+  defp check_cli_version(_backend, _control, _executable, _env, _opts), do: :ok
+
+  # The probe runs the same binary the session is about to spawn, so it gets
+  # the same release scrub `CrowdControl.Backend.Local` applies: `System.cmd/3`
+  # only adds to the inherited environment, so each scrubbed name is unset
+  # (`{name, nil}`) and the release-free `PATH` exported. An explicit `:env`
+  # entry still wins, as under Local. Anything but `release_env: :inherit`
+  # scrubs; Local refuses an unknown value at provision.
+  defp probe_env(env, opts) do
+    scrub =
+      case Keyword.get(opts, :release_env, :scrub) do
+        :inherit ->
+          %{}
+
+        _scrub ->
+          {unset, path} = Shell.release_scrub(System.get_env())
+          scrubbed = Map.new(unset, &{&1, nil})
+          if path, do: Map.put(scrubbed, "PATH", path), else: scrubbed
+      end
+
+    scrub |> Map.merge(env) |> Map.to_list()
+  end
 
   # `:unknown` (no binary, no Claude Code banner, a hang) skips the gate: the
   # spawn then fails, or system/init decides.
@@ -550,7 +604,7 @@ defmodule CrowdControl.Session do
     task =
       Task.async(fn ->
         try do
-          System.cmd(executable, ["--version"], stderr_to_stdout: true, env: Map.to_list(env))
+          System.cmd(executable, ["--version"], stderr_to_stdout: true, env: env)
         rescue
           _ in [ErlangError, ArgumentError] -> :error
         end
@@ -910,11 +964,12 @@ defmodule CrowdControl.Session do
         backend: state.backend,
         # Both the handle and the opts are scrubbed of credentials before they
         # touch the store -- a record can outlive the VM on disk, and nothing
-        # about reattaching needs an API key.
+        # about reattaching needs an API key. `state.opts` was scrubbed once,
+        # by persisted_opts/2 (or came scrubbed from a record).
         handle: Backend.scrub(state.backend, state.backend_state),
         byte_offset: state.byte_offset,
         buffer: state.buffer,
-        opts: Store.scrub_opts(state.opts),
+        opts: state.opts,
         owner: state.owner,
         control: Control.to_store(state.control)
       )

@@ -33,8 +33,11 @@ defmodule CrowdControl.SdkMcp do
     * `:name` - required, unique within the server
     * `:call` - required, an MFA `{module, function, extra_args}`, called as
       `apply(module, function, [arguments | extra_args])` with the tool's
-      JSON arguments (a string-keyed map). Funs are refused: session options
-      are persisted, and a closure cannot be.
+      JSON arguments (a string-keyed map). Funs are refused, and so are funs,
+      pids, references and ports anywhere inside `extra_args`: session options
+      are persisted to `CrowdControl.Store`, and none of those survive a
+      restart. For the same reason `extra_args` must not hold secrets; look a
+      credential up inside the called function instead.
     * `:description` - optional, defaults to `""`
     * `:input_schema` - optional JSON Schema, defaults to an empty object schema
     * `:idempotent` - optional, defaults to `false`. A session that reattaches
@@ -56,6 +59,8 @@ defmodule CrowdControl.SdkMcp do
   `tools/call`, and an empty acknowledgement for notifications. It touches no
   process state, so a session can run it wherever it likes.
   """
+
+  alias CrowdControl.Session.Control
 
   @enforce_keys [:name, :tools]
   defstruct [:name, :tools, version: "1.0.0"]
@@ -115,6 +120,8 @@ defmodule CrowdControl.SdkMcp do
             "tool #{inspect(name)} :call must be an MFA tuple {module, function, extra_args}, " <>
               "got: #{inspect(call)}"
     end
+
+    Control.check_extra_args!(elem(call, 2), "tool #{inspect(name)} :call")
 
     unless is_binary(description),
       do: raise(ArgumentError, "tool #{name} :description must be a binary")
