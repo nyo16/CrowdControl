@@ -36,10 +36,19 @@ defmodule CrowdControl.ServiceTest do
             {%{no_new_privileges: false}, nil, :no_new_privileges},
             {%{readonly_rootfs: false}, nil, :readonly_rootfs},
             {%{}, "0", :user},
-            {%{}, "root:root", :user}
+            {%{}, "00", :user},
+            {%{}, "000:1000", :user},
+            {%{}, "root", :user},
+            {%{}, "root:root", :user},
+            {%{tmpfs: %{"/tmp" => "rw,size=512m"}}, nil, :tmpfs_exec},
+            {%{tmpfs: %{"/tmp" => "rw,noexec,size=512m"}}, nil, :tmpfs_exec},
+            {%{tmpfs: %{"/tmp" => "rw,noexec,nosuid,exec"}}, nil, :tmpfs_exec},
+            {%{tmpfs: %{"/tmp" => "rw,noexec,nosuid,suid"}}, nil, :tmpfs_exec}
           ] do
         spec = sidecar(host_config: host_config) |> maybe_user(user)
-        assert {:error, {:weakening_not_declared, {"b", ^key}}} = Service.normalize(spec, :sidecar)
+
+        assert {:error, {:weakening_not_declared, {"b", ^key}}} =
+                 Service.normalize(spec, :sidecar)
 
         assert {:ok, %Service{}} = Service.normalize(Map.put(spec, :weaken, [key]), :sidecar)
       end
@@ -52,7 +61,7 @@ defmodule CrowdControl.ServiceTest do
         pids_limit: 1024,
         memory: 2_000_000_000,
         cpus: 1.5,
-        tmpfs: %{"/tmp" => "rw,size=512m"},
+        tmpfs: %{"/tmp" => "rw,noexec,nosuid,size=512m"},
         no_new_privileges: true,
         readonly_rootfs: true,
         cap_add: []
@@ -60,6 +69,42 @@ defmodule CrowdControl.ServiceTest do
 
       assert {:ok, %Service{host_config: ^host_config}} =
                Service.normalize(sidecar(host_config: host_config, user: "1000"), :sidecar)
+    end
+
+    test "a user the runtime might still read as root is invalid, declared or not" do
+      for user <- ["+0", " 0", "0 ", "-1", "0\n", "Root", "0:+0", ""] do
+        assert {:error, {:bad_service, {"b", :user}}} =
+                 Service.normalize(sidecar(user: user, weaken: [:user]), :sidecar)
+      end
+    end
+
+    test "root_user?/1 reads a uid numerically, any group" do
+      for user <- ["0", "00", "000:1000", "root", "root:root", "0:root"],
+          do: assert(Service.root_user?(user), user)
+
+      for user <- [nil, "1000", "1000:0", "10", "rooty", "vector"],
+          do: refute(Service.root_user?(user), inspect(user))
+    end
+
+    test "a host_path mount on a sidecar needs weaken: [:host_path], read-only or not" do
+      for read_only <- [false, true] do
+        spec = sidecar(volumes: [%{host_path: "/srv", target: "/srv", read_only: read_only}])
+
+        assert {:error, {:weakening_not_declared, {"b", :host_path}}} =
+                 Service.normalize(spec, :sidecar)
+
+        assert {:ok, %Service{weaken: [:host_path]}} =
+                 Service.normalize(Map.put(spec, :weaken, [:host_path]), :sidecar)
+      end
+
+      # A named volume is the stack's own and needs nothing.
+      assert {:ok, %Service{}} =
+               Service.normalize(sidecar(volumes: [%{name: "v", target: "/v"}]), :sidecar)
+    end
+
+    test "the sandbox's own host_path mount is the caller's workspace, not a weakening" do
+      spec = %{name: "sandbox", volumes: [%{host_path: "/work", target: "/workspace"}]}
+      assert {:ok, %Service{role: :sandbox}} = Service.normalize(spec, :sandbox)
     end
 
     test "privileged is refused outright, declared or not" do
@@ -83,6 +128,16 @@ defmodule CrowdControl.ServiceTest do
   end
 
   describe "fields" do
+    test "env keys are shell identifiers, so KEY=value cannot be split elsewhere" do
+      assert {:ok, %Service{}} =
+               Service.normalize(sidecar(env: %{"_A1" => "x=y", "LOG_LEVEL" => ""}), :sidecar)
+
+      for key <- ["A=B", "1A", "", "A-B", "A B", "A\n", "Ä"] do
+        assert {:error, {:bad_service, {"b", :env}}} =
+                 Service.normalize(sidecar(env: %{key => "v"}), :sidecar)
+      end
+    end
+
     test "the legacy :port leads :ports" do
       assert {:ok, %Service{ports: [3128, 9000]}} =
                Service.normalize(sidecar(port: 3128, ports: [9000, 3128]), :sidecar)
@@ -180,8 +235,13 @@ defmodule CrowdControl.ServiceTest do
       assert {:ok, [%{mode: 0o600, uid: 65_532, gid: 0}]} =
                Service.validate_files([%{path: "/a", content: "", mode: 0o600, uid: 65_532}], "b")
 
-      assert {:error, {:bad_file, {"b", "/a"}}} =
-               Service.validate_files([%{path: "/a", content: "", mode: 0o10000}], "b")
+      for mode <- [0o4755, 0o2755, 0o1777, 0o10000, -1] do
+        assert {:error, {:bad_file, {"b", "/a"}}} =
+                 Service.validate_files([%{path: "/a", content: "", mode: mode}], "b")
+      end
+
+      assert {:ok, [%{mode: 0o777}]} =
+               Service.validate_files([%{path: "/a", content: "", mode: 0o777}], "b")
 
       assert {:error, {:bad_file, {"b", "/a"}}} =
                Service.validate_files([%{path: "/a", content: :atom}], "b")

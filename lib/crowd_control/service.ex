@@ -42,11 +42,18 @@ defmodule CrowdControl.Service do
 
     * `:egress` is required on every sidecar, with no default. The sandbox can
       never carry `:allow`.
-    * HostConfig keys that *weaken* the hardened defaults — `:cap_add`,
-      `no_new_privileges: false`, `readonly_rootfs: false`, and a root `:user` —
-      must each be named in `:weaken`, or the spec is refused with
-      `{:weakening_not_declared, {name, key}}`. Resource keys (`:shm_size`,
-      `:init`, `:pids_limit`, `:memory`, `:cpus`, `:tmpfs`) need no declaration.
+    * Keys that *weaken* the hardened defaults must each be named in `:weaken`,
+      or the spec is refused with `{:weakening_not_declared, {name, key}}`:
+        * `:cap_add` — a non-empty `host_config.cap_add`;
+        * `:no_new_privileges` — `host_config.no_new_privileges: false`;
+        * `:readonly_rootfs` — `host_config.readonly_rootfs: false`;
+        * `:user` — a root `:user` (see `root_user?/1`);
+        * `:host_path` — a `kind: :host_path` mount on a sidecar, read-only or
+          not: it hands the container part of the host filesystem;
+        * `:tmpfs_exec` — a `host_config.tmpfs` entry whose options leave out
+          `noexec` or `nosuid` (or name `exec`/`suid`).
+      Resource keys (`:shm_size`, `:init`, `:pids_limit`, `:memory`, `:cpus`,
+      `:tmpfs` with `noexec,nosuid`) need no declaration.
     * `privileged` is refused outright, declared or not.
 
   ## `:files` is for configuration, never credentials
@@ -59,8 +66,9 @@ defmodule CrowdControl.Service do
   documented rather than enforced.
 
   Each file is `%{path: abs_path, content: binary}` plus optional `:mode`
-  (default `0o644`), `:uid` and `:gid` (default `0`). Paths are absolute, carry
-  no `.`/`..` segments, are unique, and all content together is at most 1 MiB.
+  (`0..0o777`, default `0o644`; no setuid, setgid or sticky bits), `:uid` and
+  `:gid` (default `0`). Paths are absolute, carry no `.`/`..` segments, are
+  unique, and all content together is at most 1 MiB.
   Kubernetes cannot set per-file ownership; `:uid`/`:gid` are Compose-only.
   """
 
@@ -76,7 +84,14 @@ defmodule CrowdControl.Service do
   @drain_margin 5
 
   @resource_keys [:shm_size, :init, :pids_limit, :memory, :cpus, :tmpfs]
-  @weakening_keys [:cap_add, :no_new_privileges, :readonly_rootfs, :user]
+  @weakening_keys [
+    :cap_add,
+    :no_new_privileges,
+    :readonly_rootfs,
+    :user,
+    :host_path,
+    :tmpfs_exec
+  ]
 
   defstruct [
     :name,
@@ -163,7 +178,7 @@ defmodule CrowdControl.Service do
          {:ok, ready} <- fetch_ready(spec, name),
          {:ok, weaken} <- fetch_weaken(spec, name),
          {:ok, host_config} <- fetch_host_config(spec, name),
-         :ok <- check_weakenings(name, host_config, user, weaken),
+         :ok <- check_weakenings(name, weakenings(host_config, user, volumes, role), weaken),
          {:ok, networks} <- fetch_networks(spec, name),
          {:ok, placement} <- fetch_placement(spec, name),
          {:ok, drain, shutdown_limit} <- fetch_drain(spec, name) do
@@ -340,16 +355,19 @@ defmodule CrowdControl.Service do
     end
   end
 
+  # A key becomes a shell variable name in the container and a `KEY=value`
+  # entry in the Engine's `Env`, where an `=` in the key would move the split.
   defp fetch_env(spec, name) do
     with env when is_map(env) <- Map.get(spec, :env, %{}),
-         true <- Enum.all?(env, &binary_pair?/1) do
+         true <- Enum.all?(env, &env_pair?/1) do
       {:ok, env}
     else
       _ -> bad(name, :env)
     end
   end
 
-  defp binary_pair?({key, value}), do: is_binary(key) and is_binary(value)
+  defp env_pair?({key, value}),
+    do: is_binary(key) and is_binary(value) and key =~ ~r/\A[A-Za-z_][A-Za-z0-9_]*\z/
 
   # The shape rules live in `CrowdControl.Volume` so no substrate can drift on
   # what a mount is. Whether a `:name` refers to something that exists is the
@@ -481,23 +499,35 @@ defmodule CrowdControl.Service do
   defp valid_host_value?(:readonly_rootfs, v), do: is_boolean(v)
   defp valid_host_value?(_key, _v), do: false
 
-  defp check_weakenings(name, host_config, user, weaken) do
-    case Enum.find(weakenings(host_config, user), &(&1 not in weaken)) do
+  defp check_weakenings(name, weakenings, weaken) do
+    case Enum.find(weakenings, &(&1 not in weaken)) do
       nil -> :ok
       key -> {:error, {:weakening_not_declared, {name, key}}}
     end
   end
 
-  # In a fixed order, so the error names the same key on every run.
-  defp weakenings(host_config, user) do
+  # In a fixed order, so the error names the same key on every run. A host path
+  # on the sandbox is the caller's own workspace mount, passed at top level on
+  # every substrate; on a sidecar it is posture and has to be written down.
+  defp weakenings(host_config, user, volumes, role) do
     [
       {:cap_add, Map.get(host_config, :cap_add, []) != []},
       {:no_new_privileges, Map.get(host_config, :no_new_privileges) == false},
       {:readonly_rootfs, Map.get(host_config, :readonly_rootfs) == false},
-      {:user, root_user?(user)}
+      {:user, root_user?(user)},
+      {:host_path, role == :sidecar and Enum.any?(volumes, &(&1.kind == :host_path))},
+      {:tmpfs_exec, Enum.any?(Map.get(host_config, :tmpfs, %{}), &tmpfs_exec?/1)}
     ]
     |> Enum.filter(&elem(&1, 1))
     |> Enum.map(&elem(&1, 0))
+  end
+
+  # Docker reads mount options left to right, so a later `exec` undoes an
+  # earlier `noexec`; any spelling of either is treated as the weaker one.
+  defp tmpfs_exec?({_path, options}) do
+    flags = String.split(options, ",", trim: true)
+
+    "noexec" not in flags or "nosuid" not in flags or "exec" in flags or "suid" in flags
   end
 
   # Membership names are validated against the stack's declarations by the
@@ -555,7 +585,7 @@ defmodule CrowdControl.Service do
     cond do
       not valid_path?(path) -> {:error, {:bad_file, {name, path}}}
       not is_binary(content) -> {:error, {:bad_file, {name, path}}}
-      not (is_integer(mode) and mode in 0..0o7777) -> {:error, {:bad_file, {name, path}}}
+      not (is_integer(mode) and mode in 0..0o777) -> {:error, {:bad_file, {name, path}}}
       not (id?(uid) and id?(gid)) -> {:error, {:bad_file, {name, path}}}
       true -> {:ok, %{path: path, content: content, mode: mode, uid: uid, gid: gid}}
     end
