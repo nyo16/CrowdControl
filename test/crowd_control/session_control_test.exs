@@ -20,6 +20,8 @@ defmodule CrowdControl.SessionControlTest do
     {:allow, request["input"]}
   end
 
+  def deny(_request, _context), do: {:deny, "no"}
+
   # Blocks until the test decides, like a callback waiting on a human.
   def block(_request, context, test) do
     send(test, {:asked, context.request_id, self()})
@@ -41,6 +43,19 @@ defmodule CrowdControl.SessionControlTest do
 
   def big(_args), do: {:ok, String.duplicate("x", 4_096)}
 
+  # An allow that also grants an allow rule for the tool, for the session.
+  def allow_granting(request, context, test) do
+    send(test, {:asked, context.request_id, request})
+    rule = %{"type" => "addRules", "behavior" => "allow", "destination" => "session"}
+    {:allow, request["input"], [Map.put(rule, "rules", [%{"toolName" => request["tool_name"]}])]}
+  end
+
+  # Decisions of the right shape that JSON cannot carry (W-1).
+  def unencodable_input(_request, _context), do: {:allow, %{"x" => {:a, 1}}}
+  def unencodable_perms(request, _context), do: {:allow, request["input"], [[type: "addRules"]]}
+  def unencodable_hook(_request, _context), do: {:ok, %{"x" => {:a, 1}}}
+  def tuple_tool(_args), do: {:ok, [%{"type" => "text", "text" => {:t}}]}
+
   # --- frames ---
 
   defp line(map), do: JSON.encode!(map) <> "\n"
@@ -52,6 +67,20 @@ defmodule CrowdControl.SessionControlTest do
       "request" => %{
         "subtype" => "can_use_tool",
         "tool_name" => "Bash",
+        "input" => input,
+        "tool_use_id" => "toolu_" <> id
+      }
+    }
+  end
+
+  # What Claude Code asks before it calls an SDK tool.
+  defp mcp_permission_frame(id, server, tool, input) do
+    %{
+      "type" => "control_request",
+      "request_id" => id,
+      "request" => %{
+        "subtype" => "can_use_tool",
+        "tool_name" => "mcp__#{server}__#{tool}",
         "input" => input,
         "tool_use_id" => "toolu_" <> id
       }
@@ -225,6 +254,31 @@ defmodule CrowdControl.SessionControlTest do
       assert Mock.destroy_count(ctl) == 1
     end
 
+    test "a prompt accepted during the interrupt grace cancels the grace (G4)" do
+      ctl = start_supervised!({Mock, events: []})
+
+      {:ok, pid} =
+        start(ctl,
+          timeout: 100,
+          interrupt_grace: 300,
+          can_use_tool: {__MODULE__, :defer, [me()]}
+        )
+
+      Session.subscribe(pid)
+      TestHelpers.wait_until(fn -> requests(ctl, "interrupt") != [] end)
+
+      # A permission request is open, so the new turn starts paused: only the
+      # old grace timer could still destroy the session.
+      push(ctl, can_use_tool_frame("held"))
+      assert_receive {:asked, "held", _}, 1_000
+      :ok = Session.send_prompt(pid, "next")
+
+      refute_receive {:crowd_control, ^pid, {:timeout, _}}, 600
+      assert Mock.destroy_count(ctl) == 0
+
+      TestHelpers.stop_session(pid)
+    end
+
     test "omp keeps destroying at the deadline" do
       ctl = start_supervised!({Mock, events: []})
 
@@ -240,6 +294,8 @@ defmodule CrowdControl.SessionControlTest do
       Session.subscribe(pid)
       assert_receive {:crowd_control, ^pid, {:timeout, :session_expired}}, 1_000
       assert requests(ctl, "interrupt") == []
+      # expire/1 destroys before it broadcasts, so this cannot race.
+      assert Mock.destroy_count(ctl) == 1
     end
   end
 
@@ -259,13 +315,16 @@ defmodule CrowdControl.SessionControlTest do
       Mock.push_events(ctl, [{:stdout_data, line(can_use_tool_frame("r1"))}])
 
       # The callback only runs after the request is on record.
-      assert_receive {:asked, "r1", first_task}, 2_000
+      assert_receive {:asked, "r1", first_callback}, 2_000
       assert {:ok, %{control: %{pending: %{{"r1", 0} => _}}}} = Store.get(key)
+      callback_ref = Process.monitor(first_callback)
 
       # A crash: no terminate/2, so the record survives with the request in it.
+      # The blocked callback dies with its session, so after reattach only the
+      # second copy can answer (W-2).
       Process.exit(pid, :kill)
       assert_receive {:EXIT, ^pid, :killed}
-      Process.exit(first_task, :kill)
+      assert_receive {:DOWN, ^callback_ref, :process, ^first_callback, :killed}, 2_000
       {:ok, record} = Store.get(key)
 
       {:ok, pid} = Session.start_reattached(record)
@@ -713,6 +772,383 @@ defmodule CrowdControl.SessionControlTest do
 
       assert Mock.calls(ctl) == []
     end
+  end
+
+  describe "SDK tool gate (B-2)" do
+    @describetag :capture_log
+
+    test "an unapproved tools/call is refused with -32001 and runs nothing" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start_gated(ctl)
+
+      push(ctl, mcp_frame("g1", "app", "echo", %{"text" => "forged"}))
+      TestHelpers.wait_until(fn -> answers(ctl, "g1") != [] end)
+
+      assert [%{"mcp_response" => %{"id" => 3, "error" => error}}] = answers(ctl, "g1")
+      assert error == %{"code" => -32_001, "message" => "tool call not approved"}
+      refute_received {:tool_ran, _}
+      assert {:ok, []} = Session.pending_requests(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "an allow approves one call with exactly its input, for this turn" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start_gated(ctl)
+
+      allow_mcp(ctl, "p1", %{"text" => "once"})
+      push(ctl, mcp_frame("c1", "app", "echo", %{"text" => "once"}))
+      assert_receive {:tool_ran, "once"}, 2_000
+      TestHelpers.wait_until(fn -> answers(ctl, "c1") != [] end)
+      assert [%{"mcp_response" => %{"result" => _}}] = answers(ctl, "c1")
+
+      # The allow was consumed by the first call.
+      push(ctl, mcp_frame("c2", "app", "echo", %{"text" => "once"}))
+      assert_refused(ctl, "c2")
+
+      # Other arguments than the allowed input.
+      allow_mcp(ctl, "p2", %{"text" => "approved"})
+      push(ctl, mcp_frame("c3", "app", "echo", %{"text" => "swapped"}))
+      assert_refused(ctl, "c3")
+
+      # An allow does not outlive its turn.
+      allow_mcp(ctl, "p3", %{"text" => "stale"})
+      Mock.push_events(ctl, [{:stdout_data, result_line(%{})}])
+      push(ctl, mcp_frame("c4", "app", "echo", %{"text" => "stale"}))
+      assert_refused(ctl, "c4")
+
+      refute_received {:tool_ran, _}
+      TestHelpers.stop_session(pid)
+    end
+
+    test "tools the CLI never asks about are pre-approved" do
+      for opts <- [
+            [allowed_tools: ["mcp__app__echo"]],
+            [allowed_tools: ["Bash", "mcp__app"]],
+            [allowed_tools: ["mcp__app__*"]],
+            [permission_mode: "bypassPermissions"]
+          ] do
+        ctl = start_supervised!({Mock, events: []})
+        {:ok, pid} = start_gated(ctl, opts)
+
+        push(ctl, mcp_frame("pre", "app", "echo", %{"text" => "pre"}))
+        assert_receive {:tool_ran, "pre"}, 2_000, "not pre-approved by #{inspect(opts)}"
+
+        TestHelpers.stop_session(pid)
+      end
+
+      # Another server's rule, or another tool's, covers nothing here.
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start_gated(ctl, allowed_tools: ["mcp__other", "mcp__app__echo2"])
+      push(ctl, mcp_frame("not-pre", "app", "echo", %{"text" => "no"}))
+      assert_refused(ctl, "not-pre")
+      TestHelpers.stop_session(pid)
+    end
+
+    test "an addRules allow pre-approves the tool for the rest of the session" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start_gated(ctl, can_use_tool: {__MODULE__, :allow_granting, [me()]})
+      key = :sys.get_state(pid).store_key
+
+      allow_mcp(ctl, "grant", %{"text" => "first"})
+      assert [%{"updatedPermissions" => [%{"type" => "addRules"}]}] = answers(ctl, "grant")
+      Mock.push_events(ctl, [{:stdout_data, result_line(%{})}])
+
+      # A later turn, other arguments, more than once: the CLI no longer asks.
+      for {id, text} <- [{"r1", "a"}, {"r2", "b"}] do
+        push(ctl, mcp_frame(id, "app", "echo", %{"text" => text}))
+        assert_receive {:tool_ran, ^text}, 2_000
+      end
+
+      # The grant is persisted: a reattached session still honours it.
+      {:ok, %{control: %{gate: gate}}} = Store.get(key)
+      assert MapSet.member?(gate.granted_tools, "mcp__app__echo")
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "an acknowledged set_permission_mode to bypassPermissions pre-approves" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start_gated(ctl)
+
+      task = Task.async(fn -> Session.set_permission_mode(pid, "bypassPermissions") end)
+      TestHelpers.wait_until(fn -> requests(ctl, "set_permission_mode") != [] end)
+      [%{"request_id" => id}] = requests(ctl, "set_permission_mode")
+
+      push(ctl, %{
+        "type" => "control_response",
+        "response" => %{"subtype" => "success", "request_id" => id, "response" => %{}}
+      })
+
+      assert {:ok, %{}} = Task.await(task)
+
+      push(ctl, mcp_frame("bypass", "app", "echo", %{"text" => "bypass"}))
+      assert_receive {:tool_ran, "bypass"}, 2_000
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "the fake CLI asks for mcp__<server>__<tool> and calls it only after an allow" do
+      for {callback, ran?} <- [
+            {{__MODULE__, :allow, [me()]}, true},
+            {{__MODULE__, :deny, []}, false}
+          ] do
+        {:ok, pid} =
+          Session.start_link(
+            executable: TestHelpers.fake_control_cli_path(),
+            timeout: 15_000,
+            can_use_tool: callback,
+            sdk_mcp_servers: %{"app" => echo_server()},
+            env: %{"FAKE_CC_MODE" => "mcp_permission"}
+          )
+
+        Session.subscribe(pid)
+        :ok = Session.send_prompt(pid, "use the tool")
+        assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
+
+        if ran? do
+          assert_receive {:asked, _id, %{"tool_name" => "mcp__app__echo"}}
+          assert_receive {:tool_ran, "hi"}
+
+          assert %{"mcp_response" => %{"result" => %{"content" => [%{"text" => "hi"}]}}} =
+                   JSON.decode!(result["result"])
+        else
+          assert result["result"] == "denied: no"
+          refute_received {:tool_ran, _}
+        end
+
+        TestHelpers.stop_session(pid)
+      end
+    end
+  end
+
+  describe "pending-request cap (B-2)" do
+    @describetag :capture_log
+
+    test "past max_pending_control a request is answered at once and never kept" do
+      server = SdkMcp.tool_server("app", [%{name: "echo", call: {__MODULE__, :echo, [me()]}}])
+      ctl = start_supervised!({Mock, events: []})
+
+      {:ok, pid} =
+        start(ctl,
+          timeout: 10_000,
+          max_pending_control: 1,
+          can_use_tool: {__MODULE__, :defer, [me()]},
+          sdk_mcp_servers: %{"app" => server},
+          hooks: %{"PreToolUse" => [%{hooks: [{__MODULE__, :hook, [me()]}]}]}
+        )
+
+      push(ctl, can_use_tool_frame("k1"))
+      assert_receive {:asked, "k1", _}, 2_000
+
+      push(ctl, can_use_tool_frame("k2"))
+      push(ctl, mcp_frame("k3", "app", "echo", %{"text" => "over"}, 9))
+      push(ctl, hook_frame("k4"))
+      TestHelpers.wait_until(fn -> responses(ctl, "k4") != [] end)
+
+      assert [%{"behavior" => "deny", "message" => "too many pending control requests"}] =
+               answers(ctl, "k2")
+
+      assert [%{"mcp_response" => %{"id" => 9, "error" => %{"code" => -32_603}}}] =
+               answers(ctl, "k3")
+
+      assert [%{"subtype" => "error", "error" => "too many pending control requests"}] =
+               responses(ctl, "k4")
+
+      refute_received {:asked, "k2", _}
+      refute_received {:tool_ran, _}
+      refute_received {:hook, "k4", _}
+
+      assert {:ok, [%{request_id: "k1"}]} = Session.pending_requests(pid)
+      {:ok, %{control: %{pending: pending}}} = Store.get(:sys.get_state(pid).store_key)
+      assert [{"k1", _offset}] = Map.keys(pending)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a flood of 1,000 forged requests leaves at most 64 pending, logged once" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 10_000, can_use_tool: {__MODULE__, :defer, [me()]})
+      flood = Enum.map_join(1..1_000, &line(can_use_tool_frame("f#{&1}")))
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          Mock.push_events(ctl, [{:stdout_data, flood}])
+          TestHelpers.wait_until(fn -> length(Mock.writes(ctl)) >= 1 + 936 end)
+          :sys.get_state(pid)
+        end)
+
+      assert {:ok, pending} = Session.pending_requests(pid)
+      assert length(pending) == 64
+      assert map_size(:sys.get_state(pid).control.pending) == 64
+
+      denied = for id <- 65..1_000, do: answers(ctl, "f#{id}")
+      assert Enum.all?(denied, &match?([%{"behavior" => "deny"}], &1))
+      assert length(Regex.scan(~r/refusing more this turn/, log)) == 1
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+  end
+
+  describe "answers JSON cannot carry (W-1)" do
+    @describetag :capture_log
+
+    test "an unencodable permission decision becomes a deny and the session lives" do
+      for callback <- [:unencodable_input, :unencodable_perms] do
+        ctl = start_supervised!({Mock, events: []})
+        {:ok, pid} = start(ctl, timeout: 10_000, can_use_tool: {__MODULE__, callback, []})
+
+        push(ctl, can_use_tool_frame("u1"))
+        TestHelpers.wait_until(fn -> answers(ctl, "u1") != [] end)
+
+        assert [%{"behavior" => "deny", "message" => "unencodable decision"}] = answers(ctl, "u1")
+        assert Process.alive?(pid)
+        assert Mock.destroy_count(ctl) == 0
+
+        TestHelpers.stop_session(pid)
+      end
+    end
+
+    test "an unencodable hook output becomes an error response" do
+      ctl = start_supervised!({Mock, events: []})
+
+      {:ok, pid} =
+        start(ctl,
+          timeout: 10_000,
+          hooks: %{"PreToolUse" => [%{hooks: [{__MODULE__, :unencodable_hook, []}]}]}
+        )
+
+      push(ctl, hook_frame("u2"))
+      TestHelpers.wait_until(fn -> responses(ctl, "u2") != [] end)
+
+      assert [%{"subtype" => "error", "error" => "unencodable decision"}] = responses(ctl, "u2")
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "an SDK tool returning a tuple becomes a JSON-RPC error" do
+      server = SdkMcp.tool_server("app", [%{name: "tuple", call: {__MODULE__, :tuple_tool, []}}])
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 10_000, sdk_mcp_servers: %{"app" => server})
+
+      push(ctl, mcp_frame("u3", "app", "tuple", %{}))
+      TestHelpers.wait_until(fn -> answers(ctl, "u3") != [] end)
+
+      assert [%{"mcp_response" => %{"id" => 3, "error" => error}}] = answers(ctl, "u3")
+      assert error == %{"code" => -32_603, "message" => "tool returned an unencodable result"}
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "respond/3 with an unencodable decision is refused and leaves the request open" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 10_000, can_use_tool: {__MODULE__, :defer, [me()]})
+
+      push(ctl, can_use_tool_frame("u4"))
+      assert_receive {:asked, "u4", _}, 2_000
+
+      bad = {:allow, %{"pid" => self()}}
+      assert {:error, {:invalid_decision, ^bad}} = Session.respond(pid, "u4", bad)
+      assert answers(ctl, "u4") == []
+      assert {:ok, [%{request_id: "u4", status: :deferred}]} = Session.pending_requests(pid)
+
+      assert :ok = Session.respond(pid, "u4", {:allow, %{"command" => "ls"}})
+      assert [%{"behavior" => "allow"}] = answers(ctl, "u4")
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a host control request JSON cannot carry is refused, not a crash" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 10_000, can_use_tool: {__MODULE__, :defer, [me()]})
+
+      request = %{"subtype" => "set_model", "model" => {:not, :json}}
+      assert {:error, {:invalid_request, ^request}} = Session.control(pid, request)
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+  end
+
+  describe "callback lifetime (W-2, G6)" do
+    test "a callback blocked when its session is killed dies with it" do
+      Process.flag(:trap_exit, true)
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 60_000, can_use_tool: {__MODULE__, :block, [me()]})
+
+      push(ctl, can_use_tool_frame("w2"))
+      assert_receive {:asked, "w2", callback}, 2_000
+      ref = Process.monitor(callback)
+
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^callback, :killed}, 2_000
+    end
+
+    test "respond/3 racing a running callback: the first answer wins" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 60_000, can_use_tool: {__MODULE__, :block, [me()]})
+
+      # respond/3 first: the still-running callback is cancelled, so its
+      # answer can never land.
+      push(ctl, can_use_tool_frame("race1"))
+      assert_receive {:asked, "race1", callback}, 2_000
+      ref = Process.monitor(callback)
+      assert :ok = Session.respond(pid, "race1", {:deny, "a human said no"})
+      assert_receive {:DOWN, ^ref, :process, ^callback, _reason}, 2_000
+      assert [%{"behavior" => "deny", "message" => "a human said no"}] = answers(ctl, "race1")
+
+      # The callback first: the late respond/3 is a no-op.
+      push(ctl, can_use_tool_frame("race2"))
+      assert_receive {:asked, "race2", callback}, 2_000
+      send(callback, {:decide, {:allow, %{"command" => "ls"}}})
+      TestHelpers.wait_until(fn -> answers(ctl, "race2") != [] end)
+      assert :ok = Session.respond(pid, "race2", {:deny, "too late"})
+      assert [%{"behavior" => "allow"}] = answers(ctl, "race2")
+
+      TestHelpers.stop_session(pid)
+    end
+  end
+
+  defp push(ctl, frame), do: Mock.push_events(ctl, [{:stdout_data, line(frame)}])
+
+  defp echo_server,
+    do: SdkMcp.tool_server("app", [%{name: "echo", call: {__MODULE__, :echo, [me()]}}])
+
+  defp start_gated(ctl, opts \\ []) do
+    start(
+      ctl,
+      Keyword.merge(
+        [
+          timeout: 10_000,
+          can_use_tool: {__MODULE__, :allow, [me()]},
+          sdk_mcp_servers: %{"app" => echo_server()}
+        ],
+        opts
+      )
+    )
+  end
+
+  # The CLI asks about the SDK tool and the callback allows `input`.
+  defp allow_mcp(ctl, id, input) do
+    push(ctl, mcp_permission_frame(id, "app", "echo", input))
+    assert_receive {:asked, ^id, %{"tool_name" => "mcp__app__echo"}}, 2_000
+    TestHelpers.wait_until(fn -> answers(ctl, id) != [] end)
+  end
+
+  defp assert_refused(ctl, id) do
+    TestHelpers.wait_until(fn -> answers(ctl, id) != [] end)
+    assert [%{"mcp_response" => %{"error" => %{"code" => -32_001}}}] = answers(ctl, id)
+  end
+
+  # Every control_response for `id`, success or error.
+  defp responses(ctl, id) do
+    for %{"type" => "control_response", "response" => %{"request_id" => ^id} = r} <-
+          decoded_writes(ctl),
+        do: r
   end
 
   defp hook_mfa(%{"PreToolUse" => [%{hooks: [mfa]}]}), do: mfa

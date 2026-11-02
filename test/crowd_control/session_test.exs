@@ -923,6 +923,44 @@ defmodule CrowdControl.SessionTest do
 
       TestHelpers.stop_session(pid)
     end
+
+    test "a hook callback's output is the CLI's answer (W-18)" do
+      {:ok, pid} = start_hook_session({__MODULE__, :hook_ok, [me()]})
+
+      assert_receive {:hook_ran, _id, %{"hook_event_name" => "PreToolUse"}}, 5_000
+      assert hook_answer(pid) == %{"continue" => true, "suppressOutput" => true}
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a hook_callback naming no registered hook is an error answer (W-18)" do
+      {:ok, pid} =
+        start_hook_session({__MODULE__, :hook_ok, [me()]}, "hook_PostToolUse_0_0")
+
+      assert hook_answer(pid) == %{"error" => ~s(unknown hook callback: "hook_PostToolUse_0_0")}
+      refute_received {:hook_ran, _, _}
+
+      TestHelpers.stop_session(pid)
+    end
+
+    @tag :capture_log
+    test "a crashing hook is an error answer, and the session lives (W-18)" do
+      {:ok, pid} = start_hook_session({__MODULE__, :crash, []})
+
+      assert hook_answer(pid) == %{"error" => "callback crashed"}
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    @tag :capture_log
+    test "a hook returning anything else is an error answer (W-18)" do
+      {:ok, pid} = start_hook_session({__MODULE__, :hook_invalid, []})
+
+      assert hook_answer(pid) == %{"error" => "invalid callback decision"}
+
+      TestHelpers.stop_session(pid)
+    end
   end
 
   defp start_fake_session(extra_opts \\ []) do
@@ -942,6 +980,25 @@ defmodule CrowdControl.SessionTest do
         extra_opts
       )
     )
+  end
+
+  # fake_control_cli.exs in hook mode: a prompt makes it call `hook_id`, and
+  # the turn's result carries the answer it got, JSON-encoded.
+  defp start_hook_session(callback, hook_id \\ "hook_PreToolUse_0_0") do
+    {:ok, pid} =
+      start_control_session(
+        hooks: %{"PreToolUse" => [%{matcher: "Bash", hooks: [callback]}]},
+        env: %{"FAKE_CC_MODE" => "hook", "FAKE_CC_HOOK_ID" => hook_id}
+      )
+
+    Session.subscribe(pid)
+    :ok = Session.send_prompt(pid, "go")
+    {:ok, pid}
+  end
+
+  defp hook_answer(pid) do
+    assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
+    JSON.decode!(result["result"])
   end
 
   # The content of the first tool_result the CLI reported.
@@ -1000,4 +1057,11 @@ defmodule CrowdControl.SessionTest do
   end
 
   def crash(_request, _context), do: raise("callback bug")
+
+  def hook_ok(request, context, test) do
+    send(test, {:hook_ran, context.request_id, request["input"]})
+    {:ok, %{"continue" => true, "suppressOutput" => true}}
+  end
+
+  def hook_invalid(_request, _context), do: :maybe
 end

@@ -32,9 +32,13 @@ defmodule CrowdControl.Backend.Mock do
       `:eof`, or `{:sleep, ms}`
     * `:live` - handles returned by `list_live/1`
     * `:reattachable` - whether `reattachable?/0` reports true (default `true`)
-    * `:fail` - map of `callback_name => reason` to force `{:error, reason}`
+    * `:fail` - map of `callback_name => reason` to force `{:error, reason}`;
+      a reason of `{:raise, message}` raises `RuntimeError` instead, for a
+      backend that crashes rather than fails
     * `:max_write_bytes` - a frame limit: larger writes return
       `{:error, :frame_too_large}`, as `CrowdControl.Backend.Docker` does
+    * `:destroy_delay` - ms `destroy/1` blocks before returning, as a
+      Kubernetes destroy waiting out a Pod's termination grace does
   """
   @spec start_link(keyword()) :: {:ok, ctl()} | {:error, term()}
   def start_link(opts \\ []) do
@@ -45,6 +49,7 @@ defmodule CrowdControl.Backend.Mock do
         reattachable: Keyword.get(opts, :reattachable, true),
         fail: Keyword.get(opts, :fail, %{}),
         max_write_bytes: Keyword.get(opts, :max_write_bytes),
+        destroy_delay: Keyword.get(opts, :destroy_delay, 0),
         calls: [],
         writes: [],
         destroyed: []
@@ -156,6 +161,12 @@ defmodule CrowdControl.Backend.Mock do
   @impl true
   def destroy(%__MODULE__{ctl: ctl, id: id}) do
     record(ctl, :destroy)
+
+    case Agent.get(ctl, & &1.destroy_delay) do
+      0 -> :ok
+      ms -> Process.sleep(ms)
+    end
+
     Agent.update(ctl, &%{&1 | destroyed: [id | &1.destroyed]})
     :ok
   end
@@ -195,6 +206,7 @@ defmodule CrowdControl.Backend.Mock do
   defp check_fail(ctl, name) do
     case Agent.get(ctl, & &1.fail)[name] do
       nil -> :ok
+      {:raise, message} -> raise message
       reason -> {:error, reason}
     end
   end
