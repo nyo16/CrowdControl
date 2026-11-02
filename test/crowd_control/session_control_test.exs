@@ -581,4 +581,139 @@ defmodule CrowdControl.SessionControlTest do
       TestHelpers.stop_session(pid)
     end
   end
+
+  describe "what the store keeps" do
+    setup do
+      Process.flag(:trap_exit, true)
+      :ok
+    end
+
+    defp init_line do
+      line(%{"type" => "system", "subtype" => "init", "session_id" => "s"})
+    end
+
+    defp hook_frame(id) do
+      %{
+        "type" => "control_request",
+        "request_id" => id,
+        "request" => %{
+          "subtype" => "hook_callback",
+          "callback_id" => "hook_PreToolUse_0_0",
+          "input" => %{"hook_event_name" => "PreToolUse"}
+        }
+      }
+    end
+
+    test "no credential, service env or file content reaches the record (B-1)" do
+      ctl = start_supervised!({Mock, events: []})
+
+      {:ok, pid} =
+        Session.start_link(
+          executable: "claude",
+          timeout: 60_000,
+          backend:
+            {Mock,
+             mock: ctl,
+             api_key: "k-secret",
+             session_token: "ccst_x-secret",
+             services: [
+               %{
+                 name: "b",
+                 image: "browser:dev",
+                 env: %{"T" => "s-secret"},
+                 files: [%{path: "/etc/b.conf", content: "file-secret"}]
+               }
+             ],
+             provider: {CrowdControl.FakeProvider, api_key: "p-secret", region: "eu"}}
+        )
+
+      key = :sys.get_state(pid).store_key
+      Mock.push_events(ctl, [{:stdout_data, init_line()}])
+      TestHelpers.wait_until(fn -> match?({:ok, %{session_id: "s"}}, Store.get(key)) end)
+
+      {:ok, record} = Store.get(key)
+      stored = :erlang.term_to_binary(record)
+
+      for secret <- ~w(k-secret ccst_x-secret s-secret file-secret p-secret) do
+        assert :binary.match(stored, secret) == :nomatch, "#{secret} reached the store"
+      end
+
+      # Everything else survives: a reattach rebuilds the session from it.
+      assert {Mock, config} = record.opts[:backend]
+      assert config[:mock] == ctl
+      assert [%{name: "b", image: "browser:dev"} = service] = config[:services]
+      refute Map.has_key?(service, :env) or Map.has_key?(service, :files)
+      assert config[:provider] == {CrowdControl.FakeProvider, region: "eu"}
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "control opts given inside backend: survive reattach (W-3)" do
+      ctl = start_supervised!({Mock, events: []})
+
+      {:ok, pid} =
+        Session.start_link(
+          executable: "claude",
+          timeout: 60_000,
+          backend:
+            {Mock,
+             mock: ctl,
+             api_key: "k-secret",
+             hooks: %{"PreToolUse" => [%{hooks: [{__MODULE__, :hook, [me()]}]}]}}
+        )
+
+      key = :sys.get_state(pid).store_key
+      assert [_initialize] = requests(ctl, "initialize")
+      Mock.push_events(ctl, [{:stdout_data, init_line()}])
+      TestHelpers.wait_until(fn -> match?({:ok, %{session_id: "s"}}, Store.get(key)) end)
+
+      Process.exit(pid, :kill)
+      assert_receive {:EXIT, ^pid, :killed}
+      {:ok, record} = Store.get(key)
+      assert {__MODULE__, :hook, [_name]} = hook_mfa(record.opts[:hooks])
+
+      {:ok, pid} = Session.start_reattached(record)
+
+      # The reattached session still has hooks, so it re-sends `initialize`
+      # carrying them, and a hook_callback reaches the callback.
+      TestHelpers.wait_until(fn -> length(requests(ctl, "initialize")) == 2 end)
+      [_, reinit] = requests(ctl, "initialize")
+      assert reinit["request"]["hooks"]["PreToolUse"] != nil
+
+      Mock.push_events(ctl, [
+        {:stdout_data, init_reply([])},
+        {:stdout_data, line(hook_frame("h-after"))}
+      ])
+
+      assert_receive {:hook, "h-after", "hook_PreToolUse_0_0"}, 2_000
+      TestHelpers.wait_until(fn -> answers(ctl, "h-after") != [] end)
+      assert [%{"continue" => true}] = answers(ctl, "h-after")
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a fun, pid, reference or port in extra_args is refused before provisioning (W-13)" do
+      ctl = start_supervised!({Mock, events: []})
+      port = Port.open({:spawn, "true"}, [])
+
+      for bad <- [fn -> :ok end, self(), make_ref(), port] do
+        for opt <- [
+              can_use_tool: {__MODULE__, :defer, [%{nested: [{:x, bad}]}]},
+              on_control_request: {__MODULE__, :defer, [bad]},
+              hooks: %{"PreToolUse" => [%{hooks: [{__MODULE__, :hook, [[1, bad]]}]}]}
+            ] do
+          assert {:error, {%ArgumentError{message: message}, _stack}} = start(ctl, [opt])
+          assert message =~ "extra_args must be plain data"
+        end
+
+        assert_raise ArgumentError, ~r/extra_args must be plain data/, fn ->
+          SdkMcp.tool_server("app", [%{name: "t", call: {__MODULE__, :echo, [{bad}]}}])
+        end
+      end
+
+      assert Mock.calls(ctl) == []
+    end
+  end
+
+  defp hook_mfa(%{"PreToolUse" => [%{hooks: [mfa]}]}), do: mfa
 end

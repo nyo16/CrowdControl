@@ -161,23 +161,24 @@ defmodule CrowdControl.Session.Control do
         %{}
 
       servers when is_map(servers) ->
-        Enum.each(servers, fn
-          {name, %SdkMcp{tools: tools}} ->
-            Enum.each(tools, fn %{name: tool, call: {_m, _f, args}} ->
-              check_extra_args!(args, "sdk_mcp_servers #{inspect(name)} tool #{inspect(tool)} :call")
-            end)
-
-          {name, other} ->
-            raise ArgumentError,
-                  ":sdk_mcp_servers #{inspect(name)} must be a CrowdControl.SdkMcp.tool_server/2 " <>
-                    "spec, got: #{inspect(other)}"
-        end)
-
+        Enum.each(servers, &sdk_server!/1)
         servers
 
       other ->
         raise ArgumentError, ":sdk_mcp_servers must be a map, got: #{inspect(other)}"
     end
+  end
+
+  defp sdk_server!({name, %SdkMcp{tools: tools}}) do
+    Enum.each(tools, fn %{name: tool, call: {_m, _f, args}} ->
+      check_extra_args!(args, "sdk_mcp_servers #{inspect(name)} tool #{inspect(tool)} :call")
+    end)
+  end
+
+  defp sdk_server!({name, other}) do
+    raise ArgumentError,
+          ":sdk_mcp_servers #{inspect(name)} must be a CrowdControl.SdkMcp.tool_server/2 " <>
+            "spec, got: #{inspect(other)}"
   end
 
   defp permission_timeout!(opts) do
