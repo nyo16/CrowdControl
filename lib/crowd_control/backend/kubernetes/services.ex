@@ -300,6 +300,14 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     * port 53, or a selector reaching `kube-system`, is kube-dns, which no
       policy here opens by accident: it needs `allow_dns: true` in the
       target (`{:external_dns_not_declared, {name, 53 | "kube-system"}}`).
+
+  The kube-dns check is best-effort, not a proof that a target cannot reach
+  a resolver. It matches the namespace selector's *values* only — some
+  label whose value is `kube-system`, or, with no namespace selector, a
+  session namespace of `kube-system` — so a selector reaching that
+  namespace by another label, and an `ip_block` covering the DNS Pods, go
+  undetected. Port 53 is the only DNS port it knows: a resolver on another
+  port (OpenShift's 5353) is not detected.
   """
   @spec check_external(Service.t(), String.t() | nil) :: :ok | {:error, {:k8s, term()}}
   def check_external(
