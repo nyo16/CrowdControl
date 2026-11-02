@@ -352,6 +352,114 @@ defmodule CrowdControl.Backend.DockerUnitTest do
     end
   end
 
+  describe "API.server_version/1 (blocker: a gate that cannot see the daemon's version)" do
+    alias CrowdControl.Backend.Docker.API
+
+    test "parses real-world version strings" do
+      assert API.parse_version(%{"Version" => "26.1.4"}) == {:ok, {26, 1, 4}}
+      assert API.parse_version(%{"Version" => "25.0.5-ce"}) == {:ok, {25, 0, 5}}
+      assert API.parse_version(%{"Version" => "28.0.0-rc.1"}) == {:ok, {28, 0, 0}}
+      assert API.parse_version(%{"Version" => "27.1"}) == {:ok, {27, 1, 0}}
+
+      assert {:error, {:docker, {:unparseable_version, "dev"}}} =
+               API.parse_version(%{"Version" => "dev"})
+
+      assert {:error, {:docker, {:unparseable_version, nil}}} = API.parse_version(%{})
+    end
+
+    test "asks GET /version once per docker_host, then answers from the cache" do
+      test_pid = self()
+
+      adapter = fn req ->
+        send(test_pid, {:path, req.url.path})
+        {req, Req.Response.new(status: 200, body: %{"Version" => "26.0.0"})}
+      end
+
+      config = [docker_host: unique_host(), req_adapter: adapter]
+
+      assert API.server_version(config) == {:ok, {26, 0, 0}}
+      assert_received {:path, "/version"}
+
+      assert API.server_version(config) == {:ok, {26, 0, 0}}
+      refute_received {:path, _}
+    end
+
+    test "a failed lookup is not cached" do
+      failing = fn req -> {req, Req.Response.new(status: 500, body: %{"message" => "boom"})} end
+      host = unique_host()
+
+      assert {:error, {:docker, {:http_status, 500, "boom"}}} =
+               API.server_version(docker_host: host, req_adapter: failing)
+
+      working = fn req -> {req, Req.Response.new(status: 200, body: %{"Version" => "27.0.1"})} end
+      assert API.server_version(docker_host: host, req_adapter: working) == {:ok, {27, 0, 1}}
+    end
+  end
+
+  describe "HostConfig per-service overrides (blocker: a weakening nobody wrote down)" do
+    alias CrowdControl.Backend.Docker.HostConfig
+
+    test "ShmSize and Init are rendered from config and from an override" do
+      assert %{"ShmSize" => 1024, "Init" => true} =
+               HostConfig.build([shm_size: 1024, init: true], network_mode: "none")
+
+      host = HostConfig.build([], network_mode: "none", overrides: %{shm_size: 2048, init: true})
+      assert host["ShmSize"] == 2048
+      assert host["Init"] == true
+    end
+
+    test "no override leaves the hardened defaults byte-identical" do
+      assert HostConfig.build([], network_mode: "none", overrides: %{}) ==
+               HostConfig.build([], network_mode: "none")
+    end
+
+    test "resource overrides replace the stack's values" do
+      host =
+        HostConfig.build([pids_limit: 64, memory: 10],
+          network_mode: "none",
+          overrides: %{pids_limit: 1024, memory: 2048, cpus: 0.5}
+        )
+
+      assert host["PidsLimit"] == 1024
+      assert host["Memory"] == 2048
+      assert host["NanoCpus"] == 500_000_000
+    end
+
+    test "a tmpfs override merges over the read-only defaults" do
+      host =
+        HostConfig.build([readonly_rootfs: true],
+          network_mode: "none",
+          overrides: %{tmpfs: %{"/tmp" => "rw,size=512m"}}
+        )
+
+      assert host["Tmpfs"]["/tmp"] == "rw,size=512m"
+      assert host["Tmpfs"]["/var/log"] == HostConfig.default_tmpfs()["/var/log"]
+    end
+
+    test "weakening overrides render exactly what they say" do
+      host =
+        HostConfig.build([readonly_rootfs: true],
+          network_mode: "none",
+          overrides: %{cap_add: ["SYS_ADMIN"], no_new_privileges: false, readonly_rootfs: false}
+        )
+
+      assert host["CapAdd"] == ["SYS_ADMIN"]
+      assert host["CapDrop"] == ["ALL"]
+      assert host["SecurityOpt"] == []
+      refute Map.has_key?(host, "ReadonlyRootfs")
+      refute Map.has_key?(host, "Tmpfs")
+    end
+
+    test "a hardening override can tighten a lax stack" do
+      host = HostConfig.build([], network_mode: "none", overrides: %{readonly_rootfs: true})
+
+      assert host["ReadonlyRootfs"] == true
+      assert host["Tmpfs"] == HostConfig.default_tmpfs()
+    end
+  end
+
+  defp unique_host, do: "tcp://docker-#{System.unique_integer([:positive])}.test:2375"
+
   defp relay_loop(test_pid) do
     receive do
       {:"$gen_cast", msg} ->

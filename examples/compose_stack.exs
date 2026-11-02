@@ -67,8 +67,8 @@ provider = [
   },
   proxy_service: "proxy",
   health_timeout: 60_000,
-  # Hardening applies to every container in the stack; there are deliberately
-  # no per-service overrides.
+  # Hardening is the default for every container in the stack; a service can
+  # override it per key with `host_config:`, and weakening needs `weaken:`.
   cpus: 2.0,
   memory: 2 * 1024 * 1024 * 1024,
   ready_timeout: 60_000
