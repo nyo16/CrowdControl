@@ -61,7 +61,9 @@ defmodule CrowdControl.Provider.Compose do
     * `:forwarder_service` — the name the forwarder is given, default
       `"forwarder"`. Always synthesised; see `:forwarder_image`.
     * `:forwarder_image` — default `"alpine/socat:1.8.1.3"`. Any image with
-      `socat` on `PATH` works; the provider sets `Entrypoint` itself.
+      `socat` on `PATH` works; the provider sets `Entrypoint` itself, and runs
+      it as `nobody` (`User: "65534:65534"`), so that `socat` must be
+      executable by uid 65534.
     * `:network` — `[internal: true, driver: "bridge", options: %{}]`. See the
       warning below.
     * `:networks` — extra **internal** networks, `[%{name: "brw"}]`. Created
@@ -81,7 +83,9 @@ defmodule CrowdControl.Provider.Compose do
 
   Agent, exactly as `CrowdControl.Provider.Docker` takes them: `:image`,
   `:agent_port`, `:capture_path`, `:ready_timeout`, `:req_adapter`,
-  `:docker_host`, `:timeout`.
+  `:docker_host`, `:timeout`. `:agent_port` must be at least 1024: the
+  forwarder listens on it as `nobody`, which cannot bind a privileged port, so
+  a lower one is `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`.
 
   Hardening (`:cpus`, `:memory`, `:cap_drop`, `:security_opt`, `:pids_limit`,
   `:user`, `:readonly_rootfs`, `:tmpfs`, `:shm_size`, `:init`) comes from
@@ -95,8 +99,10 @@ defmodule CrowdControl.Provider.Compose do
   need no declaration — a browser needs a large `/dev/shm` and an init, and
   neither weakens anything. A key that *weakens* the hardened default —
   `:cap_add`, `no_new_privileges: false`, `readonly_rootfs: false`, a root
-  `user:`, a `host_path` mount on a sidecar (`:host_path`), or a `tmpfs`
-  without `noexec,nosuid` (`:tmpfs_exec`) — must also be named in the
+  `user:` (or, on a sidecar with no `user:`, an image whose default user is
+  root — see "Posture is never inferred"), a `host_path` mount on a sidecar
+  (`:host_path`), or a `tmpfs` without `noexec,nosuid` (`:tmpfs_exec`) — must
+  also be named in the
   service's `weaken: [...]` list (see `CrowdControl.Service`), or
   `acquire/1` refuses with
   `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`. `privileged`
@@ -207,6 +213,19 @@ defmodule CrowdControl.Provider.Compose do
       bridge and full internet. It is the one option here that throws away the
       module's reason to exist, so it exists only as an explicit, typed-out
       act.
+    * A sidecar with no `user:` runs as its image's default user, so that
+      default is part of its posture. `acquire/1` reads it
+      (`GET /images/{image}/json`, read-only, after every other option check
+      and before anything is created), and a root default — `""` (no `USER`),
+      `root`, or uid 0, as `CrowdControl.Service.root_user?/1` reads it — is
+      refused with `{:error, {:compose, {:weakening_not_declared, {name,
+      :user}}}}` unless the service sets a non-root `user:` or names `:user`
+      in `weaken:`, exactly as Kubernetes refuses it through `runAsNonRoot`.
+      The providers never pull, so an image the daemon does not have is
+      `{:error, {:compose, {:image_not_found, {name, image}}}}` here rather
+      than a create failure after the networks exist. The sandbox is exempt,
+      as on Kubernetes, where its `runAsNonRoot` is opt-in (`:run_as_user`);
+      the forwarder always runs as `nobody`.
 
   ## Egress proxy
 
@@ -287,6 +306,10 @@ defmodule CrowdControl.Provider.Compose do
   @default_forwarder_service "forwarder"
   @default_proxy_port 8080
 
+  # `nobody`: the forwarder holds nothing and needs no privilege. That is also
+  # why `:agent_port` must be unprivileged — see `validate_agent_port/1`.
+  @forwarder_user "65534:65534"
+
   # Pinned, and only the *command* is load-bearing: any image with socat on
   # PATH works, which is what :forwarder_image is for on an air-gapped
   # registry.
@@ -364,8 +387,8 @@ defmodule CrowdControl.Provider.Compose do
     # Every gate runs before a single byte reaches the daemon, k8s-style. A
     # stack is N resources, and discovering an invalid service spec after four
     # of them exist means rolling back four resources to report a typo. The
-    # version gate is last: it is the one gate that may make a request, and it
-    # only does when a gated feature is in use.
+    # image-user and version gates come last: they are the only gates that make
+    # requests, and both are read-only.
     with :ok <- ensure_req!(),
          :ok <- validate_session_token(opts),
          {:ok, session_key} <- fetch_session_key(opts),
@@ -373,6 +396,7 @@ defmodule CrowdControl.Provider.Compose do
          {:ok, network} <- fetch_network(opts),
          {:ok, volumes} <- fetch_volumes(opts, project),
          {:ok, networks} <- fetch_networks(opts, project),
+         :ok <- validate_agent_port(opts),
          {:ok, services} <- build_services(opts),
          :ok <- validate_mounts(services, volumes),
          :ok <- validate_memberships(opts, services, networks),
@@ -381,6 +405,7 @@ defmodule CrowdControl.Provider.Compose do
          :ok <- validate_ready(opts, services),
          :ok <- validate_proxy(opts, services),
          {:ok, ordered} <- order_services(services),
+         :ok <- validate_image_users(opts, services),
          :ok <- ensure_versions(opts, services, networks) do
       warn_placement(services)
 
@@ -1456,10 +1481,24 @@ defmodule CrowdControl.Provider.Compose do
       name: forwarder,
       image: opts[:forwarder_image] || @default_forwarder_image,
       role: :forwarder,
+      user: @forwarder_user,
       entrypoint: ["socat"],
       command: ["TCP-LISTEN:#{port},fork,reuseaddr", "TCP:#{sandbox}:#{port}"],
       depends_on: [sandbox]
     }
+  end
+
+  # The forwarder listens on `:agent_port` as `nobody`, and a non-root process
+  # cannot bind below 1024. Refused here rather than discovered as a forwarder
+  # that never comes up.
+  defp validate_agent_port(opts) do
+    case opts[:agent_port] || @default_agent_port do
+      port when is_integer(port) and port in 1024..65_535 ->
+        :ok
+
+      port ->
+        {:error, {:compose, {:bad_agent_port, {forwarder_name(opts), port}}}}
+    end
   end
 
   # --- cross-service validation ---
@@ -1726,6 +1765,35 @@ defmodule CrowdControl.Provider.Compose do
           # request were at fault.
           _ -> {:error, {:compose, {:proxy_needs_egress, name}}}
         end
+    end
+  end
+
+  # A sidecar with no `user:` runs as its image's default user, so on Compose
+  # (unlike Kubernetes, where `runAsNonRoot` makes the kubelet check) that
+  # default is read here and held to the same `weaken: [:user]` rule as an
+  # explicit root `user:`. The sandbox is exempt, as on Kubernetes; the
+  # forwarder has an explicit user. Sequential: a stack has a handful of
+  # services, and each inspect is one local round trip.
+  defp validate_image_users(opts, services) do
+    services
+    |> Enum.filter(&(&1.role == :sidecar and &1.user == nil and :user not in &1.weaken))
+    |> each_ok(&validate_image_user(opts, &1))
+  end
+
+  defp validate_image_user(opts, %Service{name: name, image: image}) do
+    case API.image_user(opts, image) do
+      {:ok, user} ->
+        if user == "" or Service.root_user?(user),
+          do: {:error, {:compose, {:weakening_not_declared, {name, :user}}}},
+          else: :ok
+
+      # The providers never pull, so the create would fail the same way —
+      # after the networks and volumes already exist.
+      {:error, {:docker, {:not_found, _}}} ->
+        {:error, {:compose, {:image_not_found, {name, image}}}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
