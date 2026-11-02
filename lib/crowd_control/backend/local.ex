@@ -16,6 +16,19 @@ defmodule CrowdControl.Backend.Local do
   env injection and no local `ps` to hide from, so **only this backend uses the
   env-file mechanism**.
 
+  ## A release's environment is not inherited
+
+  NetRunner has no `:env` option, so the CLI inherits the BEAM's full OS
+  environment. Inside a `mix release` that includes `RELEASE_COOKIE` (the
+  distribution cookie), the other `RELEASE_*` boot variables, `BINDIR`,
+  `ROOTDIR`, `EMU`, `PROGNAME`, and a `PATH` led by the release's `bin` and
+  `erts-*/bin`. The wrapper shell therefore always runs (even with an empty
+  env), and first `unset`s those names and exports a `PATH` without the
+  release entries (see `CrowdControl.Backend.Shell.release_scrub/1`); only
+  then does it source the env file, so an explicit `:env` value can still set
+  a scrubbed name. Pass `release_env: :inherit` to opt out and hand the CLI
+  the release's environment unchanged.
+
   ## No reattach
 
   A local subprocess dies with the VM that spawned it, so there is nothing to
@@ -50,11 +63,17 @@ defmodule CrowdControl.Backend.Local do
   def reattachable?, do: false
 
   @impl true
-  def provision(opts), do: {:ok, %__MODULE__{opts: opts}}
+  def provision(opts) do
+    case Keyword.get(opts, :release_env, :scrub) do
+      mode when mode in [:scrub, :inherit] -> {:ok, %__MODULE__{opts: opts}}
+      other -> {:error, {:invalid_option, {:release_env, other}}}
+    end
+  end
 
   @impl true
   def exec(%__MODULE__{} = handle, executable, args, env) do
-    {cmd, cmd_args, env_dir, env_file} = wrap_with_env(executable, args, env)
+    scrub = release_scrub(handle.opts)
+    {cmd, cmd_args, env_dir, env_file} = wrap_with_env(executable, args, env, scrub)
 
     # NetRunner.Process.start_link/2 links to the CALLING process, so this must
     # be invoked from inside Session.init/1 for the link to land on the session.
@@ -119,19 +138,48 @@ defmodule CrowdControl.Backend.Local do
     end
   end
 
-  defp wrap_with_env(executable, args, env) when map_size(env) == 0 do
+  defp release_scrub(opts) do
+    case Keyword.get(opts, :release_env, :scrub) do
+      :inherit -> {[], nil}
+      :scrub -> Shell.release_scrub(System.get_env())
+    end
+  end
+
+  # Nothing to export and nothing to scrub means there is nothing for a wrapper
+  # to do, so the CLI is spawned directly. Under a running BEAM that only
+  # happens with `release_env: :inherit`: `erl` itself exports BINDIR, ROOTDIR,
+  # EMU and PROGNAME.
+  defp wrap_with_env(executable, args, env, {[], nil}) when map_size(env) == 0 do
     {executable, args, nil, nil}
   end
 
-  defp wrap_with_env(executable, args, env) do
+  # The scrub runs first so that an explicit `:env` entry can still set a
+  # scrubbed name (PATH included). It is inline rather than in the env file
+  # because it carries no secret: variable *names* and the PATH. The env file
+  # stays reserved for `:env` values and is only created when there are some.
+  defp wrap_with_env(executable, args, env, scrub) do
     {env_dir, env_file} = write_env_file(env)
     escaped_args = Enum.map_join([executable | args], " ", &Shell.escape/1)
 
-    shell_cmd =
-      ". #{Shell.escape(env_file)} && rm -f #{Shell.escape(env_file)} && exec #{escaped_args}"
+    shell_cmd = scrub_prefix(scrub) <> source_prefix(env_file) <> "exec #{escaped_args}"
 
     {"/bin/sh", ["-c", shell_cmd], env_dir, env_file}
   end
+
+  # `Shell.release_scrub/1` only returns names that are valid shell
+  # identifiers, so they are safe to interpolate unquoted.
+  defp scrub_prefix({unset, path}) do
+    unset_cmd = if unset == [], do: "", else: "unset #{Enum.join(unset, " ")}; "
+    path_cmd = if path, do: "PATH=#{Shell.escape(path)}; export PATH; ", else: ""
+    unset_cmd <> path_cmd
+  end
+
+  defp source_prefix(nil), do: ""
+
+  defp source_prefix(env_file),
+    do: ". #{Shell.escape(env_file)} && rm -f #{Shell.escape(env_file)} && "
+
+  defp write_env_file(env) when map_size(env) == 0, do: {nil, nil}
 
   # sobelow_skip ["Traversal.FileModule"]
   defp write_env_file(env) do

@@ -70,12 +70,104 @@ defmodule Sandboxd.ExecTest do
       assert env_dirs() == []
     end
 
-    test "an empty env skips the wrapper shell entirely" do
+    test "an empty env creates no env file" do
       :ok = Exec.exec("/bin/echo", ["direct"], %{})
       await_final()
 
       assert captured() == "direct\n"
       assert env_dirs() == []
+    end
+  end
+
+  describe "release env scrub (blocker: sandboxd's distribution cookie inherited by the CLI)" do
+    @release_root "/opt/cc_fake_release"
+    @release_path "#{@release_root}/erts-15.2/bin:#{@release_root}/bin"
+
+    setup do
+      original_path = System.get_env("PATH")
+      cookie = "cookie-#{System.unique_integer([:positive])}"
+
+      System.put_env(%{
+        "RELEASE_COOKIE" => cookie,
+        "RELEASE_ROOT" => @release_root,
+        "BINDIR" => "#{@release_root}/erts-15.2/bin",
+        "PATH" => "#{@release_path}:#{original_path}"
+      })
+
+      on_exit(fn ->
+        Enum.each(~w(RELEASE_COOKIE RELEASE_ROOT BINDIR), &System.delete_env/1)
+        System.put_env("PATH", original_path)
+      end)
+
+      %{cookie: cookie, original_path: original_path}
+    end
+
+    test "the CLI sees no release vars and no release PATH; explicit env survives", ctx do
+      :ok = Exec.exec("/usr/bin/env", [], %{"RELEASE_NODE" => "x"})
+      await_final()
+      output = captured()
+
+      refute output =~ ctx.cookie
+      refute output =~ ~r/^RELEASE_COOKIE=/m
+      refute output =~ ~r/^RELEASE_ROOT=/m
+      refute output =~ ~r/^BINDIR=/m
+      assert output =~ ~r/^RELEASE_NODE=x$/m
+
+      [path] = Regex.run(~r/^PATH=(.*)$/m, output, capture: :all_but_first)
+      assert path == ctx.original_path
+    end
+
+    test "the scrub applies with an empty env too, still without an env file", ctx do
+      :ok = Exec.exec("/usr/bin/env", [], %{})
+      await_final()
+      output = captured()
+
+      refute output =~ ctx.cookie
+      refute output =~ @release_root
+      assert env_dirs() == []
+    end
+  end
+
+  # The same cases as CrowdControl.Backend.Shell.release_scrub/1's in the parent
+  # app; the two copies must agree.
+  describe "release_scrub/1" do
+    test "enumerates RELEASE_* names, skips names sh cannot unset, leaves PATH alone without RELEASE_ROOT" do
+      env = %{
+        "RELEASE_COOKIE" => "c",
+        "RELEASE_NODE" => "n",
+        "RELEASE_bad-name" => "x",
+        "EMU" => "beam",
+        "PROGNAME" => "erl",
+        "ROOTDIR" => "/r",
+        "NOT_RELEASE_X" => "kept",
+        "PATH" => "/r/bin:/usr/bin"
+      }
+
+      assert {unset, nil} = Exec.release_scrub(env)
+      assert unset == ~w(EMU PROGNAME RELEASE_COOKIE RELEASE_NODE ROOTDIR)
+    end
+
+    test "strips only RELEASE_ROOT's bin and erts-*/bin from PATH" do
+      env = %{
+        "RELEASE_ROOT" => "/app/",
+        "PATH" => "/app/erts-15.2/bin:/app/bin/:/app/lib/x/bin:/app-other/bin:/usr/bin"
+      }
+
+      assert {["RELEASE_ROOT"], "/app/lib/x/bin:/app-other/bin:/usr/bin"} =
+               Exec.release_scrub(env)
+    end
+
+    test "matches the parent app's doctest" do
+      env = %{
+        "RELEASE_ROOT" => "/app",
+        "RELEASE_COOKIE" => "secret",
+        "BINDIR" => "/app/erts-15.0/bin",
+        "PATH" => "/app/erts-15.0/bin:/app/bin:/usr/bin:/bin",
+        "HOME" => "/root"
+      }
+
+      assert Exec.release_scrub(env) ==
+               {["BINDIR", "RELEASE_COOKIE", "RELEASE_ROOT"], "/usr/bin:/bin"}
     end
   end
 

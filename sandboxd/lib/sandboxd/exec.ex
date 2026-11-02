@@ -26,12 +26,23 @@ defmodule Sandboxd.Exec do
 
   The wrapper passes the executable and its arguments through `"$@"`:
 
-      /bin/sh -c '. "$0"; rm -f "$0"; exec "$@"' <env-file> <executable> <args...>
+      /bin/sh -c '<scrub> . "$0"; rm -f "$0"; exec "$@"' <env-file> <executable> <args...>
 
-  so nothing but the env values ever needs shell quoting, and those are quoted
-  where they are written. `CrowdControl.Backend.Local` interpolates escaped
-  argv into the command string instead; that predates this module and has the
-  same security property, but this shape has strictly less to get wrong.
+  so nothing but the env values and the scrubbed `PATH` ever needs shell
+  quoting, and those are quoted where they are written. `CrowdControl.Backend.Local`
+  interpolates escaped argv into the command string instead; that predates
+  this module and has the same security property, but this shape has strictly
+  less to get wrong.
+
+  ## The release's own environment is scrubbed
+
+  sandboxd is itself a release, so the BEAM's env carries `RELEASE_COOKIE` and
+  the other `RELEASE_*` boot variables, `BINDIR`, `ROOTDIR`, `EMU`, `PROGNAME`
+  and a `PATH` led by the release's `bin` and `erts-*/bin`. `<scrub>` above
+  `unset`s those names and exports a `PATH` without the release entries
+  (`release_scrub/1`) before the env file is sourced, so an explicit env value
+  can still set a scrubbed name. With an empty env the wrapper still runs and
+  no env file is created; `$0` is then a placeholder.
 
   Env values are never logged. Neither is the env file's content.
   """
@@ -101,7 +112,8 @@ defmodule Sandboxd.Exec do
 
   @impl true
   def handle_call({:exec, executable, args, env}, _from, state) do
-    {cmd, cmd_args, env_dir} = wrap_with_env(executable, args, env)
+    scrub = release_scrub(System.get_env())
+    {cmd, cmd_args, env_dir} = wrap_with_env(executable, args, env, scrub)
 
     case NetRunner.Process.start_link(cmd, cmd_args) do
       {:ok, proc} ->
@@ -227,16 +239,75 @@ defmodule Sandboxd.Exec do
     %{state | proc: nil, env_dir: nil, exit_status: state.exit_status || status}
   end
 
-  defp wrap_with_env(executable, args, env) when map_size(env) == 0 do
+  # The fixed names a release's boot script exports besides `RELEASE_*`.
+  @release_boot_vars ~w(BINDIR ROOTDIR EMU PROGNAME)
+
+  # keep in sync with CrowdControl.Backend.Shell.release_scrub/1 in the parent
+  # app (lib/crowd_control/backend/shell.ex). Duplicated rather than shared for
+  # the same reason as single_quote/1: this release cannot depend on it. Both
+  # copies are pinned by the same cases in their own test suites.
+  @doc false
+  @spec release_scrub(%{optional(String.t()) => String.t()}) ::
+          {[String.t()], String.t() | nil}
+  def release_scrub(env) when is_map(env) do
+    unset =
+      env
+      |> Map.keys()
+      |> Enum.filter(&(release_var?(&1) and shell_name?(&1)))
+      |> Enum.sort()
+
+    {unset, release_free_path(env)}
+  end
+
+  defp release_var?(name),
+    do: String.starts_with?(name, "RELEASE_") or name in @release_boot_vars
+
+  defp shell_name?(name), do: name =~ ~r/\A[A-Za-z_][A-Za-z0-9_]*\z/
+
+  defp release_free_path(%{"RELEASE_ROOT" => root, "PATH" => path})
+       when root not in ["", "/"] do
+    prefix = String.trim_trailing(root, "/") <> "/"
+
+    path
+    |> String.split(":")
+    |> Enum.reject(&release_bin?(&1, prefix))
+    |> Enum.join(":")
+  end
+
+  defp release_free_path(_env), do: nil
+
+  defp release_bin?(entry, prefix) do
+    entry = String.trim_trailing(entry, "/")
+
+    String.starts_with?(entry, prefix) and
+      String.replace_prefix(entry, prefix, "") =~ ~r{\A(bin|erts-[^/]+/bin)\z}
+  end
+
+  defp wrap_with_env(executable, args, env, {[], nil}) when map_size(env) == 0 do
     {executable, args, nil}
   end
 
-  defp wrap_with_env(executable, args, env) do
+  defp wrap_with_env(executable, args, env, scrub) when map_size(env) == 0 do
+    # No env file: $0 is a placeholder and only the scrub runs.
+    {"/bin/sh", ["-c", scrub_prefix(scrub) <> ~s|exec "$@"|, "sandboxd-exec", executable | args],
+     nil}
+  end
+
+  defp wrap_with_env(executable, args, env, scrub) do
     {dir, file} = write_env_file(env)
 
     # $0 is the env file; $@ is the executable and its arguments, so neither
     # needs quoting here and neither can be reinterpreted by the shell.
-    {"/bin/sh", ["-c", ~s|. "$0"; rm -f "$0"; exec "$@"|, file, executable | args], dir}
+    script = scrub_prefix(scrub) <> ~s|. "$0"; rm -f "$0"; exec "$@"|
+    {"/bin/sh", ["-c", script, file, executable | args], dir}
+  end
+
+  # `release_scrub/1` only returns names that are valid shell identifiers, so
+  # they are safe unquoted; the PATH is single-quoted.
+  defp scrub_prefix({unset, path}) do
+    unset_cmd = if unset == [], do: "", else: "unset #{Enum.join(unset, " ")}; "
+    path_cmd = if path, do: "PATH=#{single_quote(path)}; export PATH; ", else: ""
+    unset_cmd <> path_cmd
   end
 
   # sobelow_skip ["Traversal.FileModule"]
