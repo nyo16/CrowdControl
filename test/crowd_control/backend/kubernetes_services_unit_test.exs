@@ -288,7 +288,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     end
 
     test "an :allow service may not share sbx with the sandbox (invariant 1)" do
-      assert {:error, {:k8s, {:sandbox_shares_network_with_egress, "sbx", "proxy"}}} =
+      assert {:error, {:k8s, {:sandbox_shares_network_with_egress, {"proxy", "sbx"}}}} =
                normalize([Map.delete(@proxy, :networks)])
     end
 

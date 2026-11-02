@@ -46,7 +46,7 @@
 - **Compose per-service networks and overrides.** `:networks` declares extra
   internal networks a service joins through `networks:`; once in use, the
   sandbox may share no network with an `egress: :allow` service other than
-  `:proxy_service` (`{:compose, {:sandbox_shares_network_with_egress, net, svc}}`).
+  `:proxy_service` (`{:compose, {:sandbox_shares_network_with_egress, {svc, net}}}`).
   `host_config:` overrides the stack's hardening per service: resource keys
   freely, weakening keys only when named in `weaken:`, `privileged` never.
 - **`:files` on a service** — config files staged with

@@ -544,7 +544,7 @@ defmodule CrowdControl.Backend.Kubernetes do
 
     case Task.yield(task, remaining + 5_000) || Task.shutdown(task, :brutal_kill) do
       {:ok, _} -> classify_service(service.name, API.get_pod(handle.config, name))
-      _ -> {:error, {:k8s, {:service_not_ready, service.name, :timeout}}}
+      _ -> {:error, {:k8s, {:service_not_ready, {service.name, :timeout}}}}
     end
   end
 
@@ -573,7 +573,7 @@ defmodule CrowdControl.Backend.Kubernetes do
       "Kubernetes provision: service #{name} never became ready (#{inspect(reason)})"
     )
 
-    {:error, {:k8s, {:service_not_ready, name, reason}}}
+    {:error, {:k8s, {:service_not_ready, {name, reason}}}}
   end
 
   defp pod_ready?(pod) do

@@ -45,7 +45,7 @@ defmodule CrowdControl.Service do
     * HostConfig keys that *weaken* the hardened defaults — `:cap_add`,
       `no_new_privileges: false`, `readonly_rootfs: false`, and a root `:user` —
       must each be named in `:weaken`, or the spec is refused with
-      `{:weakening_not_declared, name, key}`. Resource keys (`:shm_size`,
+      `{:weakening_not_declared, {name, key}}`. Resource keys (`:shm_size`,
       `:init`, `:pids_limit`, `:memory`, `:cpus`, `:tmpfs`) need no declaration.
     * `privileged` is refused outright, declared or not.
 
@@ -253,6 +253,26 @@ defmodule CrowdControl.Service do
   @spec weakening_keys() :: [atom()]
   def weakening_keys, do: @weakening_keys
 
+  @doc """
+  Whether a validated `user:` runs as root: a uid that is numerically 0
+  (`"0"`, `"00"`, `"000:1000"`) or the name `"root"`, either with any group.
+
+      iex> CrowdControl.Service.root_user?("000:1000")
+      true
+
+      iex> CrowdControl.Service.root_user?("1000")
+      false
+  """
+  @spec root_user?(String.t() | nil) :: boolean()
+  def root_user?(nil), do: false
+
+  def root_user?(user) when is_binary(user) do
+    case user |> String.split(":") |> hd() do
+      "root" -> true
+      uid -> String.match?(uid, ~r/\A\d+\z/) and String.to_integer(uid) == 0
+    end
+  end
+
   @doc "The total `:files` content budget, in bytes."
   @spec max_files_bytes() :: pos_integer()
   def max_files_bytes, do: @max_files_bytes
@@ -348,11 +368,21 @@ defmodule CrowdControl.Service do
     end
   end
 
+  # A uid or a name, optionally `:gid` or `:group`. Strict, so `root_user?/1`
+  # can't be dodged by a spelling the runtime still reads as uid 0 ("+0",
+  # " 0"). `\A…\z`, not `^…$`: `$` would let a trailing newline through.
   defp fetch_user(spec, name) do
     case Map.get(spec, :user) do
-      nil -> {:ok, nil}
-      user when is_binary(user) and user != "" -> {:ok, user}
-      _ -> bad(name, :user)
+      nil ->
+        {:ok, nil}
+
+      user when is_binary(user) ->
+        if Regex.match?(~r/\A(\d+|[a-z_][a-z0-9_-]*)(:(\d+|[a-z_][a-z0-9_-]*))?\z/, user),
+          do: {:ok, user},
+          else: bad(name, :user)
+
+      _ ->
+        bad(name, :user)
     end
   end
 
@@ -454,7 +484,7 @@ defmodule CrowdControl.Service do
   defp check_weakenings(name, host_config, user, weaken) do
     case Enum.find(weakenings(host_config, user), &(&1 not in weaken)) do
       nil -> :ok
-      key -> {:error, {:weakening_not_declared, name, key}}
+      key -> {:error, {:weakening_not_declared, {name, key}}}
     end
   end
 
@@ -464,14 +494,11 @@ defmodule CrowdControl.Service do
       {:cap_add, Map.get(host_config, :cap_add, []) != []},
       {:no_new_privileges, Map.get(host_config, :no_new_privileges) == false},
       {:readonly_rootfs, Map.get(host_config, :readonly_rootfs) == false},
-      {:user, root?(user)}
+      {:user, root_user?(user)}
     ]
     |> Enum.filter(&elem(&1, 1))
     |> Enum.map(&elem(&1, 0))
   end
-
-  defp root?(nil), do: false
-  defp root?(user), do: hd(String.split(user, ":")) in ["0", "root"]
 
   # Membership names are validated against the stack's declarations by the
   # substrate; here only the shape: a non-empty list of unique DNS-safe names.

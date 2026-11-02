@@ -737,7 +737,7 @@ A proxy setting only constrains clients that choose to use it:
 So egress MUST be impossible without the proxy: on Compose the browser has
 `egress: :none` and only internal networks, and the sandbox may share no network
 with an `egress: :allow` service
-(`{:error, {:compose, {:sandbox_shares_network_with_egress, network, service}}}`);
+(`{:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}`);
 on Kubernetes the browser's NetworkPolicy admits only its peers' ports and the
 proxy is the only Pod with internet egress (TCP 443, private ranges excluded).
 

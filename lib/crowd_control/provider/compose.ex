@@ -97,7 +97,7 @@ defmodule CrowdControl.Provider.Compose do
   `:cap_add`, `no_new_privileges: false`, `readonly_rootfs: false`, or a root
   `user:` — must also be named in the service's `weaken: [...]` list, or
   `acquire/1` refuses with
-  `{:error, {:compose, {:weakening_not_declared, service, key}}}`. `privileged`
+  `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`. `privileged`
   is refused outright (`{:privileged_refused, service}`), declared or not.
 
   This replaces the earlier "one posture per stack" rule, and the risk it
@@ -161,7 +161,7 @@ defmodule CrowdControl.Provider.Compose do
   Once a stack uses per-service networks (a `:networks` declaration or any
   `networks:` membership), the sandbox may share **no** network with an
   `egress: :allow` service other than the `:proxy_service`:
-  `{:error, {:compose, {:sandbox_shares_network_with_egress, network, service}}}`.
+  `{:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}`.
   The strict two-tier browser layout is the sandbox on `sbx`, the browser on
   `sbx` and `brw`, and the forward proxy on `brw` with `egress: :allow`.
 
@@ -1516,7 +1516,7 @@ defmodule CrowdControl.Provider.Compose do
           :ok
 
         [{network, service} | _] ->
-          {:error, {:compose, {:sandbox_shares_network_with_egress, network, service}}}
+          {:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}
       end
     else
       :ok

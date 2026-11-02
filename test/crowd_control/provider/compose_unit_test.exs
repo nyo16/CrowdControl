@@ -1228,7 +1228,7 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
     test "a sandbox sharing a network with an :allow service is refused" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :allow, networks: ["sbx", "brw"]}]
 
-      assert {:error, {:compose, {:sandbox_shares_network_with_egress, "sbx", "proxy"}}} =
+      assert {:error, {:compose, {:sandbox_shares_network_with_egress, {"proxy", "sbx"}}}} =
                gate(services: specs, networks: [%{name: "brw"}])
     end
 
@@ -1238,14 +1238,14 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
         %{name: "proxy", image: "proxy:1", egress: :allow, networks: ["brw"]}
       ]
 
-      assert {:error, {:compose, {:sandbox_shares_network_with_egress, "brw", "proxy"}}} =
+      assert {:error, {:compose, {:sandbox_shares_network_with_egress, {"proxy", "brw"}}}} =
                gate(services: specs, networks: [%{name: "brw"}])
     end
 
     test "an :allow service left on the default sbx is refused once networks are in use" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :allow}]
 
-      assert {:error, {:compose, {:sandbox_shares_network_with_egress, "sbx", "proxy"}}} =
+      assert {:error, {:compose, {:sandbox_shares_network_with_egress, {"proxy", "sbx"}}}} =
                gate(services: specs, networks: [%{name: "brw"}])
     end
 
@@ -1415,12 +1415,12 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
         %{name: "browser", image: "b:1", egress: :none, host_config: %{cap_add: ["SYS_ADMIN"]}}
       ]
 
-      assert {:error, {:compose, {:weakening_not_declared, "browser", :cap_add}}} =
+      assert {:error, {:compose, {:weakening_not_declared, {"browser", :cap_add}}}} =
                gate(services: specs)
 
       specs = [%{name: "browser", image: "b:1", egress: :none, user: "0"}]
 
-      assert {:error, {:compose, {:weakening_not_declared, "browser", :user}}} =
+      assert {:error, {:compose, {:weakening_not_declared, {"browser", :user}}}} =
                gate(services: specs)
     end
 

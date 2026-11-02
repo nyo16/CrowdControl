@@ -46,7 +46,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   starts from it, so a compromised proxy cannot turn around into the browser —
   and its own egress is kube-dns plus TCP 443 to `0.0.0.0/0` and `::/0` minus
   RFC 1918, link-local, CGNAT and ULA. It may share no network with the
-  sandbox (`{:k8s, {:sandbox_shares_network_with_egress, "sbx", name}}`),
+  sandbox (`{:k8s, {:sandbox_shares_network_with_egress, {name, "sbx"}}}`),
   which is the Kubernetes form of invariant 1.
 
   An external is in no network of its own, so its `sbx` membership means the
@@ -209,7 +209,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
 
       {:separate, :allow} ->
         if on_sandbox_network?(service),
-          do: {:error, {:k8s, {:sandbox_shares_network_with_egress, @sandbox_network, name}}},
+          do: {:error, {:k8s, {:sandbox_shares_network_with_egress, {name, @sandbox_network}}}},
           else: :ok
 
       _ ->

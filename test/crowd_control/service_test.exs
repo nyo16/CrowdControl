@@ -39,7 +39,7 @@ defmodule CrowdControl.ServiceTest do
             {%{}, "root:root", :user}
           ] do
         spec = sidecar(host_config: host_config) |> maybe_user(user)
-        assert {:error, {:weakening_not_declared, "b", ^key}} = Service.normalize(spec, :sidecar)
+        assert {:error, {:weakening_not_declared, {"b", ^key}}} = Service.normalize(spec, :sidecar)
 
         assert {:ok, %Service{}} = Service.normalize(Map.put(spec, :weaken, [key]), :sidecar)
       end

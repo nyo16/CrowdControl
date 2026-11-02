@@ -457,7 +457,7 @@ stack's HostConfig with `host_config:`:
 * **Weakening keys** — `:cap_add`, `no_new_privileges: false`,
   `readonly_rootfs: false`, and a root `user:` — must each also be named in the
   service's `weaken: [...]` list, or `acquire/1` refuses with
-  `{:error, {:compose, {:weakening_not_declared, service, key}}}`.
+  `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`.
 * **`privileged`** is refused outright, `{:error, {:compose, {:privileged_refused,
   service}}}`, declared or not.
 
@@ -480,7 +480,7 @@ sandbox must stay on `sbx`, which the forwarder reaches it across.
 Once a stack uses per-service networks, the sandbox may share **no** network with
 an `egress: :allow` service other than the `:proxy_service`, whose SECURITY.md
 contract is the one sanctioned relay:
-`{:error, {:compose, {:sandbox_shares_network_with_egress, network, service}}}`.
+`{:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}`.
 The strict two-tier browser layout is the sandbox on `sbx`, the browser on `sbx`
 and `brw`, and the forward proxy on `brw` plus the NAT bridge.
 
@@ -906,7 +906,7 @@ browser can open a dev server under test as `sandbox:<port>`. Nothing else is
 allowed in or out. An `egress: :allow` service only answers peers (no
 in-session edge starts from it, so a compromised proxy cannot turn into the
 browser), may share no network with the sandbox
-(`{:k8s, {:sandbox_shares_network_with_egress, "sbx", name}}`, invariant 1 in
+(`{:k8s, {:sandbox_shares_network_with_egress, {name, "sbx"}}}`, invariant 1 in
 Kubernetes form), and gets kube-dns plus TCP 443 to the internet minus RFC 1918,
 link-local, CGNAT and ULA. An external's `sbx` membership means the sandbox Pod
 alone, so a `:pod` log shipper's aggregator is not handed to a browser that also
@@ -928,7 +928,7 @@ only by a hostname is unreachable from a Pod with no DNS, which is why
 request, then creates ConfigMaps (`:files`) → NetworkPolicies → Services (their
 ClusterIPs read back) → service Pods → one shared `:provision_timeout` for every
 service Pod's readiness → the sandbox Pod. A service that never becomes ready is
-`{:error, {:k8s, {:service_not_ready, name, reason}}}`. Any failure runs
+`{:error, {:k8s, {:service_not_ready, {name, reason}}}}`. Any failure runs
 `destroy/1`, which derives every object name from the sandbox Pod's
 `crowd_control.services` annotation and deletes each, 404 being success; with a
 drained `:pod` sidecar it deletes with a grace of `drain + shutdown_limit + 5`
