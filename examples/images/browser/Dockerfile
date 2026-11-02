@@ -12,10 +12,16 @@
 #     docker build --build-arg PLAYWRIGHT_VERSION=$(cat PLAYWRIGHT_VERSION) \
 #       -t crowd_control/browser:dev examples/images/browser
 #
-# The base image is pinned by digest, so bumping PLAYWRIGHT_VERSION means
-# replacing the digest below with the new tag's
-# (`docker buildx imagetools inspect mcr.microsoft.com/playwright:v<version>-noble`);
-# the build fails if the two disagree.
+# The base image is pinned by digest, and once a digest is present it alone
+# decides the image: the tag in front of it is not checked. Bumping
+# PLAYWRIGHT_VERSION therefore means replacing the digest below with the new
+# tag's (`docker buildx imagetools inspect mcr.microsoft.com/playwright:v<version>-noble`).
+# The --build-arg must equal the repository's PLAYWRIGHT_VERSION file; this
+# build context is examples/images/browser, so nothing here can read that file
+# and compare. The npm check further down is weaker than a version match: it
+# fails only when the base image lacks the Chromium revision that
+# playwright@<build-arg> expects, so two patch releases sharing a revision
+# both build against either digest.
 #
 # Runtime needs: /dev/shm of 1 GiB or more (ShmSize, or an emptyDir with
 # medium: Memory on Kubernetes), a writable /tmp, and egress only to the proxy.
@@ -41,8 +47,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini \
 WORKDIR /opt/cc-browser
 
 # Preinstalled because the sidecar sits on internal networks with no npm. The
-# base image already carries this version's browsers in /ms-playwright; the
-# check fails the build when the digest-pinned base is another version's.
+# base image already carries its version's browsers in /ms-playwright; the
+# check fails the build when that is not the Chromium revision this playwright
+# expects (a revision check, not a version check: see the note at the top).
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN npm install --omit=dev --no-fund --no-audit playwright@${PLAYWRIGHT_VERSION} \
     && npm cache clean --force \

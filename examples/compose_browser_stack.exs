@@ -17,7 +17,11 @@
 #     -t crowd_control/browser:dev examples/images/browser
 #   docker build -t crowd_control/smokescreen:dev examples/images/smokescreen
 #
-# plus `docker pull timberio/vector:0.61.0-distroless-libc alpine/socat:1.8.1.3`.
+# plus two public images, pulled by hand because the providers never pull
+# (Vector by the digest `CrowdControl.Preset.LogShipper` pins):
+#
+#   docker pull timberio/vector:0.61.0-distroless-libc@sha256:1a3451978644d5cd4b99a0b28c990791e2f7e1efbea4184122f1c59a56448143
+#   docker pull alpine/socat:1.8.1.3
 #
 # Two modes:
 #
