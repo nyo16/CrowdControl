@@ -1159,6 +1159,8 @@ CrowdControl.start_session(
 | `:pod_poll_ms` | 60s | Reader's idle Pod-liveness poll |
 | `:max_inflight_bytes` | 4 MiB | Reader backpressure watermark |
 | `:proxy_url`, `:session_token` | unset | Egress proxy — see [SECURITY.md](SECURITY.md#egress-proxy-contract) |
+| `:services` | `[]` | Sidecars, the same `CrowdControl.Service` specs Compose takes plus a **required** `placement` (`:pod`, `:separate`, `{:external, target}`); needs an explicit `:network` — see [docs/providers.md](docs/providers.md) |
+| `:sandbox_ports` | `[]` | The sandbox's own app ports a `:separate` service sharing `sbx` may reach as `sandbox:<port>` |
 
 Hardening:
 
@@ -1241,8 +1243,16 @@ RBAC the backend's identity needs, in `:namespace`:
 
     pods            create, get, list, delete
     pods/exec       create
-    events          list                    # only to explain a failed provision
-    networkpolicies create, get, delete     # only under network: :deny_all
+    pods/log        get                       # diagnostics on a failed provision
+    events          list                      # diagnostics on a failed provision
+    networkpolicies create, get, list, delete # under network: :deny_all, or with
+                                              # a placement: :separate service
+    services        create, get, list, delete # :separate services, :sandbox_ports
+    configmaps      create, get, list, delete # services with :files
+
+`list` on `services`, `configmaps` and `networkpolicies` is the reaper's orphan
+sweep (`CrowdControl.Backend.Kubernetes.sweep_orphans/1`); grant it wherever the
+reaper runs this backend, even before any session uses `:services`.
 
 **Namespace isolation is yours to provision, deliberately.** The backend runs
 every sandbox in `:namespace` and never creates, labels or deletes one: that
@@ -1564,13 +1574,26 @@ endpoints, so the stack is synthesized directly.
 | `:volumes` | `[]` | Named volume **declarations**, created as `<project>-<name>` and destroyed with the stack. A service mounts one through its own `:volumes` — see [Mounting volumes](#mounting-volumes) |
 | `:ready` | `%{}` | Per-service healthchecks, gating start order |
 | `:project_name` | `cc-<session_key>` | |
-| `:proxy_service` | unset | Sidecar fronting the egress proxy |
+| `:proxy_service` | unset | Sidecar holding the Anthropic credential for the CLI (the API proxy — not the browser's forward proxy) |
+| `:networks` | `[]` | Extra internal networks, `[%{name: "brw"}]`; a service joins one through its own `networks:` (default `["sbx"]`) |
 | `:health_timeout` | `60_000` | |
 
-Agent and hardening options are the Docker provider's, and hardening applies to
-**every** container in the stack — there are deliberately no per-service
-overrides, because a sidecar quietly weaker than the sandbox it shares a network
-with is not a useful thing to express.
+Agent and hardening options are the Docker provider's, and hardening is the
+**default** for every container in the stack. A service may override it with
+`host_config:`: resource keys (`:shm_size`, `:init`, `:pids_limit`, `:memory`,
+`:cpus`, `:tmpfs`) freely, weakening keys (`:cap_add`, `no_new_privileges:
+false`, `readonly_rootfs: false`, a root `user:`) only when also named in its
+`weaken: [...]` list, and `privileged` never. Per-service networks and any
+`egress: :allow` sidecar need Docker Engine ≥ 25.0.5 (CVE-2024-29018). See
+[docs/providers.md](docs/providers.md) for the rules.
+
+**A browser for the agent.** `CrowdControl.Preset.browser_stack/1` returns the
+strict two-tier layout — sandbox on `sbx`, a Playwright browser on `sbx` and
+`brw`, an allowlist forward proxy (Smokescreen) on `brw` plus the NAT bridge —
+as `{services, networks, sandbox_overrides}` for Compose or Kubernetes, and
+`CrowdControl.Preset.LogShipper` adds a redacting Vector sidecar over the
+capture. The network is the boundary; read
+[SECURITY.md](SECURITY.md#forward-proxy-contract) first.
 
 The sandbox sits on an `Internal: true` network with no port bindings at all: no
 default route exists, so the internet, the Docker host, sibling containers and
@@ -1712,6 +1735,18 @@ options — see `CrowdControl.Agent.Omp`.
 | `control(session, request, timeout)` | Send any control request (default timeout 60 s) |
 | `pending_requests(session)` | Control requests still awaiting an answer |
 | `stop(session)` | Graceful shutdown |
+
+### CrowdControl.Preset (service specs)
+
+Each returns plain service maps for Compose's or Kubernetes' `:services`, and
+raises `ArgumentError` on a bad option.
+
+| Function | Description |
+|----------|-------------|
+| `Preset.browser_stack(opts)` | Browser + forward proxy, wired: `{services, networks, sandbox_overrides}` for `substrate: :compose \| :kubernetes` |
+| `Preset.Browser.spec(opts)` | Chromium behind Playwright `launchServer` (3000) and `playwright mcp` (8931) |
+| `Preset.EgressProxy.spec(opts)` | Smokescreen hostname-allowlist forward proxy on 4750, the only `egress: :allow` service |
+| `Preset.LogShipper.spec(opts)` / `services(opts)` | Vector sidecar that tails, redacts and ships the capture |
 
 ### Message types
 
