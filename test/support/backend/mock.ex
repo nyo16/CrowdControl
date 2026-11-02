@@ -33,6 +33,8 @@ defmodule CrowdControl.Backend.Mock do
     * `:live` - handles returned by `list_live/1`
     * `:reattachable` - whether `reattachable?/0` reports true (default `true`)
     * `:fail` - map of `callback_name => reason` to force `{:error, reason}`
+    * `:max_write_bytes` - a frame limit: larger writes return
+      `{:error, :frame_too_large}`, as `CrowdControl.Backend.Docker` does
   """
   @spec start_link(keyword()) :: {:ok, ctl()} | {:error, term()}
   def start_link(opts \\ []) do
@@ -42,6 +44,7 @@ defmodule CrowdControl.Backend.Mock do
         live: Keyword.get(opts, :live, []),
         reattachable: Keyword.get(opts, :reattachable, true),
         fail: Keyword.get(opts, :fail, %{}),
+        max_write_bytes: Keyword.get(opts, :max_write_bytes),
         calls: [],
         writes: [],
         destroyed: []
@@ -127,9 +130,15 @@ defmodule CrowdControl.Backend.Mock do
   @impl true
   def write(%__MODULE__{ctl: ctl}, data) do
     record(ctl, :write)
-    Agent.update(ctl, &%{&1 | writes: [IO.iodata_to_binary(data) | &1.writes]})
+    data = IO.iodata_to_binary(data)
+    Agent.update(ctl, &%{&1 | writes: [data | &1.writes]})
 
-    check_fail(ctl, :write)
+    with :ok <- check_fail(ctl, :write) do
+      case Agent.get(ctl, & &1.max_write_bytes) do
+        max when is_integer(max) and byte_size(data) > max -> {:error, :frame_too_large}
+        _ -> :ok
+      end
+    end
   end
 
   @impl true

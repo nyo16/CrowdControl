@@ -14,6 +14,14 @@ defmodule CrowdControl.TestHelpers do
   end
 
   @doc """
+  Absolute path to the fake control-protocol CLI (an Elixir script run through
+  its `elixir` shebang) used by control-protocol tests.
+  """
+  def fake_control_cli_path do
+    Path.expand("../support/fake_control_cli.exs", __DIR__)
+  end
+
+  @doc """
   Stop a session, tolerating mailbox congestion. Falls back to a hard
   `Process.exit(pid, :kill)` if the GenServer.call times out.
   """

@@ -120,7 +120,8 @@ defmodule CrowdControl.MixProject do
         Agents: [
           CrowdControl.Agent,
           CrowdControl.Agent.ClaudeCode,
-          CrowdControl.Agent.Omp
+          CrowdControl.Agent.Omp,
+          CrowdControl.SdkMcp
         ],
         Backends: [
           CrowdControl.Backend,

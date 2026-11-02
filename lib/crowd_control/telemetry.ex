@@ -14,6 +14,35 @@ defmodule CrowdControl.Telemetry do
 
   ## Events
 
+  Durations are in `:native` time units, as with `:telemetry.span/3`. Every
+  session event's metadata carries `%{store_key, agent, backend}`.
+
+    * `[:crowd_control, :session, :start]`: a session is up (provisioned and
+      exec'd, or reattached). Measurements `%{system_time, monotonic_time}`.
+    * `[:crowd_control, :session, :stop]`: the session process ended normally.
+      Measurements `%{duration, monotonic_time}`; metadata adds
+      `%{status, exit_status}`.
+    * `[:crowd_control, :session, :exception]`: the session process ended
+      abnormally. Measurements as `:stop`; metadata adds `%{kind, reason,
+      stacktrace}`.
+    * `[:crowd_control, :turn, :start]`: a prompt was written. Measurements
+      `%{system_time, monotonic_time}`; metadata adds `%{turn}`.
+    * `[:crowd_control, :turn, :stop]`: that prompt's result arrived.
+      Measurements `%{duration, monotonic_time}`; metadata adds `%{turn,
+      cost_usd, turn_cost_usd, subtype, error_kind}`. `cost_usd` is the CLI's
+      cumulative `total_cost_usd`, `turn_cost_usd` this turn's share of it, and
+      `error_kind` the `CrowdControl.Error` kind from
+      `CrowdControl.Result.classify/1` (`nil` for a successful turn).
+    * `[:crowd_control, :backend, :provision, :start | :stop | :exception]`: a
+      `:telemetry.span/3` around `c:CrowdControl.Backend.provision/1`; stop
+      metadata adds `%{result: :ok | :error}`.
+    * `[:crowd_control, :control, :decision]`: one per `can_use_tool` request
+      settled, measurements `%{system_time}`, metadata `%{store_key, request_id,
+      tool_name, behavior, source}`. `behavior` is `:allow`, `:deny`, `:error`
+      (no handler) or `:cancelled`; `source` is `:callback`, `:respond`,
+      `:timeout` (`:permission_timeout`) or `:cancel` (withdrawn by the CLI).
+      Answers are written to the CLI's stdin and never reach the output
+      capture, so this event is their audit trail.
     * `[:crowd_control, :gce, :phase]`: one per `CrowdControl.Provider.Gce`
       acquire phase, measurements `%{duration_ms}`, metadata
       `%{phase, result, instance_name, zone}`.

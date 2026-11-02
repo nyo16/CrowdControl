@@ -72,6 +72,8 @@ defmodule CrowdControl.Store do
     * `:opts` — the session opts, replayed on reattach
     * `:owner` — this node's owner id; scopes reaping (see `CrowdControl.Reaper`)
     * `:updated_at` — `System.system_time(:millisecond)`
+    * `:control` — see `t:control/0`; absent from records written before it
+      existed, which reattach as if nothing were pending
   """
   @type t :: %{
           required(:key) => String.t(),
@@ -83,7 +85,24 @@ defmodule CrowdControl.Store do
           required(:opts) => keyword(),
           required(:owner) => String.t(),
           required(:updated_at) => integer(),
+          optional(:control) => control() | nil,
           optional(atom()) => term()
+        }
+
+  @typedoc """
+  The control-protocol state a reattached session resumes from.
+
+    * `:pending` — CLI control requests received but not yet answered, keyed
+      `{request_id, byte_offset}`, each `%{subtype, request, status}`
+    * `:turn_deadline_at` — when the turn deadline fires, wall-clock ms; `nil`
+      while paused or disarmed
+    * `:paused_remaining_ms` — what was left of the deadline when a pending
+      permission request paused it
+  """
+  @type control :: %{
+          pending: %{optional({String.t(), non_neg_integer() | nil}) => map()},
+          turn_deadline_at: integer() | nil,
+          paused_remaining_ms: non_neg_integer() | nil
         }
 
   @doc "Insert or replace the record for `key`."
@@ -160,7 +179,8 @@ defmodule CrowdControl.Store do
       buffer: Keyword.get(fields, :buffer, ""),
       opts: Keyword.get(fields, :opts, []),
       owner: Keyword.get(fields, :owner) || owner_id(),
-      updated_at: Keyword.get(fields, :updated_at) || System.system_time(:millisecond)
+      updated_at: Keyword.get(fields, :updated_at) || System.system_time(:millisecond),
+      control: Keyword.get(fields, :control)
     }
   end
 
