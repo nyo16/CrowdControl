@@ -260,11 +260,21 @@ defmodule CrowdControl.PresetTest do
       k8s = yaml(LogShipper.config(placement: :pod, sink: @k8s_sink, aggregator: @aggregator))
       assert k8s["api"] == %{"enabled" => false}
 
+      # Regression: a bare `host:port` never connects in Vector 0.61 (found by
+      # kubernetes_browser_test.exs); the scheme is required.
       assert k8s["sinks"]["out"] == %{
                "type" => "vector",
                "inputs" => ["transcript_redacted"],
-               "address" => "vector-aggregator.logging.svc:6000"
+               "address" => "http://vector-aggregator.logging.svc:6000"
              }
+
+      ipv6 = [
+        placement: :pod,
+        sink: {:vector, address: "[fd00::7]:6000"},
+        aggregator: @aggregator
+      ]
+
+      assert yaml(LogShipper.config(ipv6))["sinks"]["out"]["address"] == "http://[fd00::7]:6000"
     end
 
     test "proxy decisions become a second, redacted source" do
@@ -300,6 +310,16 @@ defmodule CrowdControl.PresetTest do
         assert_raise ArgumentError, ~r/only \{:vector, address: aggregator\}/, fn ->
           LogShipper.spec(placement: :pod, sink: sink, aggregator: @aggregator)
         end
+      end
+    end
+
+    test "an https aggregator address is refused, not downgraded to plain text" do
+      assert_raise ArgumentError, ~r/bad vector sink address/, fn ->
+        LogShipper.spec(
+          placement: :pod,
+          sink: {:vector, address: "https://10.96.12.7:6000"},
+          aggregator: @aggregator
+        )
       end
     end
 
@@ -394,6 +414,20 @@ defmodule CrowdControl.PresetTest do
       assert spec.env == %{"VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS" => "20"}
       assert spec.command == ["--config", "/etc/vector/vector.yaml"]
       assert [%{path: "/etc/vector/vector.yaml", mode: 0o444}] = spec.files
+    end
+
+    # Regression: Docker copies the image's root-owned 0755 `/var/lib/vector`
+    # up into the tmpfs, so Vector running as 65532 could not create its
+    # checkpoints and exited at start (found by compose_browser_test.exs).
+    test "Compose: the data dir tmpfs belongs to the user Vector runs as" do
+      tmpfs = fn opts ->
+        spec = LogShipper.spec([sink: :console, capture_volume: "c"] ++ opts)
+        spec.host_config.tmpfs["/var/lib/vector"]
+      end
+
+      assert tmpfs.([]) == "rw,noexec,nosuid,size=8m,uid=65532,gid=65532,mode=0700"
+      assert tmpfs.(user: "1000") == "rw,noexec,nosuid,size=8m,uid=1000,mode=0700"
+      assert tmpfs.(user: "vector") == "rw,noexec,nosuid,size=8m,mode=1777"
     end
 
     test "Compose with a network sink: egress on its own network" do
