@@ -13,6 +13,7 @@ defmodule CrowdControl.Backend.KubernetesFakeServerTest do
 
   import ExUnit.CaptureLog
 
+  alias CrowdControl.Backend.Kubernetes
   alias CrowdControl.Backend.Kubernetes.API
   alias CrowdControl.K8sFakeServer
 
@@ -242,6 +243,42 @@ defmodule CrowdControl.Backend.KubernetesFakeServerTest do
       assert_receive {:close, 1000, ""}, 2_000
       assert_receive {:exec_down, ^exec, :normal}, 2_000
       refute_received {:EXIT, _pid, _reason}
+    end
+  end
+
+  describe "write/2 sends frames over stdin (blocker: a frame past MAX_ARG_STRLEN)" do
+    test "a frame larger than one argv string is written, and never enters the request" do
+      server =
+        start_supervised!(
+          {K8sFakeServer,
+           scripts: [
+             [subprotocol: @subprotocol, frames: [{:status, @success}]],
+             [subprotocol: @subprotocol, frames: [{:status, @failure}]]
+           ]}
+        )
+
+      handle = %Kubernetes{
+        pod_name: "cc-x",
+        fifo_path: "/var/run/cc.fifo",
+        config: K8sFakeServer.config(server)
+      }
+
+      # 200 KiB: past the 128 KiB per-argv-string limit that a `printf` in argv
+      # would hit inside the container.
+      marker = "frame-marker-#{System.unique_integer([:positive])}"
+      payload = marker <> String.duplicate("x", 200 * 1024) <> "\n"
+
+      assert :ok = Kubernetes.write(handle, payload)
+
+      # The command reads a byte count off stdin; the frame is nowhere in the
+      # query string, which is the only place argv travels.
+      assert [request] = K8sFakeServer.requests(server)
+      assert request =~ "stdin=true"
+      assert request =~ Integer.to_string(byte_size(payload))
+      refute request =~ marker
+
+      # And channel 3 is still the write's result: a failed `head` is an error.
+      assert {:error, {:k8s, {:exit_status, 7}}} = Kubernetes.write(handle, "lost\n")
     end
   end
 end

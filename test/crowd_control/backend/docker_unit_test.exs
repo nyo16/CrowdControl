@@ -279,6 +279,79 @@ defmodule CrowdControl.Backend.DockerUnitTest do
     end
   end
 
+  describe "write/2 ordering (blocker: a detached exec lets control frames reorder)" do
+    test "each write's exec is inspected until it has exited before the next is created" do
+      # e1 is still running on its first inspect; e2 is done at once. Were write/2
+      # to return on a detached start, e2 would be created while e1 still runs.
+      {handle, agent} =
+        stub_daemon(%{
+          "e1" => [running(), done(0)],
+          "e2" => [done(0)]
+        })
+
+      assert :ok = Docker.write(handle, "first\n")
+      assert :ok = Docker.write(handle, "second\n")
+
+      assert [
+               {:create, "e1", first},
+               {:start, "e1", %{"Detach" => true}},
+               {:inspect, "e1"},
+               {:inspect, "e1"},
+               {:create, "e2", second},
+               {:start, "e2", %{"Detach" => true}},
+               {:inspect, "e2"}
+             ] = events(agent)
+
+      assert first =~ "printf %s 'first\n' >> '/var/run/cc.fifo'"
+      assert second =~ "printf %s 'second\n' >> '/var/run/cc.fifo'"
+    end
+
+    test "an exec that exits non-zero is a failed write, not a delivered frame" do
+      {handle, _agent} = stub_daemon(%{"e1" => [done(1)]})
+
+      assert {:error, {:docker, {:exit_status, 1}}} = Docker.write(handle, "lost\n")
+    end
+
+    test "a null ExitCode means not finished yet, even when Running reads false" do
+      {handle, agent} =
+        stub_daemon(%{"e1" => [%{"Running" => false, "ExitCode" => nil}, done(0)]})
+
+      assert :ok = Docker.write(handle, "hi\n")
+      assert [{:inspect, "e1"}, {:inspect, "e1"}] = Enum.filter(events(agent), &inspect?/1)
+    end
+
+    test "an exec still running when the budget runs out is indeterminate" do
+      {handle, _agent} = stub_daemon(%{"e1" => [running()]}, write_timeout: 30)
+
+      assert {:error, {:docker, :write_indeterminate}} = Docker.write(handle, "maybe\n")
+    end
+  end
+
+  describe "write/2 frame size (blocker: a frame past MAX_ARG_STRLEN)" do
+    test "a frame over 120 KiB is refused before any exec is created" do
+      {handle, agent} = stub_daemon(%{})
+
+      assert {:error, :frame_too_large} =
+               Docker.write(handle, String.duplicate("x", 120 * 1024 + 1))
+
+      assert events(agent) == []
+    end
+
+    test "the limit applies to the escaped script, which is what the kernel sees" do
+      {handle, agent} = stub_daemon(%{})
+
+      # 40 KiB of quotes escapes to 160 KiB (each `'` becomes `'\\''`).
+      assert {:error, :frame_too_large} = Docker.write(handle, String.duplicate("'", 40 * 1024))
+      assert events(agent) == []
+    end
+
+    test "a large frame under the limit is written" do
+      {handle, _agent} = stub_daemon(%{"e1" => [done(0)]})
+
+      assert :ok = Docker.write(handle, String.duplicate("x", 100 * 1024))
+    end
+  end
+
   defp relay_loop(test_pid) do
     receive do
       {:"$gen_cast", msg} ->
@@ -286,4 +359,62 @@ defmodule CrowdControl.Backend.DockerUnitTest do
         relay_loop(test_pid)
     end
   end
+
+  defp running, do: %{"Running" => true, "ExitCode" => nil}
+  defp done(code), do: %{"Running" => false, "ExitCode" => code}
+
+  defp inspect?({:inspect, _}), do: true
+  defp inspect?(_event), do: false
+
+  defp events(agent), do: Agent.get(agent, &Enum.reverse(&1.events))
+
+  # A stub Engine API that records every exec create, start and inspect in
+  # order. `inspects` maps an exec id to the answers its inspects get, in turn;
+  # the last answer repeats. Exec ids are handed out as e1, e2, ...
+  defp stub_daemon(inspects, config \\ []) do
+    {:ok, agent} = Agent.start_link(fn -> %{events: [], next: 1, inspects: inspects} end)
+
+    adapter = fn req ->
+      path = URI.parse(to_string(req.url)).path
+      {status, body} = Agent.get_and_update(agent, &route(&1, req.method, path, req))
+      {req, Req.Response.new(status: status, body: body)}
+    end
+
+    handle = %Docker{
+      container_id: "ctr",
+      fifo_path: "/var/run/cc.fifo",
+      config: [req_adapter: adapter] ++ config
+    }
+
+    {handle, agent}
+  end
+
+  defp route(state, :post, "/containers/ctr/exec", req) do
+    id = "e#{state.next}"
+    [_sh, "-c", script] = decoded_body(req)["Cmd"]
+    {{201, %{"Id" => id}}, %{record(state, {:create, id, script}) | next: state.next + 1}}
+  end
+
+  defp route(state, :post, "/exec/" <> rest, req) do
+    [id, "start"] = String.split(rest, "/")
+    {{200, ""}, record(state, {:start, id, decoded_body(req)})}
+  end
+
+  defp route(state, :get, "/exec/" <> rest, _req) do
+    [id, "json"] = String.split(rest, "/")
+
+    {answer, remaining} =
+      case Map.fetch!(state.inspects, id) do
+        [last] -> {last, [last]}
+        [next | rest] -> {next, rest}
+      end
+
+    state = record(state, {:inspect, id})
+    {{200, answer}, %{state | inspects: Map.put(state.inspects, id, remaining)}}
+  end
+
+  defp record(state, event), do: %{state | events: [event | state.events]}
+
+  defp decoded_body(%{body: body}) when is_binary(body), do: JSON.decode!(body)
+  defp decoded_body(%{options: %{json: json}}), do: JSON.decode!(JSON.encode!(json))
 end
