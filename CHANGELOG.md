@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### Added
+
+- **Control protocol for Claude Code sessions.** New session options
+  `:can_use_tool`, `:hooks`, `:sdk_mcp_servers`, `:on_control_request`,
+  `:permission_timeout` (default `:infinity`) and `:interrupt_grace` (default
+  30 s with a control feature on, else 0), and new `CrowdControl.Session`
+  functions `respond/3`, `interrupt/1`, `set_model/2`, `set_permission_mode/2`,
+  `control/3` and `pending_requests/1` (`{:error, :unsupported}` on agents
+  without the capability, i.e. omp). Callbacks are MFA tuples run under the new
+  `CrowdControl.CallbackSupervisor`; a fun raises `ArgumentError` at start,
+  because session options are persisted. A callback returning `:defer` leaves
+  the request to `respond/3` and broadcasts
+  `{:control_request, id, subtype, request}`; a withdrawn one broadcasts
+  `{:control_cancelled, id}`. Pending requests survive a host restart:
+  callbacks are at-least-once, responses idempotent. Requires Claude Code
+  2.1.268 or newer (`CrowdControl.CLI.min_version/0`); an older CLI gets
+  `{:error, {:cli_version, have, need}}`.
+- **`CrowdControl.SdkMcp`** — in-BEAM MCP tool servers
+  (`tool_server/2`), reached over the control channel. A tool call in flight at
+  a host restart is re-run only when the tool is `idempotent: true`.
+- **Typed errors.** `CrowdControl.Error` (closed set of kinds,
+  `Error.kinds/0`), `CrowdControl.Result.classify/1` and its accessors
+  `cost_usd/1`, `session_id/1`, `num_turns/1`, `permission_denials/1`, and
+  `CrowdControl.run!/2` / `CrowdControl.classify/1`. Subscribers still receive
+  the untyped `{:result, subtype, map}`.
+- **Telemetry events** for sessions, turns (with `turn_cost_usd` and
+  `error_kind`), backend provisioning and control decisions, listed in the
+  `CrowdControl.Telemetry` moduledoc. The decision event is the only audit
+  trail of permission answers.
+- **`:mcp_config` accepts inline maps** (`%{"mcpServers" => ...}`, every server
+  with a `"type"`), alone or mixed with paths in a list. Also
+  `:permission_prompt_tool` and `:permission_prompts`.
+- **`mix crowd_control.contract`** checks a Claude Code binary's flags and
+  control frames against what the library assumes, without a model call; CI
+  runs it against a pinned release.
+- **`release_env: :inherit`** on `Backend.Local`, opting out of the release
+  environment scrub below.
+- **`:write_timeout`** on `Backend.Docker` (default 10 s).
+
+### Changed
+
+- **`Backend.Local` always scrubs the release environment.** `RELEASE_*`,
+  `BINDIR`, `ROOTDIR`, `EMU`, `PROGNAME` and the release's `PATH` entries no
+  longer reach the CLI; an explicit `:env` still wins. Pass
+  `release_env: :inherit` for the old behaviour. `sandboxd` scrubs the same way.
+- **`Backend.Docker` writes are synchronous.** `write/2` waits for its exec to
+  exit, so frames arrive in order; past `:write_timeout` it returns
+  `{:error, {:docker, :write_indeterminate}}`, a non-zero exit
+  `{:error, {:docker, {:exit_status, n}}}`, and a frame over 120 KiB escaped is
+  refused with `{:error, :frame_too_large}`.
+- **Control frames are no longer delivered to subscribers** or kept in
+  `get_messages/1`; `keep_alive` is dropped. Deferred requests arrive as
+  `{:control_request, ...}` instead.
+- **The turn timer pauses** while a permission request or deferred hook awaits
+  an answer, and an interrupt-capable agent is sent `interrupt` at the deadline
+  before its sandbox is destroyed.
+- **`:telemetry` is declared as an optional dependency** (it previously
+  arrived only transitively); without it every event is a no-op.
+
+### Fixed
+
+- **A reattached session keeps its original turn deadline**, re-armed from the
+  persisted wall-clock time, instead of starting a fresh `:timeout` window
+  after every host restart.
+
 ## 0.3.0 — 2026-09-01
 
 ### Added

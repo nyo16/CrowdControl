@@ -248,18 +248,68 @@ back to `:running`. Only `exited: true`, set on `:eof`, is really terminal.
 **Destroy happens before the `{:exit, _}` broadcast**, so a subscriber that receives it is entitled to
 assume the sandbox and its env file are already gone.
 
+## The control protocol
+
+An agent with the `:control` capability (today only `CrowdControl.Agent.ClaudeCode`) speaks the
+stream-json control protocol alongside its messages. The session switches it on when any of
+`:can_use_tool`, `:hooks`, `:sdk_mcp_servers` or `:on_control_request` is set; omp has no such
+channel and its control APIs return `{:error, :unsupported}`.
+
+**Frames handled.** `control_request` from the CLI (`can_use_tool`, `hook_callback`, `mcp_message`,
+anything else via `:on_control_request`), `control_response` to the session's own requests
+(`initialize`, `interrupt`, `set_model`, `set_permission_mode`, `Session.control/3`), and
+`control_cancel_request`. `keep_alive` is dropped. None of these is stored or broadcast: a subscriber
+sees `{:control_request, id, subtype, request}` only when a callback defers, and
+`{:control_cancelled, id}` when the CLI withdraws one.
+
+**Persist before dispatch.** An incoming request is entered into the pending set and the record is
+written to the store *before* its callback is started. A node that dies between the two leaves a
+request the reattached session still knows about; the reverse order would leave one nobody answers.
+
+**Callbacks run under `CrowdControl.CallbackSupervisor`**, monitored rather than linked, because a
+`:can_use_tool` callback may block on a human while the session has to keep reading stdout. A crash
+becomes a deny (`"callback crashed"`), a malformed return a deny (`"invalid callback decision"`).
+Callbacks are MFA tuples, never funs: they live in the persisted opts, and a closure cannot be.
+
+**Reattach recovery.** The reattached session re-sends `initialize`. For permission requests the CLI's
+`pending_permission_requests` is the truth; hooks are dispatched again; an in-flight `mcp_message` is
+re-run only when its tool is declared `idempotent: true`, and otherwise answered with JSON-RPC
+`-32603` ("host restarted; call state unknown"). The consequence for callers: **callbacks are
+at-least-once** and must be idempotent by `request_id`, while responses are idempotent — answering an
+already-answered `request_id` through `Session.respond/3` is a no-op.
+
+**Timers.**
+
+* The turn timer pauses while a permission request or a deferred hook is waiting, so time spent on a
+  human does not count against `:timeout`.
+* `:permission_timeout` (default `:infinity`) denies an unanswered permission request with
+  `"permission timed out"`.
+* At the turn deadline an `:interrupt`-capable agent is sent `interrupt` first and destroyed only if
+  no result arrives within `:interrupt_grace` (30 s with a control feature on, else 0). omp is
+  destroyed at the deadline as before.
+* A reattached session — any reattachable session, control features or not — re-arms its deadline
+  from the persisted wall-clock time rather than starting a fresh one.
+
+**Version gate.** Control needs Claude Code `CrowdControl.CLI.min_version/0` or newer.
+`Backend.Local` checks `claude --version` before spawning when its output reads `X.Y.Z (Claude
+Code)`; every backend checks `claude_code_version` in `system/init`, which only arrives after the first
+user message, and broadcasts `{:error, {:cli_version, have, need}}` before stopping.
+`mix crowd_control.contract` checks a binary's flags and control frames against what the library
+assumes.
+
 ## The supervision tree
 
 CrowdControl.Application's start/2 installs `CrowdControl.LogRedactor` before starting any child —
 a rejected exec upgrade makes kubereq's connection process crash with the whole `%Req.Request{}`,
-kubeconfig included, as its last message — then starts exactly three children under
+kubeconfig included, as its last message — then starts exactly four children under
 `CrowdControl.Supervisor` with `strategy: :one_for_one`:
 
 | Order | Child | Why here |
 |---|---|---|
 | 1 | the configured `CrowdControl.Store` | must be up before any session can persist to it |
-| 2 | `DynamicSupervisor` named `CrowdControl.SessionSupervisor`, `max_children: max_sessions` | holds every session; `:max_sessions` defaults to 50 and `fetch_max_sessions!/0` raises on a non-positive integer |
-| 3 | `CrowdControl.Reaper` | **last**, because its boot reconciliation starts sessions under the supervisor above |
+| 2 | `Task.Supervisor` named `CrowdControl.CallbackSupervisor` | control callbacks run here, and must have a home before a session can dispatch one |
+| 3 | `DynamicSupervisor` named `CrowdControl.SessionSupervisor`, `max_children: max_sessions` | holds every session; `:max_sessions` defaults to 50 and `fetch_max_sessions!/0` raises on a non-positive integer |
+| 4 | `CrowdControl.Reaper` | **last**, because its boot reconciliation starts sessions under the supervisor above |
 
 `start_session/1` maps `{:error, :max_children}` to `{:error, :max_sessions_reached}`, so the
 `max_children` cap surfaces as a named condition rather than a supervisor internal.

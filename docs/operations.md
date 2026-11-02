@@ -15,7 +15,7 @@ posture.
 
 ## Supervision order, and why it is an order
 
-CrowdControl.Application's start/2 does four things, and three of them are
+CrowdControl.Application's start/2 does five things, and four of them are
 sequenced deliberately:
 
 ```elixir
@@ -23,6 +23,7 @@ sequenced deliberately:
 
 children = [
   {store, store_opts},
+  {Task.Supervisor, name: CrowdControl.CallbackSupervisor},
   {DynamicSupervisor, name: CrowdControl.SessionSupervisor, strategy: :one_for_one,
    max_children: max_sessions},
   CrowdControl.Reaper
@@ -33,6 +34,8 @@ children = [
   close happens on a routine failed exec upgrade, which can occur during the boot
   sweep itself.
 * The store must be up before any session can persist to it.
+* Control callbacks need `CrowdControl.CallbackSupervisor` before a session can
+  dispatch one.
 * The reaper comes **last**, because its boot reconciliation starts sessions under
   `CrowdControl.SessionSupervisor`.
 
@@ -476,33 +479,60 @@ and accept what they contain.
 
 ## Telemetry
 
-Be clear about the size of this surface: **one `:telemetry` event is emitted today.**
+`:telemetry` is an **optional** dependency. Every event goes through
+`CrowdControl.Telemetry`, which is a no-op when the `:telemetry` module cannot be
+loaded; add `{:telemetry, "~> 1.0"}` to your own deps (it usually arrives already,
+through Req or Finch) to receive them.
+
+The events, with their measurements and metadata, are listed in the
+`CrowdControl.Telemetry` moduledoc, which is the authoritative copy:
 
 ```
+[:crowd_control, :session, :start | :stop | :exception]
+[:crowd_control, :turn, :start | :stop]
+[:crowd_control, :backend, :provision, :start | :stop | :exception]
+[:crowd_control, :control, :decision]
 [:crowd_control, :gce, :phase]
-measurements: %{duration_ms: non_neg_integer()}
-metadata:     %{phase: :insert | :running | :ssh | :health,
-                result: :ok | :error,
-                instance_name: String.t(),
-                zone: String.t()}
 ```
 
 ```elixir
 :telemetry.attach("gce", [:crowd_control, :gce, :phase], &handler/4, nil)
 ```
 
-It exists because `Provider.Gce.acquire/1` is minutes long and was opaque:
-`:ready_timeout`'s documentation asks a caller to raise it for a heavy bootstrap and
-lower it for a prebuilt image, and nothing reported where the minutes actually went.
-It is emitted on failure too, with `result: :error`, which is the case a caller most
-needs — "it timed out" is not actionable, "`:ssh` timed out after 180s" names the
-firewall rule. The four phases and their measured baselines are in
-[providers.md](providers.md).
+Three are worth singling out:
+
+* `[:crowd_control, :turn, :stop]` carries `turn_cost_usd` and `error_kind` (the
+  `CrowdControl.Error` kind, `nil` on success), which is enough for per-turn spend
+  and error-rate dashboards without parsing results.
+* `[:crowd_control, :control, :decision]` is the **only** audit trail of permission
+  answers: decisions are written to the CLI's stdin and never reach the output
+  capture. `source` says who decided — `:callback`, `:respond`, `:timeout` or
+  `:cancel`.
+* `[:crowd_control, :gce, :phase]` exists because `Provider.Gce.acquire/1` is
+  minutes long and was opaque. It is emitted on failure too, with `result: :error`,
+  which is the case a caller most needs — "it timed out" is not actionable, "`:ssh`
+  timed out after 180s" names the firewall rule. The four phases and their measured
+  baselines are in [providers.md](providers.md).
 
 Everything else observable today is `Logger` plus `CrowdControl.Reaper.sweep/2`'s
 return value. That return value is the closest thing to a metrics surface for
 reconciliation: `%{reattached:, destroyed:, pruned:, skipped:}`, synchronous, safe to
 call on a schedule from your own instrumentation.
+
+## CLI contract check
+
+`mix crowd_control.contract` checks a Claude Code binary against the flags and
+control frames this library assumes: its version is at least
+`CrowdControl.CLI.min_version/0`, every flag `CrowdControl.CLI` can emit is known
+to it, and a live `initialize`/`interrupt` probe answers in the expected shape. It
+makes no model call and needs no API key. Run it before rolling out a new CLI
+version:
+
+```
+CC_CONTRACT_BIN=/opt/claude/bin/claude CC_CONTRACT_VERSION=2.1.292 mix crowd_control.contract
+```
+
+It exits non-zero, listing every mismatch. CI runs it against a pinned release.
 
 ## What to alarm on
 
