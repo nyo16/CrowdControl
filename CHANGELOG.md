@@ -12,7 +12,8 @@
   `set_model/2`, `set_permission_mode/2`, `control/3` and
   `pending_requests/1` (`{:error, :unsupported}` on agents without the
   capability, i.e. omp). Callbacks are MFA tuples run under the new
-  `CrowdControl.CallbackSupervisor`, killed with their session however it
+  `CrowdControl.CallbackSupervisor`, with the session in their `$callers` (so
+  Mox and Ecto sandbox allowances reach them), killed with their session however it
   dies; a fun raises `ArgumentError` at start, because session options are
   persisted, and so does a fun, pid, reference or port anywhere in
   `extra_args` — persisted arguments must be plain data, so
@@ -109,7 +110,10 @@
   is `{:k8s, {:service_not_ready, {name, reason}}}`. Under
   `network: :deny_all`, `<pod>-deny-all` is re-checked just before the
   sandbox Pod (`{:k8s, {:policy_missing, name}}`). `destroy/1` waits for a
-  drained Pod to be gone before deleting its NetworkPolicies.
+  drained Pod to be gone before deleting its NetworkPolicies. A `:separate`
+  Pod on `sbx`, which the sandbox Pod can reach, is deleted only once the
+  sandbox Pod is gone. The others are deleted alongside it, with the waits
+  overlapping, so a drained off-`sbx` service no longer doubles the teardown.
   `Kubernetes.sweep_orphans/1`, called by the reaper (reported as `swept`),
   removes service objects, Secrets, and the sandbox's own `<pod>-deny-all`
   policy, that a crash before the sandbox Pod left behind, once they are past
@@ -140,7 +144,9 @@
 
 - **`CrowdControl.run/2` follows the session's own clock.** It waits for the
   result or `{:timeout, :session_expired}`, with only a wall-clock backstop of
-  `:timeout` plus `:interrupt_grace` (30 s when unset) plus 30 s. Without
+  `:timeout` plus `:interrupt_grace` (30 s when unset) plus 30 s, with the
+  grace resolved as the session resolves it, so a value inside `backend:`
+  counts and overrides a top-level one. Without
   `:timeout` it therefore waits for the session default, 300 s, where it
   previously gave up after 60 s.
 - **`Session.stop/1` and `CrowdControl.stop_all/1` no longer time out.** A
@@ -183,6 +189,19 @@
   `FROM runtime` keeping it the default target.
 - **Compose hardening is a per-service default** rather than one posture per
   stack.
+- **Compose refuses a sidecar whose image defaults to root.** A sidecar with
+  no `user:` runs as its image's default user, so `acquire/1` reads it
+  (`GET /images/{image}/json`) before creating anything. A root default needs
+  `weaken: [:user]`, as an explicit root `user:` does, or
+  `{:compose, {:weakening_not_declared, {name, :user}}}`. This is the Compose
+  form of Kubernetes' `runAsNonRoot`, and it can refuse a stack that worked
+  before: set a non-root `user:` on the sidecar, or declare the weakening. An
+  image the daemon does not have is now `{:compose, {:image_not_found,
+  {name, image}}}` before any create, rather than a create failure after the
+  networks exist. The sandbox is exempt, and the presets set `user:`.
+- **The Compose forwarder runs as `nobody`** (`65534:65534`). `:agent_port`
+  must therefore be 1024–65535 (`{:compose, {:bad_agent_port, {forwarder,
+  port}}}`), and a custom `:forwarder_image` must let uid 65534 run `socat`.
 
 ### Fixed
 

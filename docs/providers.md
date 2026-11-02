@@ -385,7 +385,10 @@ container.
 The **forwarder** sidecar is dual-homed on 1 and 2 and publishes the agent port on
 `127.0.0.1:0`, running
 `socat TCP-LISTEN:<port>,fork,reuseaddr TCP:<sandbox>:<port>` and addressing the
-sandbox by its network alias. `fork` is not decorative: a single-slot forwarder
+sandbox by its network alias. It runs as `nobody` (`65534:65534`), so a custom
+`:forwarder_image` must let uid 65534 run `socat`, and `:agent_port` must be
+1024–65535 (`{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`, before
+any request). `fork` is not decorative: a single-slot forwarder
 (`busybox nc -e`) dropped two of three concurrent requests in testing, and
 `Backend.Sandboxd` holds a long-lived chunked stream open for the whole session.
 
@@ -457,12 +460,23 @@ stack's HostConfig with `host_config:`:
 * **Weakening keys** — `:cap_add`, `no_new_privileges: false`,
   `readonly_rootfs: false`, a root `user:` (`:user`), a `kind: :host_path` mount on
   a sidecar, read-only or not (`:host_path`), and a `:tmpfs` entry whose options
-  leave out `noexec` or `nosuid` or name `exec`/`suid` (`:tmpfs_exec`) — must each
+  leave out `noexec` or `nosuid` or name `exec`/`suid` (`:tmpfs_exec`; the flags
+  are enforced on Compose only, because on Kubernetes a tmpfs is an `emptyDir`,
+  which mounts exec) — must each
   also be named in the service's `weaken: [...]` list, or `acquire/1` refuses with
   `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`. `user:` is a
   uid or a lowercase name, optionally `:group`; root is decided numerically, so
   `"0"`, `"00"`, `"0:1000"` and `"root"` all need `weaken: [:user]`, and `"+0"` or
   `" 0"` is not a valid user at all. Env keys must match `[A-Za-z_][A-Za-z0-9_]*`.
+* **A sidecar's image default user** counts as its `user:` when it sets none.
+  Before anything is created, `acquire/1` reads it with `GET /images/{image}/json`
+  and holds a root default (no `USER`, `root` or uid 0) to the same
+  `weaken: [:user]` rule, `{:error, {:compose, {:weakening_not_declared,
+  {service, :user}}}}`. This is Kubernetes' `runAsNonRoot` done by the provider.
+  The presets all set `user:`, so they skip the read. The providers never pull,
+  so an image the daemon lacks is `{:error, {:compose, {:image_not_found,
+  {service, image}}}}` at the same point. The sandbox is exempt, as on
+  Kubernetes, and the forwarder runs as `nobody`.
 * **`privileged`** is refused outright, `{:error, {:compose, {:privileged_refused,
   service}}}`, declared or not.
 
@@ -930,9 +944,14 @@ reaches to what it is for: an `ip_block` inside RFC 1918, CGNAT or ULA space or 
 least a /24 (IPv4) or /56 (IPv6), else `{:k8s, {:external_too_broad, {name, cidr}}}`;
 no `egress: :allow` (`{:k8s, {:external_egress_forbidden, name}}`); and no port 53
 or `kube-system` selector without `allow_dns: true` in the target
-(`{:k8s, {:external_dns_not_declared, {name, 53 | "kube-system"}}}`). A service
-container with no `user:` runs with `runAsNonRoot: true` unless `weaken: [:user]`
-says otherwise.
+(`{:k8s, {:external_dns_not_declared, {name, 53 | "kube-system"}}}`). The DNS check
+is best-effort. It matches namespace-selector values only, so a selector reaching
+`kube-system` by another label, or an `ip_block` covering the DNS Pods, goes
+undetected. It also knows only port 53, so it misses a resolver on 5353 (OpenShift).
+A service container with no `user:` runs with `runAsNonRoot: true` unless
+`weaken: [:user]` says otherwise. A `host_config.tmpfs` entry becomes an in-memory
+`emptyDir` sized by its `size=`, and its other options are dropped. `noexec,nosuid`
+cannot be expressed, so the browser preset's `/tmp` is executable on Kubernetes.
 
 ### No DNS: `hostAliases` instead
 
@@ -960,15 +979,19 @@ seconds and the sidecar carries a `preStop` sleep (Kubernetes 1.30). A drained P
 keeps running through its grace, so `destroy/1` waits for it to be gone (grace plus
 10 s) before deleting its NetworkPolicies; one still there at the deadline keeps
 its policy for the sweep. The same holds for a drained `:separate` service Pod and
-its own policy.
+its own policy. The order follows reach. A `:separate` Pod on `sbx`, which the
+sandbox Pod can reach and a drained `:pod` shipper may still be sending to, is
+deleted only once the sandbox Pod's wait is over. Every other `:separate` Pod is
+deleted alongside the sandbox Pod, and all the waits overlap, each against its own
+deadline. The derived Services, ConfigMaps and Secrets go after every wait.
 
 A service's `env` never reaches a Pod spec. Each service with a non-empty `env`
 gets a per-session Secret, `cc-<session_key>-<service>-env`, labelled
 `crowd_control.session`, `crowd_control.owner_hash`, `crowd_control.service` and
 `crowd_control.role=service-secret`, with one key per variable; its container reads
 each through `valueFrom.secretKeyRef`, `:pod` sidecars included, and the
-`crowd_control.services` annotation holds no values. Env names must be valid
-Secret keys, or the spec is `{:k8s, {:bad_service, {name, :env}}}` before any
+`crowd_control.services` annotation holds no values. Env names must match
+`[A-Za-z_][A-Za-z0-9_]*`, as on Compose, or the spec is `{:k8s, {:bad_service, {name, :env}}}` before any
 request. The Secret is deleted with the session's other objects, needs `secrets`
 RBAC (`create, get, list, delete`), and is readable by anyone with `get secrets` in
 the namespace. `:files` stay configuration: the ConfigMap's payload, binary content

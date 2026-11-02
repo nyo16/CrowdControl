@@ -54,8 +54,9 @@ defmodule CrowdControl.Preset.Browser do
 
   Resources follow playwright.dev's container advice: a 1 GiB `/dev/shm`
   (Compose `ShmSize`, Kubernetes an in-memory `emptyDir`), an init, and a
-  512 MiB in-memory `/tmp` (`noexec`, `nosuid`), where Chromium keeps its
-  profile.
+  512 MiB in-memory `/tmp`, where Chromium keeps its profile. The `/tmp` is
+  `noexec,nosuid` on Compose only: on Kubernetes it is an `emptyDir`, which
+  mounts exec (see SECURITY.md).
   """
 
   @ws_port 3000

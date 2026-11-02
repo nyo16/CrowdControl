@@ -110,6 +110,14 @@ bounding, and the rest is the callback's job:
   `"tool call not approved"`, runs nothing, and emits a decision event with
   `source: :gate`. What the gate has learnt is persisted with the session, so
   a reattached session keeps it. Without `:can_use_tool` nothing is gated.
+- **A tightening the CLI refuses leaves the gate where it was.** The gate
+  follows `set_permission_mode/2` only once the CLI acknowledges the new
+  mode. If the CLI answers with an error, or no answer arrives in time, the
+  gate keeps its previous mode and the call returns `{:error, _}`. That error
+  may be forged by anything that can write to the CLI's control channel
+  inside the sandbox. A failed tightening, `bypassPermissions` to `default`
+  say, therefore leaves SDK tools pre-approved: treat that session as
+  untightened, and retry or stop it.
 - **Pending requests are capped.** At most `:max_pending_control` (default
   64) requests wait on an answer at once. Past that, a new request is answered
   at once with an error — a deny for `can_use_tool` (decision event
@@ -252,7 +260,10 @@ control — so `/tmp` can stage and execute a binary even under
 `readOnlyRootFilesystem: true`. Verified on `v1.34.8+orb1`. Enabling
 `:readonly_rootfs` is still worth it, because it stops writes everywhere except
 the mounted volumes, but it does not make those volumes non-executable and must
-not be read as if it did.
+not be read as if it did. The same goes for a service's `host_config.tmpfs`:
+on Kubernetes each entry becomes an in-memory `emptyDir` sized by its `size=`,
+and its other options, `noexec,nosuid` included, are dropped. The browser
+preset's `noexec,nosuid` `/tmp` therefore holds on Compose only.
 
 **Two settings are requirements, not options.** Neither has a Docker analogue,
 and neither is overridable:
@@ -389,9 +400,17 @@ sweep.
 sidecar is deleted with a grace period and keeps running through it, and its
 NetworkPolicy is what keeps it contained. So `destroy/1` waits for that Pod to
 be gone (its grace plus 10 s) before deleting the policies, and the same for a
-drained `:separate` service Pod and its own policy. A Pod still there at the
-deadline, or one whose DELETE failed, keeps its policy, and the orphan sweep,
-which counts a terminating Pod as live, removes it later. Every object carries
+drained `:separate` service Pod and its own policy. A `:separate` service the
+sandbox Pod can reach outlives the sandbox Pod, because a drained sidecar may
+still be shipping to it. That means a service on `sbx`, and its Pod is deleted
+only once the sandbox Pod's wait is over. Every other `:separate` Pod is
+deleted alongside the sandbox Pod, and the waits overlap. Only direct reach
+counts: if a service on `sbx` forwards onward, the peers it forwards to are not
+held back. A Pod still there at the deadline, or one whose DELETE failed, keeps
+its policy, and the orphan sweep, which counts a terminating Pod as live,
+removes it later. If the sandbox Pod is not confirmed gone by its own deadline,
+the `sbx` services are still deleted then, and only the sandbox's policy stays.
+Every object carries
 a `crowd_control.sweep_after_ms` annotation (provision time plus the session's
 `:provision_timeout` plus `:orphan_margin_ms`, default a minute), and the sweep
 leaves it alone until then, so an in-flight provision is never swept. Under
@@ -406,7 +425,13 @@ RFC 1918, CGNAT or ULA space or be at least a /24 (IPv4) or /56 (IPv6)
 `egress: :allow` on one is `{:k8s, {:external_egress_forbidden, name}}`; and
 port 53 or a selector reaching `kube-system` is kube-dns, refused unless the
 target says `allow_dns: true`
-(`{:k8s, {:external_dns_not_declared, {name, 53 | "kube-system"}}}`).
+(`{:k8s, {:external_dns_not_declared, {name, 53 | "kube-system"}}}`). That
+check is best-effort, not a proof that the target cannot reach a resolver. It
+matches namespace-selector *values* only (or, with no namespace selector, a
+session namespace of `kube-system`), so it misses a selector that reaches
+`kube-system` by another label and an `ip_block` that covers the DNS Pods. It
+also knows port 53 only, so it misses a resolver on another port (OpenShift's
+5353).
 
 **Services run as non-root unless declared.** A service with no `user:` gets
 `runAsNonRoot: true`, and a root uid (`"0"`, `"00"`, `"0:1000"`) needs
@@ -640,6 +665,21 @@ such stack without making it safer. To opt into the strict model, declare
 the sandbox is not on — the two-tier browser layout is the sandbox on `sbx`,
 the browser on `sbx` and `brw`, and the forward proxy on `brw` only.
 
+**A sidecar's image default user is part of its posture.** A sidecar with no
+`user:` runs as whatever its image declares. So before anything is created,
+`acquire/1` reads that user (`GET /images/{image}/json`, read-only). A root
+default (no `USER`, `root`, or uid 0) is refused with
+`{:error, {:compose, {:weakening_not_declared, {name, :user}}}}` unless the
+service names `:user` in `weaken:`. Setting a non-root `user:` skips the check.
+This is the Compose form of Kubernetes' `runAsNonRoot`. The providers never
+pull, so an image the daemon does not have is
+`{:error, {:compose, {:image_not_found, {name, image}}}}` at the same point,
+rather than a create failure after the networks exist. The check reads the
+image as the daemon has it at `acquire/1`. A tag that is re-pointed before the
+create is not checked again, which can't happen to an image pinned by digest.
+The sandbox is exempt, as on Kubernetes, where its `runAsNonRoot` is opt-in
+through `:run_as_user`.
+
 **The capture file is the sandbox's alone.** A sidecar that reads the
 transcript must mount the sandbox's capture volume (the same named volume or
 host path) `read_only: true`, and no service may stage `:files` under the
@@ -668,6 +708,10 @@ strong. The documented limits of `enable_ip_masquerade=false` apply to the
 forwarder and to nothing else in the stack: it is "no NAT", not "dropped". The
 forwarder runs `socat` and no attacker-controlled code, which is why that weaker
 posture is acceptable there and would not be for the sandbox.
+The forwarder runs as `nobody` (`65534:65534`), whatever its image's default. A process
+that isn't root cannot bind a privileged port, so `:agent_port` must be
+1024–65535, or `acquire/1` refuses with
+`{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}` before any request.
 
 **Credentials.** With `:proxy_service` named, the provider mints a per-session
 token, sets `ANTHROPIC_BASE_URL` to the proxy's network alias and
@@ -873,10 +917,12 @@ redirects), so this library does not rely on them.
 
 - **Chromium runs with `--no-sandbox`.** Playwright launches it that way by
   default (`chromiumSandbox: false`), and the example image does not change
-  it. The container's isolation — the hardened service defaults (dropped
-  capabilities, `no-new-privileges`), a `noexec,nosuid` `/tmp`, and the
-  network layer above — is the boundary, so a renderer compromise is a
-  compromise of the browser container.
+  it. The container's isolation is the boundary: the hardened service
+  defaults (dropped capabilities, `no-new-privileges`), a `noexec,nosuid`
+  `/tmp` on Compose (on Kubernetes it is an in-memory `emptyDir`, which mounts
+  exec; see [the Kubernetes backend](#the-kubernetes-backend)), and the
+  network layer above. A renderer compromise is therefore a compromise of the
+  browser container.
 - **The `ccpw_` token is in the MCP child's argv.** `browser-sidecar.mjs`
   starts `playwright mcp` with `--endpoint ws://127.0.0.1:3000/<token>`, so
   anything that can list processes inside the browser container can read it.

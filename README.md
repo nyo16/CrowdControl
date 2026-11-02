@@ -1582,7 +1582,7 @@ endpoints, so the stack is synthesized directly.
 |--------|---------|-------|
 | `:services` | `[]` | Sidecar specs; a spec named `:sandbox_service` *is* the sandbox |
 | `:sandbox_service` | `"sandbox"` | |
-| `:forwarder_service` / `:forwarder_image` | `"forwarder"` / `alpine/socat:1.8.1.3` | Always synthesized, never caller-supplied |
+| `:forwarder_service` / `:forwarder_image` | `"forwarder"` / `alpine/socat:1.8.1.3` | Always synthesized, never caller-supplied; runs as `nobody`, so `:agent_port` must be ≥ 1024 |
 | `:network` | `[internal: true, driver: "bridge"]` | |
 | `:volumes` | `[]` | Named volume **declarations**, created as `<project>-<name>` and destroyed with the stack. A service mounts one through its own `:volumes` — see [Mounting volumes](#mounting-volumes) |
 | `:ready` | `%{}` | Per-service healthchecks, gating start order |
@@ -1596,7 +1596,9 @@ Agent and hardening options are the Docker provider's, and hardening is the
 `host_config:`: resource keys (`:shm_size`, `:init`, `:pids_limit`, `:memory`,
 `:cpus`, `:tmpfs`) freely, weakening keys (`:cap_add`, `no_new_privileges:
 false`, `readonly_rootfs: false`, a root `user:`) only when also named in its
-`weaken: [...]` list, and `privileged` never. Per-service networks and any
+`weaken: [...]` list, and `privileged` never. A sidecar with no `user:` whose
+image defaults to root needs `weaken: [:user]` too; the provider reads the image's
+user before creating anything. Per-service networks and any
 `egress: :allow` sidecar need Docker Engine ≥ 25.0.5 (CVE-2024-29018). See
 [docs/providers.md](docs/providers.md) for the rules.
 
