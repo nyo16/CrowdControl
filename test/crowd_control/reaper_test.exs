@@ -516,4 +516,77 @@ defmodule CrowdControl.ReaperTest do
       assert Mock.destroyed(ctl) == ["k-orphan2"]
     end
   end
+
+  defmodule SweepingBackend do
+    @moduledoc false
+    # A backend with objects beside its sandboxes (Kubernetes with :services):
+    # it exports sweep_orphans/1, which reports its call to the test and
+    # answers whatever the config says. Defined before use, as above.
+    @behaviour CrowdControl.Backend
+
+    def reattachable?, do: true
+    def provision(_), do: {:ok, %{}}
+    def exec(h, _, _, _), do: {:ok, h}
+    def start_reader(_, _, _), do: {:ok, spawn(fn -> :ok end)}
+    def write(_, _), do: :ok
+    def await_exit(_, _), do: {:ok, 0}
+    def alive?(_), do: true
+    def reattach(h, _), do: {:ok, h}
+    def destroy(_), do: :ok
+    def list_live(opts), do: Keyword.fetch!(opts, :list_live)
+
+    def sweep_orphans(opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:sweep_orphans, opts})
+      Keyword.fetch!(opts, :sweep)
+    end
+  end
+
+  describe "orphan sweep (blocker: service objects outliving a crashed provision)" do
+    test "runs after a successful list_live, with the owner, and reports what it swept",
+         %{owner: owner} do
+      reaper =
+        start_reaper(
+          backends: [{SweepingBackend, list_live: {:ok, []}, sweep: {:ok, 3}, test_pid: self()}],
+          supervisor: start_sup()
+        )
+
+      assert %{swept: 3, skipped: 0} = Reaper.sweep(reaper)
+      assert_received {:sweep_orphans, opts}
+      assert opts[:owner] == owner
+    end
+
+    test "never runs when list_live failed — the same positive-evidence rule" do
+      reaper =
+        start_reaper(
+          backends: [
+            {SweepingBackend,
+             list_live: {:error, :unreachable}, sweep: {:ok, 9}, test_pid: self()}
+          ],
+          supervisor: start_sup()
+        )
+
+      assert %{swept: 0, skipped: 1} = Reaper.sweep(reaper)
+      refute_received {:sweep_orphans, _}
+    end
+
+    test "a failed sweep fails open and leaves the reconciliation's counts alone" do
+      reaper =
+        start_reaper(
+          backends: [
+            {SweepingBackend, list_live: {:ok, []}, sweep: {:error, :forbidden}, test_pid: self()}
+          ],
+          supervisor: start_sup()
+        )
+
+      assert %{swept: 0, skipped: 0, destroyed: 0, pruned: 0} = Reaper.sweep(reaper)
+      assert_received {:sweep_orphans, _}
+    end
+
+    test "a backend without sweep_orphans/1 sweeps nothing" do
+      ctl = start_supervised!({Mock, events: []})
+      Mock.set_live(ctl, [])
+
+      assert %{swept: 0} = Reaper.sweep(start_mock_reaper(ctl))
+    end
+  end
 end

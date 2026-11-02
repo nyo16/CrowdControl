@@ -842,8 +842,13 @@ defmodule CrowdControl.Provider.Compose do
   # so it is stripped from `config` on the way to disk, and it is not a struct
   # field. The sandbox and the proxy both hold it; nothing else needs to
   # remember it.
+  #
+  # The `ccst_` prefix is what lets a log shipper find it: 32 random bytes have
+  # no shape a redaction regex can match, and the sandbox prints its environment
+  # into the transcript as readily as anything else.
+  # `CrowdControl.Preset.LogShipper` redacts `ccst_` by default.
   defp mint_session_token do
-    32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    "ccst_" <> (32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false))
   end
 
   # --- labels ---
@@ -1377,8 +1382,17 @@ defmodule CrowdControl.Provider.Compose do
       role = if spec_name(spec) == sandbox, do: :sandbox, else: :sidecar
 
       case Service.normalize(spec, role) do
-        {:ok, service} -> {:ok, service}
-        {:error, reason} -> {:error, {:compose, reason}}
+        # An `{:external, _}` placement needs no image on Kubernetes, where it
+        # creates nothing. Here every service is a container, and placement is
+        # ignored, so an image-less one is the same mistake it always was.
+        {:ok, %Service{image: nil, role: :sidecar, name: name}} ->
+          {:error, {:compose, {:image_required, name}}}
+
+        {:ok, service} ->
+          {:ok, service}
+
+        {:error, reason} ->
+          {:error, {:compose, reason}}
       end
     end)
   end

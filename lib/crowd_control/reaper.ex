@@ -50,6 +50,18 @@ defmodule CrowdControl.Reaper do
   `crowd_control.created_at` label, protects a container created by a node that
   has not yet written its store record from being destroyed mid-provision.
 
+  ## Objects beside the sandbox
+
+  A backend that creates objects *before* its sandbox — `Backend.Kubernetes`
+  with `:services` makes ConfigMaps, NetworkPolicies, Services and Pods first —
+  can leave them behind when it dies in between, with no sandbox for
+  `list_live/1` to report. Such a backend exports `sweep_orphans/1`, and each
+  sweep calls it after that backend's `list_live/1` succeeded (never after a
+  failure — the same positive-evidence rule), failing open: an error is logged
+  and nothing is deleted. The backend re-checks the raw owner of every object
+  itself, as `owned_by?/3` does here, and applies its own age floor. The count
+  is reported as `swept`.
+
   ## Configuration
 
       config :crowd_control,
@@ -91,7 +103,8 @@ defmodule CrowdControl.Reaper do
           reattached: non_neg_integer(),
           destroyed: non_neg_integer(),
           pruned: non_neg_integer(),
-          skipped: non_neg_integer()
+          skipped: non_neg_integer(),
+          swept: non_neg_integer()
         }
   def sweep(server \\ __MODULE__, timeout \\ 30_000) do
     GenServer.call(server, :sweep, timeout)
@@ -139,7 +152,7 @@ defmodule CrowdControl.Reaper do
   # --- Reconciliation ---
 
   defp reconcile(state) do
-    empty = %{reattached: 0, destroyed: 0, pruned: 0, skipped: 0}
+    empty = %{reattached: 0, destroyed: 0, pruned: 0, skipped: 0, swept: 0}
 
     Enum.reduce(state.backends, empty, fn backend_spec, acc ->
       {module, config} = normalize_backend(backend_spec)
@@ -153,7 +166,9 @@ defmodule CrowdControl.Reaper do
 
     case safe_list_live(module, config) do
       {:ok, live} ->
-        do_reconcile(state, module, owner, live)
+        state
+        |> do_reconcile(module, owner, live)
+        |> Map.put(:swept, sweep_orphans(module, config))
 
       {:error, reason} ->
         # FAIL-OPEN. Never infer "nothing is live" from a failed listing --
@@ -163,7 +178,7 @@ defmodule CrowdControl.Reaper do
             "skipping this backend. No sandboxes will be destroyed or pruned."
         )
 
-        %{reattached: 0, destroyed: 0, pruned: 0, skipped: 1}
+        %{reattached: 0, destroyed: 0, pruned: 0, skipped: 1, swept: 0}
     end
   end
 
@@ -178,6 +193,34 @@ defmodule CrowdControl.Reaper do
     pruned = prune_stale(module, records, live_by_key)
 
     %{reattached: reattached, destroyed: destroyed, pruned: pruned, skipped: 0}
+  end
+
+  # See "Objects beside the sandbox". Runs after the reconciliation above, so
+  # a stale record's `destroy/1` has already had its chance to remove the
+  # objects by name.
+  defp sweep_orphans(module, config) do
+    if function_exported?(module, :sweep_orphans, 1) do
+      case safe_sweep(module, config) do
+        {:ok, count} ->
+          count
+
+        {:error, reason} ->
+          Logger.warning(
+            "Reaper: #{inspect(module)} sweep_orphans failed (#{inspect(reason)}); " <>
+              "nothing was swept."
+          )
+
+          0
+      end
+    else
+      0
+    end
+  end
+
+  defp safe_sweep(module, config) do
+    Backend.safe(fn -> module.sweep_orphans(config) end, {:error, :sweep_orphans_exited})
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
   end
 
   # live + stored -> reattach

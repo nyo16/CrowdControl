@@ -82,6 +82,17 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
                gate(services: [%{name: "proxy", egress: :none}])
     end
 
+    test "an {:external, _} placement buys no image here: placement is ignored, so it is a container" do
+      external = %{
+        name: "aggregator",
+        egress: :none,
+        ports: [6000],
+        placement: {:external, %{ip_block: "10.0.0.0/8"}}
+      }
+
+      assert {:error, {:compose, {:image_required, "aggregator"}}} = gate(services: [external])
+    end
+
     test "refuses duplicate service names" do
       specs = [
         %{name: "proxy", image: "i", egress: :none},
@@ -495,6 +506,10 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       assert "ANTHROPIC_API_KEY=sk-real-secret" in proxy_env
       assert ["CC_SESSION_TOKEN=" <> token] = Enum.filter(proxy_env, &(&1 =~ "CC_SESSION_TOKEN"))
       assert ("ANTHROPIC_API_KEY=" <> token) in sandbox_env
+
+      # Prefixed, so a log shipper's redaction can find it (B6.4).
+      assert "ccst_" <> random = token
+      assert byte_size(random) == 43
     end
 
     test "an explicit :session_token is used rather than a minted one", %{specs: specs} do
@@ -1281,6 +1296,43 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       refute Enum.any?(connects, &(elem(&1, 1) == "ctr-sandbox"))
 
       assert handle.networks == [@project <> "-brw"]
+    end
+
+    test "Preset.browser_stack/1's Compose output is accepted as is, in the two-tier layout" do
+      {services, networks, _overrides} =
+        CrowdControl.Preset.browser_stack(
+          substrate: :compose,
+          proxy: [image: "smokescreen:1", allow_domains: ["example.com"], nc: true],
+          browser: [image: "browser:1"]
+        )
+
+      {_handle, _endpoint, requests} = acquire!(services: services, networks: networks)
+
+      assert container_body(requests, "browser")["NetworkingConfig"] == %{
+               "EndpointsConfig" => %{(@project <> "-sbx") => %{"Aliases" => ["browser"]}}
+             }
+
+      proxy = container_body(requests, "egress-proxy")
+      assert proxy["HostConfig"]["NetworkMode"] == @project <> "-brw"
+      assert proxy["User"] == "65532:65532"
+      assert ["/bin/sh", "-c", "exec smokescreen " <> _] = proxy["Entrypoint"]
+      assert proxy["Healthcheck"]["Test"] == ["CMD", "nc", "-z", "127.0.0.1", "4750"]
+
+      browser = container_body(requests, "browser")["HostConfig"]
+      assert browser["ShmSize"] == 1_073_741_824
+      assert browser["Init"] == true
+      assert browser["Tmpfs"]["/tmp"] == "rw,nosuid,size=512m"
+
+      connects =
+        for r <- requests,
+            r.method == :post and String.ends_with?(r.path, "/connect"),
+            do: {r.path, r.body["Container"]}
+
+      assert {"/networks/#{@project}-brw/connect", "ctr-browser"} in connects
+      assert {"/networks/#{@project}-egress/connect", "ctr-egress-proxy"} in connects
+
+      # The Smokescreen config is staged before start.
+      assert find(requests, :put, "/containers/ctr-egress-proxy/archive")
     end
 
     test "memberships must name sbx or a declared network" do

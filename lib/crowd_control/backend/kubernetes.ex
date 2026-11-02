@@ -35,6 +35,8 @@ defmodule CrowdControl.Backend.Kubernetes do
                  over a long-lived `Kubereq.PodExec` websocket
 
       destroy    DELETE /api/v1/namespaces/{ns}/pods/{pod}?gracePeriodSeconds=0
+                 (the drain budget instead when a :pod sidecar is drained;
+                 then every object the session's :services derived)
 
   Three details are load-bearing and were all established empirically, exactly as
   under Docker:
@@ -179,6 +181,11 @@ defmodule CrowdControl.Backend.Kubernetes do
       `%{"sandbox.gke.io/runtime" => "gvisor"}`
     * `:tolerations` — list of raw toleration maps, needed to schedule onto the
       tainted node pools sandbox runtimes usually run on
+    * `:services` — sidecars, each a `CrowdControl.Service` spec with a
+      required `placement`; see "Services" below
+    * `:sandbox_ports` — the sandbox's own app ports that a `:separate`
+      service sharing `sbx` may reach as `sandbox:<port>` (a dev server under
+      test, from a browser). Creates a ClusterIP Service for the alias
 
   Hardening:
 
@@ -194,13 +201,68 @@ defmodule CrowdControl.Backend.Kubernetes do
     * `:volume_sizes` — per-mount-path size limits, applied under
       `:readonly_rootfs`; default 64Mi, 8Mi for `/var/run`
 
+  `:cap_drop`, `:allow_privilege_escalation` and `:readonly_rootfs` are also
+  every service container's default, overridable per service exactly as on
+  Compose (`host_config:`, weakening keys declared in `weaken:`).
+
+  ## Services
+
+  `:services` takes the same spec maps `CrowdControl.Provider.Compose` does —
+  see `CrowdControl.Service` — plus a **required** `placement`, and
+  `CrowdControl.Backend.Kubernetes.Services` has the full rules:
+
+    * `:pod` — a native sidecar after `cc-init` in the sandbox Pod
+      (Kubernetes ≥ 1.29). It shares the sandbox's network namespace, so
+      `egress: :allow` is refused. A read-only mount of the capture directory
+      is how a log shipper reads the transcript.
+    * `:separate` — its own Pod, ClusterIP Service and NetworkPolicy, named
+      `cc-<session_key>-<name>` (`name` at most 27 characters).
+    * `{:external, target}` — nothing is created; peers sharing its network
+      get an egress rule to the `target` selector or CIDR.
+
+  NetworkPolicy edges come from `networks:` membership, as Compose networks
+  do: the sandbox is on `sbx`, parties sharing a network may reach each
+  other's `ports`, and an `egress: :allow` service — which may not share a
+  network with the sandbox — gets TCP 443 to the internet minus every private
+  range. Nothing gets kube-dns except that service: every Pod carries
+  `hostAliases` mapping its peers' names to their ClusterIPs instead, so
+  `browser:8931` resolves as it does on Compose. Using `:services` requires an
+  explicit `:network`, and runs the enforcement probe below whenever a
+  `:separate` service exists, whatever `:network` says.
+
+  `provision/1` validates every spec and checks the version floor before its
+  first create, then creates in this order: ConfigMaps (`:files`) →
+  NetworkPolicies → Services → service Pods → wait for every service Pod's
+  readiness (one `:provision_timeout` for all) → the sandbox Pod. Any failure
+  runs `destroy/1`, which derives every name from the
+  `crowd_control.services` annotation the sandbox Pod carries and deletes
+  each unconditionally, 404 being success. A crash between the first service
+  object and the sandbox Pod is the one case `destroy/1` cannot reach; the
+  reaper's `sweep_orphans/1` call removes those once they are older than
+  `:provision_timeout` plus a minute and no live sandbox Pod claims their
+  session.
+
+  A service's `env` lands in its Pod object, so it is readable by anyone with
+  `get pods` — credentials belong in an operator-managed Secret, and `:files`
+  (a ConfigMap) is for configuration only.
+
   ## RBAC
 
   The identity this backend runs as needs, in `:namespace`:
 
       pods            create, get, list, delete
       pods/exec       create
-      networkpolicies create, get, delete     # only under :network :deny_all
+      pods/log        get                       # diagnostics on a failed provision
+      events          list                      # diagnostics on a failed provision
+      networkpolicies create, get, list, delete # create/delete under :deny_all or
+                                                # with a :separate service
+      services        create, get, list, delete # :separate services, :sandbox_ports
+      configmaps      create, get, list, delete # services with :files
+
+  `list` on `services`, `configmaps` and `networkpolicies` is what the
+  reaper's orphan sweep needs, so grant it wherever the reaper runs this
+  backend, even before any session uses `:services`; without it the sweep
+  logs a warning and deletes nothing.
   """
 
   @behaviour CrowdControl.Backend
@@ -213,6 +275,9 @@ defmodule CrowdControl.Backend.Kubernetes do
 
   alias CrowdControl.Backend.Credentials
   alias CrowdControl.Backend.Kubernetes.API
+  alias CrowdControl.Backend.Kubernetes.Drain
+  alias CrowdControl.Backend.Kubernetes.Files
+  alias CrowdControl.Backend.Kubernetes.Services
   alias CrowdControl.Backend.Shell
   alias CrowdControl.Store
 
@@ -269,9 +334,17 @@ defmodule CrowdControl.Backend.Kubernetes do
     :env_path,
     :session_key,
     :owner,
+    services: [],
+    sandbox_ports: [],
     config: []
   ]
 
+  @typedoc """
+  `services` are refs (`Services.ref/0`: name, placement, delete grace), never
+  specs — they are persisted, and a spec carries env and files. They and
+  `sandbox_ports` round-trip through the sandbox Pod's annotations, so a
+  handle `list_live/1` rebuilds can still derive every object to delete.
+  """
   @type t :: %__MODULE__{
           pod_name: String.t() | nil,
           namespace: String.t() | nil,
@@ -281,6 +354,8 @@ defmodule CrowdControl.Backend.Kubernetes do
           env_path: String.t(),
           session_key: String.t() | nil,
           owner: String.t() | nil,
+          services: [Services.ref()],
+          sandbox_ports: [pos_integer()],
           config: keyword()
         }
 
@@ -311,12 +386,16 @@ defmodule CrowdControl.Backend.Kubernetes do
         config: opts
       }
 
-      # First, because it is the only one of these that costs nothing to check
-      # and everything below it creates cluster objects.
+      # Every gate before the first request: they cost nothing, and everything
+      # below them talks to the cluster. The version gate is the first request
+      # (a GET), the enforcement probe the first object, and only then does
+      # anything of the session's own exist.
       with :ok <- validate_volumes(handle),
-           :ok <- network_preflight!(handle),
-           :ok <- ensure_network_policy(handle),
-           :ok <- create_pod(handle) do
+           {:ok, services, sandbox_ports} <- validate_services(handle),
+           handle = %{handle | services: Services.refs(services), sandbox_ports: sandbox_ports},
+           :ok <- ensure_versions(opts, Services.version_features(services)),
+           :ok <- network_preflight!(handle, services),
+           :ok <- create_objects(handle, services) do
         {:ok, handle}
       end
     end
@@ -329,8 +408,209 @@ defmodule CrowdControl.Backend.Kubernetes do
     end
   end
 
-  defp create_pod(handle) do
-    with {:ok, _pod} <- API.create_pod(handle.config, pod_manifest(handle)),
+  defp validate_services(handle) do
+    with {:ok, services} <- Services.normalize(handle.config, service_context(handle)),
+         {:ok, ports} <- Services.sandbox_ports(handle.config),
+         :ok <- require_posture(handle.config, services, ports) do
+      {:ok, services, ports}
+    end
+  end
+
+  # Services exist to be reached across a boundary, and the sandbox's side of
+  # that boundary is its `:network`. Leaving it out is the same refusal as
+  # leaving it out beside a `:proxy_url`.
+  defp require_posture(config, services, ports) do
+    if config[:network] == nil and (services != [] or ports != []),
+      do: {:error, {:k8s, :network_policy_required}},
+      else: :ok
+  end
+
+  # Each object exists before anything that refers to it: ConfigMaps before the
+  # Pods that mount them; every NetworkPolicy before the Pod it selects, so no
+  # Pod has a moment without its policy; Services before the Pods whose
+  # `hostAliases` carry their ClusterIPs; service Pods Ready before the
+  # sandbox, so the agent's first request finds them.
+  #
+  # Any failure deletes everything created so far through `destroy/1`, whose
+  # every DELETE treats 404 as success. With no services the sequence, and its
+  # failure behaviour, is exactly what it was before services existed.
+  defp create_objects(handle, services) do
+    with :ok <- created(handle, create_config_maps(handle, services)),
+         :ok <- created(handle, ensure_network_policy(handle, services)),
+         :ok <- created(handle, create_service_policies(handle, services)),
+         {:ok, ips} <- created(handle, create_services(handle, services)),
+         :ok <- created(handle, create_service_pods(handle, services, ips)),
+         :ok <- created(handle, await_services(handle, services)) do
+      create_pod(handle, services, ips)
+    end
+  end
+
+  defp created(_handle, :ok), do: :ok
+  defp created(_handle, {:ok, _value} = ok), do: ok
+
+  defp created(handle, {:error, reason}) do
+    if derives_objects?(handle), do: destroy(handle)
+    {:error, reason}
+  end
+
+  defp derives_objects?(handle), do: handle.services != [] or handle.sandbox_ports != []
+
+  defp create_config_maps(handle, services) do
+    session = %{session_key: handle.session_key, owner: handle.owner, namespace: handle.namespace}
+
+    services
+    |> Enum.filter(&(&1.placement in [:pod, :separate] and &1.files != []))
+    |> each_ok(&API.create_config_map(handle.config, Files.manifest(session, &1.name, &1.files)))
+  end
+
+  defp create_service_policies(handle, services) do
+    ctx = service_context(handle)
+
+    services
+    |> Services.separate()
+    |> each_ok(fn service ->
+      manifest = Services.policy_manifest(ctx, service, services, handle.sandbox_ports)
+      API.create_network_policy(handle.config, manifest)
+    end)
+  end
+
+  # Returns `%{name => ClusterIP}`, the sandbox's own under `"sandbox"`: the
+  # one value only the API server can supply, and what every `hostAliases`
+  # entry is built from.
+  defp create_services(handle, services) do
+    ctx = service_context(handle)
+
+    sandbox =
+      if handle.sandbox_ports == [],
+        do: [],
+        else: [{"sandbox", Services.sandbox_service_manifest(ctx, handle.sandbox_ports)}]
+
+    fronted =
+      for service <- Services.separate(services), service.ports != [] do
+        {service.name, Services.service_manifest(ctx, service)}
+      end
+
+    Enum.reduce_while(sandbox ++ fronted, {:ok, %{}}, fn {name, manifest}, {:ok, ips} ->
+      with {:ok, created} <- API.create_service(handle.config, manifest),
+           {:ok, ip} <- cluster_ip(created, manifest) do
+        {:cont, {:ok, Map.put(ips, name, ip)}}
+      else
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp cluster_ip(%{"spec" => %{"clusterIP" => ip}}, _manifest)
+       when is_binary(ip) and ip not in ["", "None"],
+       do: {:ok, ip}
+
+  defp cluster_ip(_created, manifest),
+    do: {:error, {:k8s, {:no_cluster_ip, get_in(manifest, ["metadata", "name"])}}}
+
+  defp create_service_pods(handle, services, ips) do
+    ctx = service_context(handle)
+
+    services
+    |> Services.separate()
+    |> each_ok(fn service ->
+      aliases = Services.host_aliases(service, services, ips)
+      API.create_pod(handle.config, Services.pod_manifest(ctx, service, aliases))
+    end)
+  end
+
+  # One deadline for all of them rather than one each: the orphan sweep's age
+  # floor is derived from `:provision_timeout`, so the window between the
+  # first service object and the sandbox Pod has to stay inside it.
+  defp await_services(handle, services) do
+    timeout = handle.config[:provision_timeout] || @default_provision_timeout
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    services
+    |> Services.separate()
+    |> each_ok(&await_service(handle, &1, deadline))
+  end
+
+  # Same shape as `await_running/1`: the watch only reports "settled", and the
+  # Pod is re-read to say what it settled into.
+  defp await_service(handle, service, deadline) do
+    name = Services.object_name(handle.session_key, service.name)
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    task =
+      Task.async(fn ->
+        API.wait_until(handle.config, name, &service_settled?/1, remaining)
+      end)
+
+    case Task.yield(task, remaining + 5_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, _} -> classify_service(service.name, API.get_pod(handle.config, name))
+      _ -> {:error, {:k8s, {:service_not_ready, service.name, :timeout}}}
+    end
+  end
+
+  defp service_settled?(:deleted), do: true
+
+  defp service_settled?(pod) do
+    pod_ready?(pod) or phase(pod) in ["Succeeded", "Failed"] or
+      waiting_reason(pod) in @fatal_waiting
+  end
+
+  defp classify_service(name, {:ok, pod}) do
+    waiting = waiting_reason(pod)
+
+    cond do
+      pod_ready?(pod) -> :ok
+      waiting in @fatal_waiting -> service_not_ready(name, waiting)
+      phase(pod) in ["Succeeded", "Failed"] -> service_not_ready(name, phase(pod))
+      true -> service_not_ready(name, :timeout)
+    end
+  end
+
+  defp classify_service(_name, {:error, reason}), do: {:error, reason}
+
+  defp service_not_ready(name, reason) do
+    Logger.warning(
+      "Kubernetes provision: service #{name} never became ready (#{inspect(reason)})"
+    )
+
+    {:error, {:k8s, {:service_not_ready, name, reason}}}
+  end
+
+  defp pod_ready?(pod) do
+    pod
+    |> get_in(["status", "conditions"])
+    |> List.wrap()
+    |> Enum.any?(&(&1["type"] == "Ready" and &1["status"] == "True"))
+  end
+
+  defp each_ok(items, fun) do
+    Enum.reduce_while(items, :ok, fn item, :ok ->
+      case fun.(item) do
+        :ok -> {:cont, :ok}
+        {:ok, _value} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  @doc false
+  # What `Services`' manifests need from a handle. Exported so the manifests
+  # are assertable through the same context provisioning builds.
+  @spec service_context(t()) :: Services.ctx()
+  def service_context(%__MODULE__{} = handle) do
+    capture_dir = Path.dirname(handle.tee_path)
+
+    %{
+      session_key: handle.session_key,
+      owner: handle.owner,
+      namespace: handle.namespace,
+      config: handle.config,
+      capture_dir: capture_dir,
+      capture_volume: volume_name(capture_dir)
+    }
+  end
+
+  defp create_pod(handle, services, ips) do
+    with {:ok, _pod} <- API.create_pod(handle.config, pod_manifest(handle, services, ips)),
          :ok <- await_running(handle) do
       :ok
     else
@@ -469,8 +749,16 @@ defmodule CrowdControl.Backend.Kubernetes do
   # Docker-parity table, plus the two k8s-only requirements, is a pure property
   # of this map. See kubernetes_unit_test.exs.
   @spec pod_manifest(t()) :: map()
-  def pod_manifest(%__MODULE__{} = handle) do
+  def pod_manifest(%__MODULE__{} = handle), do: pod_manifest(handle, [], %{})
+
+  @doc false
+  # The same, for a session with `:services` (normalized, from
+  # `Services.normalize/2`) and the ClusterIPs `create_services/2` read back.
+  @spec pod_manifest(t(), [CrowdControl.Service.t()], %{String.t() => String.t()}) :: map()
+  def pod_manifest(%__MODULE__{} = handle, services, ips) do
     config = handle.config
+    ctx = service_context(handle)
+    in_pod = Services.in_pod(services)
 
     %{
       "apiVersion" => "v1",
@@ -478,10 +766,13 @@ defmodule CrowdControl.Backend.Kubernetes do
       "metadata" => %{
         "name" => handle.pod_name,
         "namespace" => handle.namespace,
+        # `role` is what keeps `list_live/1` from mistaking a service Pod —
+        # which carries the same session and owner labels — for a sandbox.
         "labels" => %{
           "crowd_control.session" => handle.session_key,
           "crowd_control.owner_hash" => owner_label(handle.owner),
-          "crowd_control.created_at" => to_string(System.system_time(:millisecond))
+          "crowd_control.created_at" => to_string(System.system_time(:millisecond)),
+          "crowd_control.role" => "sandbox"
         },
         # Annotation VALUES are unconstrained, so the raw owner lives here and
         # Reaper.owned_by?/3 keeps comparing exact strings. The KEY has no "/"
@@ -495,12 +786,19 @@ defmodule CrowdControl.Backend.Kubernetes do
         # file that does not exist, with a byte offset that referred to another
         # file entirely. The paths are provisioning facts about this sandbox, so
         # they belong on the object rather than in whichever process asks about it.
-        "annotations" => %{
-          "crowd_control.owner" => to_string(handle.owner),
-          "crowd_control.tee_path" => handle.tee_path,
-          "crowd_control.fifo_path" => handle.fifo_path,
-          "crowd_control.env_path" => handle.env_path
-        }
+        #
+        # `services` and `sandbox_ports` are here for the same reason: they are
+        # what `destroy/1` derives every other object's name from, and a handle
+        # rebuilt by `list_live/1` has nothing else to go on.
+        "annotations" =>
+          %{
+            "crowd_control.owner" => to_string(handle.owner),
+            "crowd_control.tee_path" => handle.tee_path,
+            "crowd_control.fifo_path" => handle.fifo_path,
+            "crowd_control.env_path" => handle.env_path
+          }
+          |> maybe_put("crowd_control.services", Services.encode_refs(Services.refs(services)))
+          |> maybe_put("crowd_control.sandbox_ports", encode_ports(handle.sandbox_ports))
       },
       "spec" =>
         %{
@@ -514,10 +812,13 @@ defmodule CrowdControl.Backend.Kubernetes do
           # credential, and service links map the cluster into its env.
           "automountServiceAccountToken" => false,
           "enableServiceLinks" => false,
-          "initContainers" => [init_container_spec(handle)],
+          "initContainers" => [init_container_spec(handle) | Services.sidecars(ctx, in_pod)],
           "containers" => [container_spec(handle)],
-          "volumes" => volumes(handle)
+          "volumes" => volumes(handle) ++ Services.sidecar_volumes(ctx, in_pod)
         }
+        # No DNS: every peer the sandbox may reach is pinned to its ClusterIP.
+        |> maybe_put("hostAliases", presence(Services.host_aliases(:sandbox, services, ips)))
+        |> maybe_put("terminationGracePeriodSeconds", Drain.termination_grace_period(in_pod))
         |> put_pod_security_context(config)
         |> put_scheduling(config)
     }
@@ -1522,8 +1823,15 @@ defmodule CrowdControl.Backend.Kubernetes do
   @impl true
   def destroy(%__MODULE__{pod_name: nil}), do: :ok
 
+  # Map.get rather than the struct fields: a handle persisted before services
+  # existed comes back from the Store without the keys.
   def destroy(%__MODULE__{pod_name: name} = handle) do
-    result = API.delete_pod(handle.config, name)
+    refs = Map.get(handle, :services) || []
+
+    # Grace 0 unless a `:pod` sidecar is drained: a log shipper SIGKILLed
+    # mid-flush loses the transcript's tail. See `Kubernetes.Drain`.
+    result = API.delete_pod(handle.config, name, Services.sandbox_grace(refs))
+    _ = delete_derived(handle, refs)
     _ = delete_managed_policy(handle)
 
     case result do
@@ -1542,14 +1850,60 @@ defmodule CrowdControl.Backend.Kubernetes do
     end
   end
 
+  # Every name the session's services derived, unconditionally, each 404 being
+  # success — the same reasoning as `delete_managed_policy/1` below, and the
+  # same reason it never reads `config[:services]`: a handle `list_live/1`
+  # rebuilt carries the caller's config, not the provisioning one. The refs
+  # come off the sandbox Pod's annotation instead, and every name derived from
+  # them is one this backend minted.
+  defp delete_derived(handle, refs) do
+    sandbox_service? = (Map.get(handle, :sandbox_ports) || []) != []
+
+    for object <- Services.derived_objects(handle.session_key, refs, sandbox_service?) do
+      case delete_object(handle.config, object) do
+        {:ok, _} ->
+          :ok
+
+        {:error, {:k8s, {:not_found, _}}} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "Kubernetes destroy: #{inspect(object)} not deleted: #{inspect(reason)}; " <>
+              "the reaper's orphan sweep will retry it"
+          )
+      end
+    end
+  end
+
+  defp delete_object(config, {:pod, name, grace}), do: API.delete_pod(config, name, grace)
+  defp delete_object(config, {:service, name}), do: API.delete_service(config, name)
+  defp delete_object(config, {:network_policy, name}), do: API.delete_network_policy(config, name)
+  defp delete_object(config, {:config_map, name}), do: API.delete_config_map(config, name)
+
   @impl true
   def scrub(%__MODULE__{} = handle) do
     # The handle carries the config it was provisioned from, which may include
     # :api_key and :session_token. Store records can be written to disk and
     # outlive the VM, and reattaching needs none of this -- the Pod already
     # holds whatever environment it was started with.
-    %{handle | config: Store.scrub_opts(handle.config)}
+    #
+    # `Store.scrub_opts/1` cannot see into `:services`, and a service's `:env`
+    # is where a credential would live, so the specs lose `:env` and `:files`
+    # too, as under `Provider.Compose.scrub/1`. Teardown needs neither: it
+    # works from the refs.
+    %{handle | config: handle.config |> Store.scrub_opts() |> scrub_services()}
   end
+
+  defp scrub_services(config) do
+    case Keyword.get(config, :services) do
+      specs when is_list(specs) -> Keyword.put(config, :services, Enum.map(specs, &drop_env/1))
+      _ -> config
+    end
+  end
+
+  defp drop_env(spec) when is_map(spec), do: Map.drop(spec, [:env, :files])
+  defp drop_env(spec), do: spec
 
   @impl true
   def list_live(opts) do
@@ -1558,7 +1912,15 @@ defmodule CrowdControl.Backend.Kubernetes do
     # Scoped to this owner, never global: an unscoped list would let one node's
     # reaper destroy another node's Pods. The selector is the hash; the raw
     # owner comes back off the annotation so Reaper.owned_by?/3 can re-check it.
-    selectors = [{"crowd_control.owner_hash", owner_label(owner)}]
+    #
+    # `role!=service`: a service Pod carries the same owner and session labels
+    # as its sandbox, and reported as live it would be "reattached" to, or
+    # destroyed as an orphan sandbox. `!=` rather than `=sandbox` so a sandbox
+    # created before the role label existed still matches.
+    selectors = [
+      {"crowd_control.owner_hash", owner_label(owner)},
+      {"crowd_control.role", {:ne, "service"}}
+    ]
 
     case API.list_all(opts, nil, label_selectors: selectors) do
       {:ok, pods} ->
@@ -1587,6 +1949,8 @@ defmodule CrowdControl.Backend.Kubernetes do
       env_path: sandbox_path(annotations, opts, :env_path, @default_env),
       session_key: labels["crowd_control.session"],
       owner: annotations["crowd_control.owner"] || owner,
+      services: Services.decode_refs(annotations["crowd_control.services"]),
+      sandbox_ports: decode_ports(annotations["crowd_control.sandbox_ports"]),
       config: opts
     }
   end
@@ -1600,6 +1964,148 @@ defmodule CrowdControl.Backend.Kubernetes do
   # annotations shipped, and the module defaults cover the rest.
   defp sandbox_path(annotations, opts, key, default) do
     annotations["crowd_control.#{key}"] || opts[key] || default
+  end
+
+  defp encode_ports([]), do: nil
+  defp encode_ports(ports), do: Enum.join(ports, ",")
+
+  defp decode_ports(annotation) when is_binary(annotation) do
+    annotation
+    |> String.split(",", trim: true)
+    |> Enum.flat_map(fn part ->
+      case Integer.parse(part) do
+        {port, ""} when port in 1..65_535 -> [port]
+        _ -> []
+      end
+    end)
+  end
+
+  defp decode_ports(_annotation), do: []
+
+  # --- orphan sweep ---
+
+  # Past the provision window: `provision/1` spends at most one
+  # `:provision_timeout` between its first service object and the sandbox Pod
+  # (the readiness wait shares one deadline), and the margin covers the create
+  # round trips either side of it.
+  @orphan_margin_ms 60_000
+
+  @doc """
+  Delete the session objects a crash left behind, for `CrowdControl.Reaper`.
+
+  `provision/1` creates a session's ConfigMaps, NetworkPolicies, Services and
+  service Pods *before* its sandbox Pod, and `destroy/1` finds them through
+  the sandbox Pod's annotation — so a VM dying between the two leaves objects
+  nothing will ever name. This finds them by label instead: every object with
+  `crowd_control.role` `service` or `service-config` and this owner's hash,
+  whose session has no live sandbox Pod (Pending or Running, not being
+  deleted), whose raw `crowd_control.owner` annotation matches exactly (the
+  hash is a selector, not proof), and that is older than
+  `:provision_timeout` plus a minute, so an in-flight provision is never
+  swept from under itself.
+
+  All four lists must succeed before anything is deleted; any failure is
+  returned and nothing is touched. Returns how many objects were deleted
+  (404 included: something else got there first).
+  """
+  @spec sweep_orphans(keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def sweep_orphans(config) do
+    owner = config[:owner] || Store.owner_id()
+    by_owner = [{"crowd_control.owner_hash", owner_label(owner)}]
+    services_role = by_owner ++ [{"crowd_control.role", "service"}]
+
+    with {:ok, pods} <- API.list_all(config, nil, label_selectors: by_owner),
+         {:ok, services} <- API.list_services(config, services_role),
+         {:ok, policies} <- API.list_network_policies(config, services_role),
+         {:ok, config_maps} <-
+           API.list_config_maps(config, by_owner ++ [{"crowd_control.role", "service-config"}]) do
+      {service_pods, sandboxes} = Enum.split_with(pods, &(role(&1) == "service"))
+      live = sandboxes |> Enum.filter(&live_sandbox?/1) |> MapSet.new(&session_of/1)
+      floor = (config[:provision_timeout] || @default_provision_timeout) + @orphan_margin_ms
+
+      swept =
+        (Enum.map(service_pods, &{:pod, &1}) ++
+           Enum.map(services, &{:service, &1}) ++
+           Enum.map(policies, &{:network_policy, &1}) ++
+           Enum.map(config_maps, &{:config_map, &1}))
+        |> Enum.filter(fn {_kind, object} -> orphan?(object, live, owner, floor) end)
+        |> Enum.count(&sweep_object(config, &1))
+
+      {:ok, swept}
+    end
+  end
+
+  defp role(object), do: get_in(object, ["metadata", "labels", "crowd_control.role"])
+  defp session_of(object), do: get_in(object, ["metadata", "labels", "crowd_control.session"])
+
+  # A Pod with no phase yet has only just been created: live, not terminal.
+  defp live_sandbox?(pod) do
+    get_in(pod, ["metadata", "deletionTimestamp"]) == nil and
+      phase(pod) not in ["Succeeded", "Failed"]
+  end
+
+  defp orphan?(object, live, owner, floor) do
+    session = session_of(object)
+    annotated = get_in(object, ["metadata", "annotations", "crowd_control.owner"])
+    age = object_age(object)
+
+    cond do
+      not is_binary(session) or MapSet.member?(live, session) ->
+        false
+
+      annotated != owner ->
+        Logger.warning(
+          "Kubernetes sweep: refusing #{inspect(get_in(object, ["metadata", "name"]))} — " <>
+            "owner #{inspect(annotated)} does not match #{inspect(owner)}"
+        )
+
+        false
+
+      # Unknown age is young: a missed sweep costs one interval, a wrong one
+      # breaks a session that is still provisioning.
+      is_nil(age) ->
+        false
+
+      true ->
+        age >= floor
+    end
+  end
+
+  # The label where this backend set one (the same clock `age_ms/1` reads),
+  # else the API server's own `creationTimestamp` — ConfigMaps carry only that.
+  defp object_age(object) do
+    parse_age(get_in(object, ["metadata", "labels", "crowd_control.created_at"])) ||
+      timestamp_age(get_in(object, ["metadata", "creationTimestamp"]))
+  end
+
+  defp timestamp_age(timestamp) when is_binary(timestamp) do
+    case DateTime.from_iso8601(timestamp) do
+      {:ok, created, _offset} ->
+        max(DateTime.diff(DateTime.utc_now(), created, :millisecond), 0)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp timestamp_age(_timestamp), do: nil
+
+  defp sweep_object(config, {kind, object}) do
+    name = get_in(object, ["metadata", "name"])
+
+    target =
+      case kind do
+        :pod -> {:pod, name, 0}
+        other -> {other, name}
+      end
+
+    Logger.info("Kubernetes sweep: deleting orphaned #{kind} #{name}")
+
+    case delete_object(config, target) do
+      {:ok, _} -> true
+      {:error, {:k8s, {:not_found, _}}} -> true
+      {:error, _reason} -> false
+    end
   end
 
   @doc """
@@ -1700,16 +2206,16 @@ defmodule CrowdControl.Backend.Kubernetes do
 
   defp validate_tolerations(other), do: {:error, {:k8s, {:invalid_tolerations, other}}}
 
-  defp ensure_network_policy(%__MODULE__{config: config} = handle) do
+  defp ensure_network_policy(%__MODULE__{config: config} = handle, services) do
     case config[:network] do
-      :deny_all -> create_managed_policy(handle)
+      :deny_all -> create_managed_policy(handle, services)
       {:policy, name} -> assert_policy_exists(config, name)
       _ -> :ok
     end
   end
 
-  defp create_managed_policy(%__MODULE__{config: config} = handle) do
-    case API.create_network_policy(config, network_policy_manifest(handle)) do
+  defp create_managed_policy(%__MODULE__{config: config} = handle, services) do
+    case API.create_network_policy(config, network_policy_manifest(handle, services)) do
       {:ok, _} -> :ok
       # 409 means a previous provision of this exact Pod name already made it,
       # which is the desired end state.
@@ -1751,8 +2257,8 @@ defmodule CrowdControl.Backend.Kubernetes do
   defp policy_name(pod_name), do: pod_name <> "-deny-all"
 
   @doc false
-  @spec network_policy_manifest(t()) :: map()
-  def network_policy_manifest(%__MODULE__{} = handle) do
+  @spec network_policy_manifest(t(), [CrowdControl.Service.t()]) :: map()
+  def network_policy_manifest(%__MODULE__{} = handle, services \\ []) do
     %{
       "apiVersion" => "networking.k8s.io/v1",
       "kind" => "NetworkPolicy",
@@ -1761,16 +2267,32 @@ defmodule CrowdControl.Backend.Kubernetes do
         "namespace" => handle.namespace,
         "labels" => %{
           "crowd_control.session" => handle.session_key,
-          "crowd_control.owner_hash" => owner_label(handle.owner)
+          "crowd_control.owner_hash" => owner_label(handle.owner),
+          "crowd_control.role" => "sandbox"
         }
       },
       # Empty rule lists under both policy types is the canonical deny-all: the
       # Pod is selected, so the default-allow no longer applies, and nothing is
-      # permitted back in.
-      "spec" => %{
-        "podSelector" => %{"matchLabels" => %{"crowd_control.session" => handle.session_key}},
-        "policyTypes" => ["Ingress", "Egress"]
-      }
+      # permitted back in. Services add only named allows — egress to each peer
+      # on `sbx` on its ports, ingress from them to `:sandbox_ports` — and never
+      # kube-dns; see `Services.sandbox_rules/3`.
+      #
+      # `role: sandbox` in the selector is load-bearing: service Pods carry the
+      # same session label, and a policy selecting them too would deny-all the
+      # browser and the proxy on top of their own policies.
+      "spec" =>
+        Map.merge(
+          %{
+            "podSelector" => %{
+              "matchLabels" => %{
+                "crowd_control.session" => handle.session_key,
+                "crowd_control.role" => "sandbox"
+              }
+            },
+            "policyTypes" => ["Ingress", "Egress"]
+          },
+          Services.sandbox_rules(service_context(handle), services, handle.sandbox_ports)
+        )
     }
   end
 
@@ -1798,11 +2320,15 @@ defmodule CrowdControl.Backend.Kubernetes do
   # instance, accepts them and enforces nothing -- so a `:deny_all` sandbox
   # there would report a boundary that does not exist. Prove it once per
   # cluster, cache the answer either way, and refuse to start if it is absent.
-  defp network_preflight!(%__MODULE__{config: config}) do
+  #
+  # A `:separate` service's posture is its own NetworkPolicy, so it needs the
+  # same proof whatever the sandbox's `:network` is.
+  defp network_preflight!(%__MODULE__{config: config}, services) do
     cond do
-      config[:network] != :deny_all -> :ok
       config[:network_probe] == false -> :ok
-      true -> check_enforcement(config)
+      config[:network] == :deny_all -> check_enforcement(config)
+      Services.separate(services) != [] -> check_enforcement(config)
+      true -> :ok
     end
   end
 
@@ -2156,6 +2682,9 @@ defmodule CrowdControl.Backend.Kubernetes do
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp presence([]), do: nil
+  defp presence(list), do: list
 
   defp ensure_kubereq! do
     if Code.ensure_loaded?(Kubereq) do
