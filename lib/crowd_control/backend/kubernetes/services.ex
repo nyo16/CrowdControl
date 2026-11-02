@@ -118,9 +118,6 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
 
   @dns_label ~r/\A[a-z0-9]([-a-z0-9]*[a-z0-9])?\z/
 
-  # The Secret key alphabet: each env name is a key of the service's Secret.
-  @secret_key ~r/\A[-._a-zA-Z0-9]+\z/
-
   @typedoc """
   What `destroy/1` needs to know about one service, persisted on the sandbox
   Pod as the `crowd_control.services` annotation: enough to derive every
@@ -204,7 +201,6 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
          :ok <- check_user(service),
          :ok <- check_mounts(service, ctx),
          :ok <- check_tmpfs(service),
-         :ok <- check_env(service),
          :ok <- check_files(service) do
       check_external(service, ctx.namespace)
     end
@@ -270,14 +266,6 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
         :error -> {:halt, {:error, {:k8s, {:bad_host_config, {name, :tmpfs}}}}}
       end
     end)
-  end
-
-  # Each name becomes a key of the service's Secret, which the API server
-  # would refuse only once other objects exist.
-  defp check_env(%Service{env: env, name: name}) do
-    if Enum.all?(Map.keys(env), &Regex.match?(@secret_key, &1)),
-      do: :ok,
-      else: {:error, {:k8s, {:bad_service, {name, :env}}}}
   end
 
   # `Service.normalize/2` counts raw bytes; the ConfigMap carries binary
