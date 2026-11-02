@@ -43,7 +43,7 @@ defmodule BrowserAgent do
   # endpoints, which can trail Pod readiness by a few seconds, so the
   # stand-in retries a refused connection -- as a real agent would.
   @script ~S"""
-  const { chromium } = require('/usr/lib/node_modules/playwright');
+  const { chromium } = require('playwright');
   const os = require('node:os');
   const say = (o) => process.stdout.write(JSON.stringify(o) + '\n');
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

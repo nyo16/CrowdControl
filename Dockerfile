@@ -1,10 +1,5 @@
 ARG CLAUDE_CODE_VERSION=latest
 
-# The single Playwright pin. The sandbox-browser stage below and the example
-# browser sidecar image (examples/images/browser) must run the same version:
-# a run-server rejects a client of a different minor with 428.
-ARG PLAYWRIGHT_VERSION=1.64.1
-
 # One place, three stages. Bumped from 1.18.3/erlang-27.3 because mix.exs now
 # requires ~> 1.19 (:gcp_compute declares it). Debian bookworm is deliberate and
 # load-bearing for the sandboxd release: an OTP release must be built on the
@@ -194,17 +189,39 @@ ENTRYPOINT ["iex", "-S", "mix"]
 # browsers: they live in the browser sidecar (examples/images/browser), which
 # the agent reaches over ws://browser:3000/<token> or http://browser:8931/mcp.
 # A separate stage so the default image does not carry the npm packages.
+#
+# The single Playwright pin is the PLAYWRIGHT_VERSION file at the repository
+# root; the example browser image is built from the same file, because a
+# run-server rejects a client of a different minor with 428. A
+# --build-arg PLAYWRIGHT_VERSION is not needed, and is refused if it disagrees.
 FROM runtime AS sandbox-browser
 
 ARG PLAYWRIGHT_VERSION
 
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
+# npm -g installs to /usr/lib/node_modules, which Node does not search from
+# the agent's workspace: without this `require('playwright')` and
+# `playwright test` (which needs @playwright/test) fail with MODULE_NOT_FOUND.
+ENV NODE_PATH=/usr/lib/node_modules
+
+# The runtime image's HEALTHCHECK probes a self-hosted CrowdControl, which a
+# sandbox never runs: inherited, it marks every sandbox unhealthy.
+HEALTHCHECK NONE
+
 USER root
+
+COPY PLAYWRIGHT_VERSION /tmp/PLAYWRIGHT_VERSION
 
 # The shim lets the skill's literal `playwright-cli …` commands run on the
 # pinned core rather than the alpha-cored @playwright/cli package.
-RUN npm install -g playwright@${PLAYWRIGHT_VERSION} @playwright/test@${PLAYWRIGHT_VERSION} \
+RUN pin="$(cat /tmp/PLAYWRIGHT_VERSION)" && rm /tmp/PLAYWRIGHT_VERSION \
+    && test -n "${pin}" \
+    && if [ -n "${PLAYWRIGHT_VERSION}" ] && [ "${PLAYWRIGHT_VERSION}" != "${pin}" ]; then \
+         echo "--build-arg PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION} disagrees with the PLAYWRIGHT_VERSION file (${pin})" >&2; \
+         exit 1; \
+       fi \
+    && npm install -g "playwright@${pin}" "@playwright/test@${pin}" \
     && npm cache clean --force \
     && printf '#!/bin/sh\nexec playwright cli "$@"\n' > /usr/local/bin/playwright-cli \
     && chmod 0755 /usr/local/bin/playwright-cli

@@ -9,7 +9,7 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
   # Kubernetes >= 1.30 (native sidecars, preStop sleep), nodes that can run
   # the images Compose uses (see compose_browser_test.exs for the builds; a
   # local cluster sharing the Docker image store, as OrbStack does, needs no
-  # registry), `timberio/vector:0.61.0-distroless-libc`, `busybox:1.36`, and
+  # registry), `@vector_image` (pinned by digest), `busybox:1.36`, and
   # internet egress from the proxy Pod.
   #
   # Two kinds of check, split by what they need from the cluster:
@@ -46,7 +46,8 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
   @sandbox_image "crowd_control/sandbox-browser:dev"
   @browser_image "crowd_control/browser:dev"
   @proxy_image "crowd_control/smokescreen:dev"
-  @vector_image "timberio/vector:0.61.0-distroless-libc"
+  @vector_image "timberio/vector:0.61.0-distroless-libc@" <>
+                  "sha256:1a3451978644d5cd4b99a0b28c990791e2f7e1efbea4184122f1c59a56448143"
 
   @app_port 5173
   @stun_port 3478
@@ -174,7 +175,7 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
         ])
 
       assert upgrade.("1.63.0") == "428"
-      assert upgrade.("1.64.1") == "101"
+      assert upgrade.(P.playwright_version()) == "101"
 
       mcp =
         &(config

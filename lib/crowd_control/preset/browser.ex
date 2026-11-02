@@ -54,7 +54,8 @@ defmodule CrowdControl.Preset.Browser do
 
   Resources follow playwright.dev's container advice: a 1 GiB `/dev/shm`
   (Compose `ShmSize`, Kubernetes an in-memory `emptyDir`), an init, and a
-  512 MiB in-memory `/tmp`, where Chromium keeps its profile.
+  512 MiB in-memory `/tmp` (`noexec`, `nosuid`), where Chromium keeps its
+  profile.
   """
 
   @ws_port 3000
@@ -63,7 +64,7 @@ defmodule CrowdControl.Preset.Browser do
   @default_network "brw"
   @default_user "10001:10001"
   @shm_bytes 1_073_741_824
-  @tmp_options "rw,nosuid,size=512m"
+  @tmp_options "rw,noexec,nosuid,size=512m"
 
   # Every spelling Playwright's `shouldProxyLoopback` treats as "the caller
   # chose loopback handling", which turns its forced `<-loopback>` off.
