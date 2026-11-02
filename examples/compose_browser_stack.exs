@@ -13,7 +13,7 @@
 # Needs Docker >= 25.0.5 and three local images, none of them published:
 #
 #   docker build --target sandbox-browser -t crowd_control/sandbox-browser:dev .
-#   docker build --build-arg PLAYWRIGHT_VERSION=1.64.1 \
+#   docker build --build-arg PLAYWRIGHT_VERSION=$(cat PLAYWRIGHT_VERSION) \
 #     -t crowd_control/browser:dev examples/images/browser
 #   docker build -t crowd_control/smokescreen:dev examples/images/smokescreen
 #
@@ -47,14 +47,15 @@ Application.put_env(:crowd_control, :sandboxd_secret, secret)
 
 # ---------------------------------------------------------------------------
 # The stand-in agent. Node is what the sandbox-browser image has, and the
-# Playwright client in it is the same 1.64.1 the browser runs (a different
-# minor would get a 428 from the run-server).
+# Playwright client in it is the version in PLAYWRIGHT_VERSION, which the
+# browser runs too (a different minor would get a 428 from the run-server).
+# A bare require resolves through the image's NODE_PATH, as an agent's would.
 # ---------------------------------------------------------------------------
 defmodule BrowserAgent do
   @behaviour CrowdControl.Agent
 
   @script ~S"""
-  const { chromium } = require('/usr/lib/node_modules/playwright');
+  const { chromium } = require('playwright');
   const os = require('node:os');
   const say = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 

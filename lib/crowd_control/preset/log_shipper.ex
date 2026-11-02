@@ -83,7 +83,8 @@ defmodule CrowdControl.Preset.LogShipper do
       event's `cc.labels`.
     * `:max_line_bytes` — default `1_048_576`, the session default.
     * `:capture_path` — default `/var/log/cc/out.jsonl`.
-    * `:image` — default `timberio/vector:0.61.0-distroless-libc`.
+    * `:image` — default `timberio/vector:0.61.0-distroless-libc`, pinned by
+      digest.
     * `:user` — default `"65532:65532"` (the image runs as root otherwise).
     * `:drain`, `:shutdown_limit` — defaults `3_000` ms and `20` s.
     * `:sandbox` — Compose: the sandbox service name, default `"sandbox"`;
@@ -102,7 +103,8 @@ defmodule CrowdControl.Preset.LogShipper do
   alias CrowdControl.Preset.YAML
 
   @default_name "vector"
-  @default_image "timberio/vector:0.61.0-distroless-libc"
+  @default_image "timberio/vector:0.61.0-distroless-libc@" <>
+                   "sha256:1a3451978644d5cd4b99a0b28c990791e2f7e1efbea4184122f1c59a56448143"
   @default_user "65532:65532"
   @default_capture "/var/log/cc/out.jsonl"
   # Keep in step with `CrowdControl.Session`'s `:max_line_bytes` default.

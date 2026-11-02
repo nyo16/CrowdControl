@@ -18,7 +18,8 @@ defmodule CrowdControl.Preset.LogShipperVectorTest do
   @moduletag :tmp_dir
   @moduletag timeout: 300_000
 
-  @image "timberio/vector:0.61.0-distroless-libc"
+  @image "timberio/vector:0.61.0-distroless-libc@" <>
+           "sha256:1a3451978644d5cd4b99a0b28c990791e2f7e1efbea4184122f1c59a56448143"
 
   @aggregator %{ip_block: "10.96.0.9/32"}
 

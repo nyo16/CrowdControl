@@ -5,14 +5,14 @@ defmodule CrowdControl.Provider.ComposeBrowserTest do
   # images, none of which is published:
   #
   #     docker build --target sandbox-browser -t crowd_control/sandbox-browser:dev .
-  #     docker build --build-arg PLAYWRIGHT_VERSION=1.64.1 \
+  #     docker build --build-arg PLAYWRIGHT_VERSION=$(cat PLAYWRIGHT_VERSION) \
   #       -t crowd_control/browser:dev examples/images/browser
   #     docker build -t crowd_control/smokescreen:dev examples/images/smokescreen
   #
-  # plus `timberio/vector:0.61.0-distroless-libc` and internet access for the
-  # proxy (example.com and wikipedia.org). No API key: the "CLI" is a shell
-  # loop launched through sandboxd, so the transcript Vector ships is one the
-  # real capture path wrote.
+  # plus `@vector_image` (LogShipper's default, pinned by digest) and internet
+  # access for the proxy (example.com and wikipedia.org). No API key: the
+  # "CLI" is a shell loop launched through sandboxd, so the transcript Vector
+  # ships is one the real capture path wrote.
   #
   #     sbx (internal)                     brw (internal)        egress
   #     sandbox ── browser ─────────────── egress-proxy ──────── internet
@@ -38,7 +38,8 @@ defmodule CrowdControl.Provider.ComposeBrowserTest do
   @sandbox_image "crowd_control/sandbox-browser:dev"
   @browser_image "crowd_control/browser:dev"
   @proxy_image "crowd_control/smokescreen:dev"
-  @vector_image "timberio/vector:0.61.0-distroless-libc"
+  @vector_image "timberio/vector:0.61.0-distroless-libc@" <>
+                  "sha256:1a3451978644d5cd4b99a0b28c990791e2f7e1efbea4184122f1c59a56448143"
   @forwarder_image "alpine/socat:1.8.1.3"
 
   @app_port 5173
@@ -169,8 +170,8 @@ defmodule CrowdControl.Provider.ComposeBrowserTest do
     # The browser reaches the sandbox's dev server (bypassing the proxy).
     assert %{"status" => 200, "title" => "cc-dev", "body" => ^marker} = out["app"]
 
-    # (c) A 1.64.1 client loads an allowlisted page through the proxy, and a
-    # page off the allowlist is a 407 that Chromium names
+    # (c) A client at the pinned version loads an allowlisted page through the
+    # proxy, and a page off the allowlist is a 407 that Chromium names
     # ERR_PROXY_AUTH_UNSUPPORTED.
     assert %{"status" => 200, "title" => "Example Domain"} = out["allowed"]
     assert out["denied"]["error"] =~ "net::ERR_PROXY_AUTH_UNSUPPORTED"
@@ -194,7 +195,7 @@ defmodule CrowdControl.Provider.ComposeBrowserTest do
     # version upgrades.
     upgrade = &node(sandbox_id, P.ws_upgrade(), ["browser", 3000, "/" <> token, P.user_agent(&1)])
     assert upgrade.("1.63.0") == "428"
-    assert upgrade.("1.64.1") == "101"
+    assert upgrade.(P.playwright_version()) == "101"
 
     # (e) MCP answers `initialize` for its own Host and 403s any other.
     mcp = &(sandbox_id |> node(P.mcp_initialize(), ["browser", 8931, &1]) |> JSON.decode!())

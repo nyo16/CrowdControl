@@ -12,7 +12,9 @@
 #     sh -c 'exec smokescreen --config-file /etc/smokescreen/config.yaml 2>>/var/log/proxy/decisions.jsonl'
 ARG SMOKESCREEN_COMMIT=336cb34495041ce3a33b8d489a2edcbf5f300913
 
-FROM golang:1.26 AS build
+# Bases pinned by digest (multi-arch index), so a rebuild is reproducible;
+# refresh with `docker buildx imagetools inspect <tag>`.
+FROM golang:1.26@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c AS build
 
 ARG SMOKESCREEN_COMMIT
 
@@ -26,7 +28,7 @@ RUN git init -q . \
 
 RUN CGO_ENABLED=0 go build -mod=vendor -trimpath -ldflags='-s -w' -o /out/smokescreen .
 
-FROM busybox:1.37
+FROM busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/smokescreen /usr/local/bin/smokescreen

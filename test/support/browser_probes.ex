@@ -7,6 +7,13 @@ defmodule CrowdControl.Test.BrowserProbes do
   # line: the sandbox Pod's exec has no env parameter, so nothing here reads
   # the environment.
 
+  @playwright_version_file Path.expand("../../PLAYWRIGHT_VERSION", __DIR__)
+  @external_resource @playwright_version_file
+  @playwright_version @playwright_version_file |> File.read!() |> String.trim()
+
+  @doc "The single Playwright pin, from the repository's `PLAYWRIGHT_VERSION` file."
+  def playwright_version, do: @playwright_version
+
   @doc "`[kind, host, port]` -> `REACHABLE` | `BLOCKED` (tcp), `RESOLVES` | `NO-DNS` (dns)."
   def probe,
     do: ~S"""
@@ -55,15 +62,17 @@ defmodule CrowdControl.Test.BrowserProbes do
     """
 
   @doc """
-  `[ws_endpoint, app_url, stun_ip, stun_port]`: a Playwright 1.64.1 client,
-  as an agent's `chromium.connect` script would drive the browser. Prints a
-  JSON object: `app`, `allowed` (example.com), `denied` (wikipedia.org) as
-  `{status, title, body}` or `{error}`, and the ICE `candidates` a page
-  gathered against a STUN server at `stun_ip`; or `{fatal}`.
+  `[ws_endpoint, app_url, stun_ip, stun_port]`: a client at the pinned
+  Playwright version, resolved by a bare `require` through the image's
+  `NODE_PATH`, as an agent's `chromium.connect` script would drive the
+  browser. Prints a JSON object: `app`, `allowed` (example.com), `denied`
+  (wikipedia.org) as `{status, title, body}` or `{error}`, and the ICE
+  `candidates` a page gathered against a STUN server at `stun_ip`; or
+  `{fatal}`.
   """
   def client,
     do: ~S"""
-    const { chromium } = require('/usr/lib/node_modules/playwright');
+    const { chromium } = require('playwright');
     const [endpoint, app, stunIp, stunPort] = process.argv.slice(1);
     (async () => {
       const out = {};
