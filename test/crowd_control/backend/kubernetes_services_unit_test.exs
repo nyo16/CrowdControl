@@ -393,9 +393,9 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       assert metadata["labels"]["crowd_control.role"] == "sandbox"
 
       assert Services.decode_refs(metadata["annotations"]["crowd_control.services"]) == [
-               %{name: "vector", placement: :pod, grace: 28},
-               %{name: "browser", placement: :separate, grace: 0},
-               %{name: "proxy", placement: :separate, grace: 0}
+               %{name: "vector", placement: :pod, grace: 28, sbx: true},
+               %{name: "browser", placement: :separate, grace: 0, sbx: true},
+               %{name: "proxy", placement: :separate, grace: 0, sbx: false}
              ]
     end
 
@@ -1247,6 +1247,64 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       assert List.last(requests).path =~ ~r"/networkpolicies/cc-#{@key}-deny-all$"
     end
 
+    test "a drained service off sbx is deleted with the sandbox Pod, before its first poll" do
+      {config, log} = gone_after_one_poll()
+
+      refs = [
+        %{name: "vector", placement: :pod, grace: 28, sbx: true},
+        %{name: "proxy", placement: :separate, grace: 45, sbx: false}
+      ]
+
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+      at = indexes(log.())
+
+      assert [0] = at.({:delete, :pods, "cc-#{@key}"})
+      assert [proxy_delete] = at.({:delete, :pods, "cc-#{@key}-proxy"})
+      assert [first_sandbox_poll, _gone] = at.({:get, :pods, "cc-#{@key}"})
+      assert proxy_delete < first_sandbox_poll, "the sandbox Pod cannot reach the proxy"
+    end
+
+    test "a drained service on sbx is deleted only after the sandbox Pod's 404" do
+      {config, log} = gone_after_one_poll()
+
+      refs = [
+        %{name: "vector", placement: :pod, grace: 28, sbx: true},
+        %{name: "aggregator", placement: :separate, grace: 30, sbx: true}
+      ]
+
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+      at = indexes(log.())
+
+      assert [_terminating, sandbox_gone] = at.({:get, :pods, "cc-#{@key}"})
+      assert [aggregator_delete] = at.({:delete, :pods, "cc-#{@key}-aggregator"})
+
+      assert sandbox_gone < aggregator_delete,
+             "the sandbox's drained shipper may still be sending to the aggregator"
+    end
+
+    test "each NetworkPolicy follows its own Pod's 404, on sbx or off it" do
+      {config, log} = gone_after_one_poll()
+
+      refs = [
+        %{name: "vector", placement: :pod, grace: 28, sbx: true},
+        %{name: "proxy", placement: :separate, grace: 45, sbx: false},
+        %{name: "aggregator", placement: :separate, grace: 30, sbx: true}
+      ]
+
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+      at = indexes(log.())
+
+      for {pod, policy} <- [
+            {"cc-#{@key}", "cc-#{@key}-deny-all"},
+            {"cc-#{@key}-proxy", "cc-#{@key}-proxy"},
+            {"cc-#{@key}-aggregator", "cc-#{@key}-aggregator"}
+          ] do
+        assert [_terminating, gone] = at.({:get, :pods, pod})
+        assert [policy_delete] = at.({:delete, :networkpolicies, policy})
+        assert gone < policy_delete, "#{policy} was deleted before #{pod} was gone"
+      end
+    end
+
     test "a sandbox Pod whose delete failed keeps its deny-all" do
       {config, log} =
         recorder(fn
@@ -1652,6 +1710,27 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       "metadata" => %{"name" => name, "deletionTimestamp" => "2026-11-02T00:00:00Z"},
       "status" => %{"phase" => "Running"}
     }
+  end
+
+  # Every Pod answers its first GET as terminating and every later one 404.
+  defp gone_after_one_poll do
+    {:ok, seen} = Agent.start_link(fn -> MapSet.new() end)
+
+    recorder(fn
+      %{method: :get, path: "/api/v1/namespaces/ns1/pods/" <> pod} ->
+        if Agent.get_and_update(seen, &{pod in &1, MapSet.put(&1, pod)}),
+          do: {404, %{"message" => "not found"}},
+          else: {200, terminating_pod(pod)}
+
+      %{method: :delete} ->
+        {200, %{}}
+    end)
+  end
+
+  # The positions of `{method, kind, name}` in the recorded requests.
+  defp indexes(requests) do
+    requests = Enum.map(requests, &{&1.method, kind(&1.path), Path.basename(&1.path)})
+    fn request -> for {^request, i} <- Enum.with_index(requests), do: i end
   end
 
   defp pulling_pod do

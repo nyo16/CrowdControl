@@ -121,9 +121,17 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   @typedoc """
   What `destroy/1` needs to know about one service, persisted on the sandbox
   Pod as the `crowd_control.services` annotation: enough to derive every
-  object name and the delete grace, and nothing else (no env, no files).
+  object name, the delete grace and the delete order, and nothing else (no
+  env, no files). `sbx` is whether the sandbox Pod can reach the service
+  (it is in the Pod, or it is on `sbx`), so a `:separate` one is deleted
+  only once the sandbox Pod is gone.
   """
-  @type ref :: %{name: String.t(), placement: :pod | :separate, grace: non_neg_integer()}
+  @type ref :: %{
+          name: String.t(),
+          placement: :pod | :separate,
+          grace: non_neg_integer(),
+          sbx: boolean()
+        }
 
   @typedoc """
   What the manifests need from the backend: `Kubernetes.service_context/1`.
@@ -485,7 +493,12 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   @spec refs([Service.t()]) :: [ref()]
   def refs(services) do
     for %Service{placement: placement} = service <- services, placement in [:pod, :separate] do
-      %{name: service.name, placement: placement, grace: Drain.grace_seconds([service])}
+      %{
+        name: service.name,
+        placement: placement,
+        grace: Drain.grace_seconds([service]),
+        sbx: placement == :pod or on_sandbox_network?(service)
+      }
     end
   end
 
@@ -496,7 +509,12 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   def encode_refs(refs) do
     refs
     |> Enum.map(fn ref ->
-      %{"name" => ref.name, "placement" => Atom.to_string(ref.placement), "grace" => ref.grace}
+      %{
+        "name" => ref.name,
+        "placement" => Atom.to_string(ref.placement),
+        "grace" => ref.grace,
+        "sbx" => ref.sbx
+      }
     end)
     |> JSON.encode!()
   end
@@ -505,11 +523,15 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   Parse a `crowd_control.services` annotation back into refs. Lenient: an
   unreadable annotation is `[]` (the orphan sweep is the backstop), an entry
   with an illegal name is dropped rather than turned into a DELETE path, and
-  placements map through a closed set — never `String.to_atom/1`.
+  placements map through a closed set — never `String.to_atom/1`. An entry
+  without `sbx` (written before it existed) is on `sbx`, which keeps the
+  order it was deleted in then: after the sandbox Pod.
 
       iex> alias CrowdControl.Backend.Kubernetes.Services
+      iex> Services.decode_refs(~s([{"name":"proxy","placement":"separate","grace":0,"sbx":false}]))
+      [%{name: "proxy", placement: :separate, grace: 0, sbx: false}]
       iex> Services.decode_refs(~s([{"name":"browser","placement":"separate","grace":0}]))
-      [%{name: "browser", placement: :separate, grace: 0}]
+      [%{name: "browser", placement: :separate, grace: 0, sbx: true}]
       iex> Services.decode_refs("not json")
       []
   """
@@ -525,11 +547,13 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
 
   defp decode_ref(%{"name" => name, "placement" => placement} = ref) when is_binary(name) do
     grace = Map.get(ref, "grace", 0)
+    sbx = Map.get(ref, "sbx", true)
 
     with true <- Regex.match?(@dns_label, name),
          {:ok, placement} <- decode_placement(placement),
-         true <- is_integer(grace) and grace >= 0 do
-      [%{name: name, placement: placement, grace: grace}]
+         true <- is_integer(grace) and grace >= 0,
+         true <- is_boolean(sbx) do
+      [%{name: name, placement: placement, grace: grace, sbx: sbx}]
     else
       _ -> []
     end
@@ -552,24 +576,29 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
 
   @doc """
   Every object a session's services derive, for `destroy/1`: the `:separate`
-  Pods (with their own grace), Services and NetworkPolicies, every service's
+  Pods (with their own grace, and whether the sandbox Pod can reach them —
+  `:sbx` or `:off_sbx`), Services and NetworkPolicies, every service's
   `:files` ConfigMap and `env` Secret, and the sandbox's own Service when it
   declared `:sandbox_ports`. Deleted unconditionally, each 404 being success.
   """
   @spec derived_objects(String.t(), [ref()], boolean()) :: [
-          {:pod, String.t(), non_neg_integer()}
+          {:pod, String.t(), non_neg_integer(), :sbx | :off_sbx}
           | {:service | :network_policy | :config_map | :secret, String.t()}
         ]
   def derived_objects(session_key, refs, sandbox_service?) do
     separate = Enum.filter(refs, &(&1.placement == :separate))
 
-    Enum.map(separate, &{:pod, object_name(session_key, &1.name), &1.grace}) ++
+    Enum.map(separate, &{:pod, object_name(session_key, &1.name), &1.grace, reach(&1)}) ++
       Enum.map(separate, &{:service, object_name(session_key, &1.name)}) ++
       if(sandbox_service?, do: [{:service, object_name(session_key, @sandbox_alias)}], else: []) ++
       Enum.map(separate, &{:network_policy, object_name(session_key, &1.name)}) ++
       Enum.map(refs, &{:config_map, Files.config_map_name(session_key, &1.name)}) ++
       Enum.map(refs, &{:secret, Secrets.secret_name(session_key, &1.name)})
   end
+
+  # A ref from a handle persisted before `sbx` existed has no key: on `sbx`,
+  # as `decode_refs/1` reads a missing one.
+  defp reach(ref), do: if(Map.get(ref, :sbx, true), do: :sbx, else: :off_sbx)
 
   @doc """
   The `CrowdControl.VersionGate` features `services` need: native sidecars

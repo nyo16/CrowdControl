@@ -37,8 +37,9 @@ defmodule CrowdControl.Backend.Kubernetes do
       destroy    DELETE /api/v1/namespaces/{ns}/pods/{pod}?gracePeriodSeconds=0
                  (the drain budget instead when a :pod sidecar is drained,
                  and then GET until the Pod is gone, so its NetworkPolicy
-                 outlives it; then every object the session's :services
-                 derived)
+                 outlives it), with every :separate Pod off `sbx`; then the
+                 :separate Pods on `sbx`, and every other object the
+                 session's :services derived
 
   Three details are load-bearing and were all established empirically, exactly as
   under Docker:
@@ -266,9 +267,13 @@ defmodule CrowdControl.Backend.Kubernetes do
   policy, and the same for each drained `:separate` service and its own
   policy; the CLI gets the `SIGTERM` PID 1 receives. A Pod still there at the
   deadline keeps its policy, and the sweep, which counts a terminating Pod
-  as live, removes it later. `destroy/1` therefore blocks for up to that
-  long when anything is drained. A Pod whose DELETE fails (anything but a
-  404) keeps its policy too, whatever its grace.
+  as live, removes it later. A `:separate` service on `sbx` is one the
+  sandbox Pod can reach — a drained sidecar may be shipping to it — so its
+  Pod is deleted only once the sandbox Pod's wait is over; every other
+  `:separate` Pod is deleted with the sandbox Pod, and the waits overlap.
+  `destroy/1` therefore blocks for up to the sandbox's wait plus the
+  longest wait of a drained service on `sbx`. A Pod whose DELETE fails
+  (anything but a 404) keeps its policy too, whatever its grace.
 
   A service's `env` goes in a per-session Secret, `cc-<key>-<name>-env`
   (`crowd_control.role=service-secret`), which its container reads by
@@ -1957,22 +1962,63 @@ defmodule CrowdControl.Backend.Kubernetes do
   # Always `:ok`: the behaviour requires destroy/1 to be idempotent, Session
   # calls it from several teardown paths, and whatever is left behind — logged
   # here — the reaper's next pass retries.
+  #
+  # Every name the session's services derived is deleted unconditionally,
+  # each 404 being success — the same reasoning as `delete_managed_policy/1`
+  # below, and the same reason it never reads `config[:services]`: a handle
+  # `list_live/1` rebuilt carries the caller's config, not the provisioning
+  # one. The refs come off the sandbox Pod's annotation instead, and every
+  # name derived from them is one this backend minted.
+  #
+  # The order is invariant 5: a service the sandbox Pod can reach outlives it.
+  # The sandbox reaches a `:separate` service exactly when that service is on
+  # `sbx` — its policy and the service's admit each other on no other
+  # network — and a drained `:pod` sidecar keeps shipping to it for the whole
+  # drain, so a `:separate` Pod on `sbx` is DELETEd only once the sandbox
+  # Pod's wait is over (its 404, or its deadline: as before, a sandbox not
+  # confirmed gone keeps only its own policy). Every other `:separate` Pod is
+  # DELETEd with the sandbox Pod, and all the waits overlap: each runs against
+  # its own deadline from its own DELETE. A NetworkPolicy goes only once its
+  # own Pod is gone, and the derived Services, ConfigMaps and Secrets after
+  # every wait.
   def destroy(%__MODULE__{pod_name: name} = handle) do
+    config = handle.config
     refs = Map.get(handle, :services) || []
-    started = System.monotonic_time(:millisecond)
+    sandbox_service? = (Map.get(handle, :sandbox_ports) || []) != []
+    objects = Services.derived_objects(handle.session_key, refs, sandbox_service?)
+    {pods, others} = Enum.split_with(objects, &match?({:pod, _name, _grace, _reach}, &1))
+    {reached, unreached} = Enum.split_with(pods, &match?({:pod, _name, _grace, :sbx}, &1))
 
     # Grace 0 unless a `:pod` sidecar is drained: a log shipper SIGKILLed
     # mid-flush loses the transcript's tail. See `Kubernetes.Drain`.
     grace = Services.sandbox_grace(refs)
-    state = start_pod_delete(handle.config, name, grace)
-    running? = still_running?(handle.config, name, state, gone_deadline(started, grace))
+    started = System.monotonic_time(:millisecond)
+    state = start_pod_delete(config, name, grace)
+    unreached = start_pod_deletes(config, unreached, started)
+    running? = still_running?(config, name, state, gone_deadline(started, grace))
 
-    _ = delete_derived(handle, refs)
+    reached = start_pod_deletes(config, reached, System.monotonic_time(:millisecond))
+
+    running =
+      for {pod, pod_state, deadline} <- unreached ++ reached,
+          still_running?(config, pod, pod_state, deadline),
+          into: MapSet.new(),
+          do: pod
+
+    for object <- others, do: delete_unless_running(config, object, running)
 
     # The Pod's only NetworkPolicy. Without it a Pod is non-isolated, i.e.
     # allow-all, so it goes only once the Pod has.
     _ = if running?, do: keep_policy(name), else: delete_managed_policy(handle)
     :ok
+  end
+
+  # A drained `:separate` Pod is held to the sandbox's rule: its own
+  # NetworkPolicy (the same name) goes only once it is gone, so its deadline
+  # starts at its own DELETE.
+  defp start_pod_deletes(config, pods, started) do
+    for {:pod, name, grace, _reach} <- pods,
+        do: {name, start_pod_delete(config, name, grace), gone_deadline(started, grace)}
   end
 
   # `:gone` when the Pod no longer exists, or was deleted with no grace (the
@@ -2030,35 +2076,6 @@ defmodule CrowdControl.Backend.Kubernetes do
       "Kubernetes destroy: #{name} is not confirmed gone; its NetworkPolicy stays " <>
         "until it is, and the reaper's orphan sweep deletes it then"
     )
-  end
-
-  # Every name the session's services derived, unconditionally, each 404 being
-  # success — the same reasoning as `delete_managed_policy/1` below, and the
-  # same reason it never reads `config[:services]`: a handle `list_live/1`
-  # rebuilt carries the caller's config, not the provisioning one. The refs
-  # come off the sandbox Pod's annotation instead, and every name derived from
-  # them is one this backend minted.
-  #
-  # A drained `:separate` Pod is held to the sandbox's order: its own
-  # NetworkPolicy (the same name) goes only once it is gone. Every Pod delete
-  # is issued before any wait, so the waits overlap.
-  defp delete_derived(handle, refs) do
-    config = handle.config
-    sandbox_service? = (Map.get(handle, :sandbox_ports) || []) != []
-    objects = Services.derived_objects(handle.session_key, refs, sandbox_service?)
-    {pods, others} = Enum.split_with(objects, &match?({:pod, _name, _grace}, &1))
-    started = System.monotonic_time(:millisecond)
-
-    states =
-      for {:pod, name, grace} <- pods, do: {name, grace, start_pod_delete(config, name, grace)}
-
-    running =
-      for {name, grace, state} <- states,
-          still_running?(config, name, state, gone_deadline(started, grace)),
-          into: MapSet.new(),
-          do: name
-
-    for object <- others, do: delete_unless_running(config, object, running)
   end
 
   defp delete_unless_running(config, {:network_policy, name} = object, running) do
