@@ -305,10 +305,17 @@ defmodule CrowdControl.Session do
     GenServer.call(session, :get_messages)
   end
 
-  @doc "Gracefully stop the session."
+  @doc """
+  Gracefully stop the session: destroy its sandbox, then exit.
+
+  Returns once the backend's `destroy/1` has, so it waits as long as teardown
+  takes; no client-side timeout cuts it short. That is bounded by the backend:
+  a Kubernetes sandbox with drained sidecars waits out each Pod's termination
+  grace before deleting its network policies, which can take most of a minute.
+  """
   @spec stop(session()) :: :ok
   def stop(session) do
-    GenServer.call(session, :stop, 10_000)
+    GenServer.call(session, :stop, :infinity)
   end
 
   @doc """

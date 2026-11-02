@@ -181,7 +181,13 @@ defmodule CrowdControl do
     end
   end
 
-  @doc "Stop all sessions in parallel."
+  @doc """
+  Stop all sessions in parallel.
+
+  Waits for every session's teardown, which `CrowdControl.Session.stop/1`
+  does not bound (see there): a Kubernetes sandbox with drained sidecars can
+  take most of a minute to be destroyed.
+  """
   @spec stop_all([session()]) :: :ok
   def stop_all(sessions) do
     sessions
@@ -195,8 +201,7 @@ defmodule CrowdControl do
       end,
       max_concurrency: 16,
       ordered: false,
-      on_timeout: :kill_task,
-      timeout: 15_000
+      timeout: :infinity
     )
     |> Stream.run()
 

@@ -1113,6 +1113,24 @@ defmodule CrowdControl.SessionControlTest do
     end
   end
 
+  describe "teardown budget (B-3)" do
+    # A Kubernetes destroy can wait out Pod termination graces; stop/1 used to
+    # give up after 10 s while the destroy carried on inside the session.
+    @tag timeout: 30_000
+    test "stop/1 waits for a destroy slower than the old 10 s call timeout" do
+      ctl = start_supervised!({Mock, events: [], destroy_delay: 10_500})
+      {:ok, pid} = start(ctl, timeout: 60_000)
+      ref = Process.monitor(pid)
+
+      {elapsed_us, result} = :timer.tc(fn -> Session.stop(pid) end)
+
+      assert result == :ok
+      assert elapsed_us >= 10_500_000
+      assert Mock.destroy_count(ctl) == 1
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+    end
+  end
+
   defp push(ctl, frame), do: Mock.push_events(ctl, [{:stdout_data, line(frame)}])
 
   defp echo_server,
