@@ -311,8 +311,20 @@ conclusive on its own — so the common case still costs one Pod, not two.
 
     pods            create, get, list, delete
     pods/exec       create
-    pods/log        get                     # diagnostics on a failed provision
-    networkpolicies create, get, delete     # only under network: :deny_all
+    pods/log        get                       # diagnostics on a failed provision
+    events          list                      # diagnostics on a failed provision
+    networkpolicies create, get, list, delete # create/delete under network: :deny_all
+                                              # or with a placement: :separate service
+    services        create, get, list, delete # :separate services, :sandbox_ports
+    configmaps      create, get, list, delete # services with :files
+
+`list` on `services`, `configmaps` and `networkpolicies` is the reaper's
+orphan sweep: a session's service objects are created before its sandbox Pod,
+so a crash in between leaves objects only a label selector can find. Grant it
+wherever the reaper runs this backend; without it the sweep logs a warning and
+deletes nothing. A ConfigMap is readable by anyone with `get configmaps` in the
+namespace, and a service's `env` sits in its Pod object, so neither carries
+credentials — those belong in an operator-managed Secret.
 
 **One place this backend is stricter than Docker.** The sandbox container keeps
 `capabilities.drop: ["ALL"]` with *nothing* added. Creating the FIFO needs

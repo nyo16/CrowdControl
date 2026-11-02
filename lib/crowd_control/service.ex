@@ -23,7 +23,7 @@ defmodule CrowdControl.Service do
         host_config: %{shm_size: 1_073_741_824, init: true},
         weaken: [],
         networks: ["sbx", "brw"],
-        placement: :separate,               # Kubernetes only
+        placement: :separate,               # Kubernetes only; see below
         drain: 3_000,                       # ms; log shippers only
         shutdown_limit: 20                  # s; with :drain
       }
@@ -32,6 +32,11 @@ defmodule CrowdControl.Service do
   reason. Each substrate wraps the reason in its own tag (`{:compose, reason}`,
   `{:k8s, reason}`), so `{:egress_required, name}` and
   `:sandbox_egress_forbidden` read the same everywhere.
+
+  `:placement` is read by `CrowdControl.Backend.Kubernetes` only: `:pod` (a
+  native sidecar in the sandbox Pod), `:separate` (its own Pod, Service and
+  NetworkPolicy) or `{:external, target}` (something outside the session the
+  session may reach; it runs nothing, so it needs no `:image`).
 
   ## Posture is never inferred
 
@@ -271,14 +276,19 @@ defmodule CrowdControl.Service do
     end
   end
 
-  # The sandbox may inherit a top-level `:image`; a sidecar has no fallback.
+  # The sandbox may inherit a top-level `:image`; a sidecar has no fallback. An
+  # `{:external, _}` placement names something the session only *reaches*, so
+  # there is nothing to run and no image to name.
   defp fetch_image(spec, name, role) do
     case {Map.get(spec, :image), role} do
       {image, _role} when is_binary(image) and image != "" -> {:ok, image}
       {_missing, :sandbox} -> {:ok, nil}
+      {nil, _role} -> if external?(spec), do: {:ok, nil}, else: {:error, {:image_required, name}}
       {_missing, _role} -> {:error, {:image_required, name}}
     end
   end
+
+  defp external?(spec), do: match?({:external, _}, Map.get(spec, :placement))
 
   # Never inferred. A sidecar with egress can relay the internet to whatever it
   # shares a network with, which is exactly why it has to be written down.

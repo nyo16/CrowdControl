@@ -82,6 +82,7 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   @event_api [api_version: "v1", kind: "Event"]
   @netpol_api [api_version: "networking.k8s.io/v1", kind: "NetworkPolicy"]
   @configmap_api [api_version: "v1", kind: "ConfigMap"]
+  @service_api [api_version: "v1", kind: "Service"]
 
   # kubereq raises rather than returns in several places: a malformed kubeconfig
   # (`Kubereq.Kubeconfig.load/1`, `Step.TLS.ca_cert!/1`), an unknown resource,
@@ -715,6 +716,49 @@ defmodule CrowdControl.Backend.Kubernetes.API do
     run(fn -> Kubereq.delete(client(config, @netpol_api), namespace(config), name) end)
   end
 
+  @doc """
+  Every NetworkPolicy matching `label_selectors`, following `continue` to the
+  last page. The orphan sweep reads this as evidence of what exists, so it
+  carries `list_all/3`'s never-truncated contract.
+  """
+  @spec list_network_policies(config(), keyword() | [tuple()]) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_network_policies(config, label_selectors) do
+    list_labelled(config, @netpol_api, label_selectors)
+  end
+
+  # --- services ---
+
+  @doc "GET a Service by name."
+  @spec get_service(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def get_service(config, name) do
+    run(fn -> Kubereq.get(client(config, @service_api), namespace(config), name) end)
+  end
+
+  @doc """
+  POST a Service manifest. The created object carries the allocated
+  `spec.clusterIP`, which is what `hostAliases` are built from.
+  """
+  @spec create_service(config(), map()) :: {:ok, map()} | {:error, term()}
+  def create_service(config, manifest) do
+    run(fn -> Kubereq.create(client(config, @service_api), manifest) end)
+  end
+
+  @doc "DELETE a Service by name."
+  @spec delete_service(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def delete_service(config, name) do
+    run(fn -> Kubereq.delete(client(config, @service_api), namespace(config), name) end)
+  end
+
+  @doc """
+  Every Service matching `label_selectors`, following `continue` to the last
+  page, with `list_all/3`'s never-truncated contract.
+  """
+  @spec list_services(config(), keyword() | [tuple()]) :: {:ok, [map()]} | {:error, term()}
+  def list_services(config, label_selectors) do
+    list_labelled(config, @service_api, label_selectors)
+  end
+
   # --- config maps ---
 
   @doc "GET a ConfigMap by name."
@@ -740,12 +784,15 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   page — the same never-truncated contract as `list_all/3`, because the reaper
   sweep reads this as the evidence of what exists.
   """
-  @spec list_config_maps(config(), keyword() | [{String.t(), String.t()}]) ::
-          {:ok, [map()]} | {:error, term()}
+  @spec list_config_maps(config(), keyword() | [tuple()]) :: {:ok, [map()]} | {:error, term()}
   def list_config_maps(config, label_selectors) do
+    list_labelled(config, @configmap_api, label_selectors)
+  end
+
+  defp list_labelled(config, resource, label_selectors) do
     guard do
       paginate(
-        client(config, @configmap_api),
+        client(config, resource),
         namespace(config),
         [label_selectors: label_selectors],
         nil,
