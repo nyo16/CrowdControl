@@ -207,9 +207,9 @@ defmodule CrowdControl.Service do
     end
   end
 
-  # Maps only, deliberately: `Provider.Compose.scrub/1` strips `:env` out of the
-  # persisted specs without a second normalisation pass over a shape it can
-  # only guess at.
+  # Maps only, deliberately: `CrowdControl.Store.scrub_services/1` strips `:env`
+  # and `:files` out of the persisted specs without a second normalisation pass
+  # over a shape it can only guess at.
   def normalize(spec, _role), do: {:error, {:bad_service, spec}}
 
   @doc """
