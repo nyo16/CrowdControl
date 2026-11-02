@@ -83,6 +83,7 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   @netpol_api [api_version: "networking.k8s.io/v1", kind: "NetworkPolicy"]
   @configmap_api [api_version: "v1", kind: "ConfigMap"]
   @service_api [api_version: "v1", kind: "Service"]
+  @secret_api [api_version: "v1", kind: "Secret"]
 
   # kubereq raises rather than returns in several places: a malformed kubeconfig
   # (`Kubereq.Kubeconfig.load/1`, `Step.TLS.ca_cert!/1`), an unknown resource,
@@ -787,6 +788,36 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   @spec list_config_maps(config(), keyword() | [tuple()]) :: {:ok, [map()]} | {:error, term()}
   def list_config_maps(config, label_selectors) do
     list_labelled(config, @configmap_api, label_selectors)
+  end
+
+  # --- secrets ---
+
+  @doc "GET a Secret by name."
+  @spec get_secret(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def get_secret(config, name) do
+    run(fn -> Kubereq.get(client(config, @secret_api), namespace(config), name) end)
+  end
+
+  @doc "POST a Secret manifest."
+  @spec create_secret(config(), map()) :: {:ok, map()} | {:error, term()}
+  def create_secret(config, manifest) do
+    run(fn -> Kubereq.create(client(config, @secret_api), manifest) end)
+  end
+
+  @doc "DELETE a Secret by name."
+  @spec delete_secret(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def delete_secret(config, name) do
+    run(fn -> Kubereq.delete(client(config, @secret_api), namespace(config), name) end)
+  end
+
+  @doc """
+  Every Secret matching `label_selectors`, following `continue` to the last
+  page, with `list_all/3`'s never-truncated contract: the reaper sweep reads
+  it as the evidence of what exists.
+  """
+  @spec list_secrets(config(), keyword() | [tuple()]) :: {:ok, [map()]} | {:error, term()}
+  def list_secrets(config, label_selectors) do
+    list_labelled(config, @secret_api, label_selectors)
   end
 
   defp list_labelled(config, resource, label_selectors) do

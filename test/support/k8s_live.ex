@@ -16,32 +16,99 @@ defmodule CrowdControl.Test.K8sLive do
   @spec context() :: String.t()
   def context, do: System.get_env("CC_K8S_CONTEXT", @default_context)
 
+  @doc "The kubeconfig file `kubeconfig/0` loads."
+  @spec kubeconfig_path() :: String.t()
+  def kubeconfig_path, do: System.get_env("CC_K8S_KUBECONFIG", Path.expand("~/.kube/config"))
+
   @doc "The loaded kubeconfig for `context/0`, for the backend's `:kubeconfig`."
-  @spec kubeconfig() :: Kubereq.Kubeconfig.t()
-  def kubeconfig do
-    path = System.get_env("CC_K8S_KUBECONFIG", Path.expand("~/.kube/config"))
+  @spec kubeconfig(String.t()) :: Kubereq.Kubeconfig.t()
+  def kubeconfig(path \\ kubeconfig_path()) do
     Kubereq.Kubeconfig.load({Kubereq.Kubeconfig.File, path: path, context: context(), !: true})
   end
 
   @doc """
-  `nil` when the cluster enforces NetworkPolicy, else why it does not, as a
-  `@tag skip:` reason.
+  The `@moduletag skip:` and `@tag skip:` reasons for the live test module in
+  `file` (pass `__ENV__.file`), worked out while it compiles — ExUnit has no
+  runtime skip:
 
-  Runs the backend's own enforcement probe by provisioning a `:deny_all`
-  sandbox — the gate every policy-dependent check would pass through anyway
-  — and only when `:k8s` tests are included, since it is called while the
-  test module compiles (ExUnit has no runtime skip). The verdict is cached
-  per cluster in `:persistent_term`, so the tests' own provisions reuse it.
+    * `:cluster` — why there is no cluster to run on at all (no kubeconfig,
+      or no `context/0` in it), else `nil`;
+    * `:policy` — why a check that needs NetworkPolicy enforcement cannot
+      run: the cluster's reason, or the backend's enforcement probe saying
+      "not enforced", else `nil`.
+
+  Only the probe's own "not enforced" verdict is a skip. Any other probe
+  failure — an image that will not pull, missing RBAC, a quota, a timeout —
+  is a broken cluster, and raises: a deny check reported as skipped there
+  would hide exactly the failure it exists to catch.
+
+  Nothing runs unless this is a live run of `file`: `:k8s` is included
+  (`--include k8s`, `--only k8s`), or a location filter names it
+  (`mix test path/to/file.exs:LINE`, which includes the test however `:k8s`
+  is configured). The probe provisions a `:deny_all` sandbox — the gate every
+  policy-dependent check would pass through anyway — and the verdict is
+  cached per cluster in `:persistent_term`, so the tests' own provisions
+  reuse it.
+
+  `opts` exist for this module's own unit test: `:configuration` (default
+  `ExUnit.configuration/0`) and `:kubeconfig_path` (default
+  `kubeconfig_path/0`).
   """
-  @spec policy_skip_reason() :: String.t() | nil
-  def policy_skip_reason do
-    if :k8s in Keyword.get(ExUnit.configuration(), :include, []), do: probe(), else: nil
+  @spec skip_reasons(String.t(), keyword()) :: %{
+          cluster: String.t() | nil,
+          policy: String.t() | nil
+        }
+  def skip_reasons(file, opts \\ []) do
+    configuration = Keyword.get_lazy(opts, :configuration, &ExUnit.configuration/0)
+    path = Keyword.get_lazy(opts, :kubeconfig_path, &kubeconfig_path/0)
+
+    with true <- live_run?(file, configuration),
+         {:ok, kubeconfig} <- load(path) do
+      %{cluster: nil, policy: probe(kubeconfig)}
+    else
+      false -> %{cluster: nil, policy: nil}
+      {:error, reason} -> %{cluster: reason, policy: reason}
+    end
   end
 
-  defp probe do
+  @doc false
+  # Whether `configuration` (ExUnit's) runs `file`'s `:k8s` tests.
+  @spec live_run?(String.t(), keyword()) :: boolean()
+  def live_run?(file, configuration) do
+    configuration
+    |> Keyword.get(:include, [])
+    |> Enum.any?(fn
+      :k8s -> true
+      {:k8s, _value} -> true
+      {:location, {path, _lines}} -> names?(file, path)
+      {:location, path} -> names?(file, path)
+      _other -> false
+    end)
+  end
+
+  # ExUnit's own test for a location filter: the filter's path is relative
+  # to the working directory, the file's absolute.
+  defp names?(file, path) when is_binary(path), do: String.ends_with?(file, path)
+  defp names?(_file, _path), do: false
+
+  defp load(path) do
+    if File.exists?(path) do
+      try do
+        {:ok, kubeconfig(path)}
+      rescue
+        e ->
+          {:error,
+           "no usable kube context #{inspect(context())} in #{path}: #{Exception.message(e)}"}
+      end
+    else
+      {:error, "no kubeconfig at #{path} (set CC_K8S_KUBECONFIG and CC_K8S_CONTEXT)"}
+    end
+  end
+
+  defp probe(kubeconfig) do
     opts = [
       image: "busybox:1.36",
-      kubeconfig: kubeconfig(),
+      kubeconfig: kubeconfig,
       owner: "cc-netpol-gate",
       session_key: Store.new_key(),
       network: :deny_all,
@@ -61,7 +128,10 @@ defmodule CrowdControl.Test.K8sLive do
           "CNI passes the probe"
 
       {:error, reason} ->
-        "the NetworkPolicy enforcement probe failed on context #{context()}: #{inspect(reason)}"
+        raise "the NetworkPolicy enforcement gate could not run on context #{context()}: " <>
+                "#{inspect(reason)}. This is a broken cluster (image pull, RBAC, quota or " <>
+                "timeout), not one that ignores NetworkPolicy, so the deny checks are not " <>
+                "skipped; fix the cluster or exclude :k8s"
     end
   end
 end

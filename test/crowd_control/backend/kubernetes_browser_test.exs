@@ -16,11 +16,12 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
   #
   #   * The deny checks — the sandbox has no egress and cannot reach the
   #     proxy, the browser's only way out is the proxy — mean nothing on a
-  #     cluster whose CNI ignores NetworkPolicy, so they are skipped unless
-  #     the backend's enforcement probe passes, with its verdict as the
-  #     reason. OrbStack fails the probe: measured, it does enforce policies
-  #     pod-to-pod and to the internet, but not on the path to the API
-  #     server the probe tests, so the probe (rightly) refuses to vouch.
+  #     cluster whose CNI ignores NetworkPolicy, so they are skipped when
+  #     the backend's enforcement probe says "not enforced", with its verdict
+  #     as the reason. Any other probe failure is a broken cluster and fails
+  #     the run instead. OrbStack fails the probe: measured, it does enforce
+  #     policies pod-to-pod and to the internet, but not on the path to the
+  #     API server the probe tests, so the probe (rightly) refuses to vouch.
   #   * Everything else runs everywhere: DNS-free discovery through
   #     `hostAliases` and ClusterIPs, the dev server through `:sandbox_ports`,
   #     the proxy allowlist, MCP and run-server, WebRTC, Vector shipping
@@ -54,12 +55,15 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
   @udp_log "/tmp/udp.log"
   @aggregator_port 6000
 
-  # Evaluated while this module compiles, and only when `:k8s` is included:
-  # ExUnit has no runtime skip.
-  @policy_skip K8sLive.policy_skip_reason()
+  # Evaluated while this module compiles, and only on a live run of this
+  # file (see K8sLive.skip_reasons/1): ExUnit has no runtime skip. No
+  # kubeconfig skips the module rather than aborting the run.
+  @live K8sLive.skip_reasons(__ENV__.file)
+  @enforced? @live.policy == nil
+  @moduletag skip: @live.cluster
 
   setup_all do
-    {:ok, kubeconfig: K8sLive.kubeconfig(), enforced?: @policy_skip == nil}
+    {:ok, kubeconfig: K8sLive.kubeconfig(), enforced?: @enforced?}
   end
 
   setup context do
@@ -239,10 +243,18 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
       {services, [], overrides} = browser_stack()
       parent = self()
 
+      # A short sweep window, so the wait below is seconds rather than the
+      # default margin's minute: the objects are stamped `sweep_after_ms` =
+      # provision start + :provision_timeout + :orphan_margin_ms.
+      window = [provision_timeout: 20_000, orphan_margin_ms: 1_000]
+
       # Provision in a process killed as soon as the browser Pod exists: the
       # service Pods are still becoming Ready, so the sandbox Pod — and the
       # annotation destroy/1 derives every name from — never gets created.
-      pid = spawn(fn -> send(parent, {:provisioned, provision(ctx, services, overrides)}) end)
+      pid =
+        spawn(fn ->
+          send(parent, {:provisioned, provision(ctx, services, overrides, window)})
+        end)
 
       eventually(
         fn -> Enum.any?(owner_pods(ctx.config), fn {_, role} -> role == "service" end) end,
@@ -254,6 +266,7 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
 
       objects = owner_objects(ctx.config)
       assert objects.pods != [] and objects.services != [] and objects.policies != []
+      assert objects.secrets != [], "the browser's env Secret was not created first"
 
       refute Enum.any?(Map.values(owner_pods(ctx.config)), &(&1 != "service")),
              "the sandbox Pod was created; the crash came too late"
@@ -261,13 +274,13 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
       # No sandbox, so nothing to report: service Pods are never live.
       assert {:ok, []} = Kubernetes.list_live(ctx.config)
 
-      # Young objects are an in-flight provision and are left alone. The
-      # floor is `:provision_timeout` + 60 s, so a 1 s timeout makes it 61 s.
-      sweep = Keyword.put(ctx.config, :provision_timeout, 1_000)
+      # Young objects are an in-flight provision and are left alone: the
+      # reaper's own floor (1 s + 1 s) has passed, their stamp has not.
+      sweep = ctx.config ++ [provision_timeout: 1_000, orphan_margin_ms: 1_000]
       assert {:ok, 0} = Kubernetes.sweep_orphans(sweep)
       assert owner_objects(ctx.config) == objects
 
-      Process.sleep(62_000)
+      Process.sleep(max(latest_stamp(ctx.config) - System.system_time(:millisecond), 0) + 1_000)
 
       assert {:ok, swept} = Kubernetes.sweep_orphans(sweep)
       total = objects |> Map.values() |> Enum.map(&length/1) |> Enum.sum()
@@ -279,7 +292,8 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
                    pods: [],
                    services: [],
                    policies: [],
-                   config_maps: []
+                   config_maps: [],
+                   secrets: []
                  }
                end,
                60_000
@@ -288,7 +302,7 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
   end
 
   describe "the deny checks (need a NetworkPolicy-enforcing CNI)" do
-    @tag skip: @policy_skip
+    @tag skip: @live.policy
     test "sandbox has no egress and no proxy; the browser leaves only by the proxy", ctx do
       {services, [], overrides} = browser_stack()
       {:ok, handle} = provision(ctx, services, overrides)
@@ -328,9 +342,10 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
     )
   end
 
-  defp provision(ctx, services, overrides) do
+  defp provision(ctx, services, overrides, extra \\ []) do
     Kubernetes.provision(
-      ctx.config ++
+      extra ++
+        ctx.config ++
         [
           image: @sandbox_image,
           session_key: Store.new_key(),
@@ -455,13 +470,31 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
     {:ok, services} = API.list_services(config, selector)
     {:ok, policies} = API.list_network_policies(config, selector)
     {:ok, config_maps} = API.list_config_maps(config, selector)
+    {:ok, secrets} = API.list_secrets(config, selector)
 
     %{
       pods: pods |> Enum.reject(&deleting?/1) |> names(),
       services: names(services),
       policies: names(policies),
-      config_maps: names(config_maps)
+      config_maps: names(config_maps),
+      secrets: names(secrets)
     }
+  end
+
+  # The latest `crowd_control.sweep_after_ms` on any of this owner's objects:
+  # before it, the sweep leaves them all alone.
+  defp latest_stamp(config) do
+    selector = owner_selector(config)
+    {:ok, pods} = API.list_all(config, nil, label_selectors: selector)
+    {:ok, services} = API.list_services(config, selector)
+    {:ok, policies} = API.list_network_policies(config, selector)
+    {:ok, config_maps} = API.list_config_maps(config, selector)
+    {:ok, secrets} = API.list_secrets(config, selector)
+
+    (pods ++ services ++ policies ++ config_maps ++ secrets)
+    |> Enum.map(&get_in(&1, ["metadata", "annotations", "crowd_control.sweep_after_ms"]))
+    |> Enum.map(&String.to_integer/1)
+    |> Enum.max()
   end
 
   defp deleting?(object), do: get_in(object, ["metadata", "deletionTimestamp"]) != nil
@@ -480,6 +513,7 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
     Enum.each(objects.services, &API.delete_service(config, &1))
     Enum.each(objects.policies, &API.delete_network_policy(config, &1))
     Enum.each(objects.config_maps, &API.delete_config_map(config, &1))
+    Enum.each(objects.secrets, &API.delete_secret(config, &1))
   rescue
     _ -> :ok
   catch

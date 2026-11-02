@@ -32,7 +32,20 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
           %{ip_block: "10.20.0.0/16", except: ["10.20.1.0/24"]}
 
       `ports` are required. `host` and `ip` (both or neither) become a
-      `hostAliases` entry, since nothing here can resolve a name.
+      `hostAliases` entry, since nothing here can resolve a name. An
+      external runs nothing, so it may not carry `egress: :allow`; one the
+      sandbox reaches must be private or narrow, and kube-dns needs
+      `allow_dns: true` — see `check_external/2`.
+
+  A `:pod` or `:separate` service's `env` lives in a per-session Secret
+  (`CrowdControl.Backend.Kubernetes.Secrets`) and reaches the container
+  through `secretKeyRef`, so no literal value is in any Pod spec. Its
+  `:files` live in a per-session ConfigMap (`Kubernetes.Files`), whose
+  payload — binary content base64-encoded — must fit
+  `CrowdControl.Service.max_files_bytes/0` (`{:files_too_large, {name, size}}`).
+  A container with no `user:` gets `runAsNonRoot: true` unless `:user` is
+  declared in `weaken:`; a numeric root uid (`"0"`, `"00"`, `"0:1000"`) is
+  `runAsNonRoot: false`, which only `weaken: [:user]` lets through.
 
   ## Edges come from network membership
 
@@ -68,6 +81,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   alias CrowdControl.Backend.Kubernetes
   alias CrowdControl.Backend.Kubernetes.Drain
   alias CrowdControl.Backend.Kubernetes.Files
+  alias CrowdControl.Backend.Kubernetes.Secrets
   alias CrowdControl.Service
 
   @sandbox_network "sbx"
@@ -92,11 +106,20 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   @private_v6 ["fc00::/7", "fe80::/10"]
   @internet_ports [443]
 
+  # Where an `{:external, %{ip_block: _}}` reached from `sbx` may point
+  # without a long prefix: RFC 1918, CGNAT and ULA. Not link-local, whose
+  # 169.254.169.254 is a cloud metadata endpoint.
+  @narrow_v4 ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"]
+  @narrow_v6 ["fc00::/7"]
+
   @probe_period_seconds 2
   @probe_failure_threshold 60
   @default_tmpfs_size "64Mi"
 
   @dns_label ~r/\A[a-z0-9]([-a-z0-9]*[a-z0-9])?\z/
+
+  # The Secret key alphabet: each env name is a key of the service's Secret.
+  @secret_key ~r/\A[-._a-zA-Z0-9]+\z/
 
   @typedoc """
   What `destroy/1` needs to know about one service, persisted on the sandbox
@@ -114,7 +137,8 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
           namespace: String.t(),
           config: keyword(),
           capture_dir: String.t(),
-          capture_volume: String.t()
+          capture_volume: String.t(),
+          sweep_after_ms: non_neg_integer() | nil
         }
 
   # --- validation ---
@@ -179,8 +203,10 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
          :ok <- check_placement(service),
          :ok <- check_user(service),
          :ok <- check_mounts(service, ctx),
-         :ok <- check_tmpfs(service) do
-      check_external(service)
+         :ok <- check_tmpfs(service),
+         :ok <- check_env(service),
+         :ok <- check_files(service) do
+      check_external(service, ctx.namespace)
     end
   end
 
@@ -246,24 +272,116 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     end)
   end
 
-  defp check_external(%Service{placement: {:external, target}, name: name, ports: ports}) do
-    if ports != [] and valid_target?(target),
+  # Each name becomes a key of the service's Secret, which the API server
+  # would refuse only once other objects exist.
+  defp check_env(%Service{env: env, name: name}) do
+    if Enum.all?(Map.keys(env), &Regex.match?(@secret_key, &1)),
       do: :ok,
-      else: {:error, {:k8s, {:bad_external, name}}}
+      else: {:error, {:k8s, {:bad_service, {name, :env}}}}
   end
 
-  defp check_external(_service), do: :ok
+  # `Service.normalize/2` counts raw bytes; the ConfigMap carries binary
+  # content base64-encoded, 4/3 the size, and is refused over the budget by
+  # the API server only once other objects exist.
+  defp check_files(%Service{files: files, name: name}) do
+    size = Files.payload_size(files)
+
+    if size <= Service.max_files_bytes(),
+      do: :ok,
+      else: {:error, {:k8s, {:files_too_large, {name, size}}}}
+  end
+
+  @doc """
+  Validate one `{:external, target}` service for a session in `namespace`
+  (`nil` when not yet known); any other placement is `:ok`. `normalize/2`
+  runs it for every service, and `CrowdControl.Preset.LogShipper` for its
+  aggregator, so a preset refuses what `provision/1` would.
+
+  An external is a hole in a deny-all, so each one is held to what it is
+  for:
+
+    * it needs `ports` and a well-formed target — a selector map, or an
+      `ip_block` whose prefix fits its family, with `host` (a DNS-1123
+      name) and `ip` both or neither (`{:bad_external, name}`);
+    * it runs nothing, so it has no egress of its own to declare
+      (`egress: :allow` is `{:external_egress_forbidden, name}`);
+    * reached from `sbx`, an `ip_block` must sit inside RFC 1918, CGNAT or
+      ULA space or be at least a /24 (IPv4) or /56 (IPv6) — anything wider
+      is internet egress for the sandbox nobody declared
+      (`{:external_too_broad, {name, cidr}}`);
+    * port 53, or a selector reaching `kube-system`, is kube-dns, which no
+      policy here opens by accident: it needs `allow_dns: true` in the
+      target (`{:external_dns_not_declared, {name, 53 | "kube-system"}}`).
+  """
+  @spec check_external(Service.t(), String.t() | nil) :: :ok | {:error, {:k8s, term()}}
+  def check_external(
+        %Service{placement: {:external, target}, name: name, ports: ports} = service,
+        namespace
+      ) do
+    cond do
+      ports == [] or not valid_target?(target) ->
+        {:error, {:k8s, {:bad_external, name}}}
+
+      service.egress == :allow ->
+        {:error, {:k8s, {:external_egress_forbidden, name}}}
+
+      true ->
+        with :ok <- check_breadth(service, target) do
+          check_dns(service, target, namespace)
+        end
+    end
+  end
+
+  def check_external(%Service{}, _namespace), do: :ok
+
+  defp check_breadth(service, %{ip_block: cidr}) do
+    if on_sandbox_network?(service) and not narrow?(cidr),
+      do: {:error, {:k8s, {:external_too_broad, {service.name, cidr}}}},
+      else: :ok
+  end
+
+  defp check_breadth(_service, _selector_target), do: :ok
+
+  defp check_dns(%Service{name: name, ports: ports}, target, namespace) do
+    cond do
+      Map.get(target, :allow_dns, false) ->
+        :ok
+
+      53 in ports ->
+        {:error, {:k8s, {:external_dns_not_declared, {name, 53}}}}
+
+      reaches_kube_system?(target, namespace) ->
+        {:error, {:k8s, {:external_dns_not_declared, {name, "kube-system"}}}}
+
+      true ->
+        :ok
+    end
+  end
+
+  # A namespace selector naming `kube-system` under any key, or a bare pod
+  # selector — which a NetworkPolicy scopes to its own namespace — in a
+  # session that runs there.
+  defp reaches_kube_system?(%{ip_block: _}, _namespace), do: false
+
+  defp reaches_kube_system?(target, namespace) do
+    case target[:namespace_selector] do
+      nil -> namespace == "kube-system"
+      labels -> "kube-system" in Map.values(labels)
+    end
+  end
 
   defp valid_target?(%{ip_block: cidr} = target) do
     cidr?(cidr) and Enum.all?(Map.get(target, :except, []), &cidr?/1) and
       not Map.has_key?(target, :namespace_selector) and
-      not Map.has_key?(target, :pod_selector) and valid_alias?(target)
+      not Map.has_key?(target, :pod_selector) and valid_alias?(target) and
+      valid_allow_dns?(target)
   end
 
   defp valid_target?(%{} = target) do
     selectors = Enum.reject([target[:namespace_selector], target[:pod_selector]], &is_nil/1)
 
-    selectors != [] and Enum.all?(selectors, &string_map?/1) and valid_alias?(target)
+    selectors != [] and Enum.all?(selectors, &string_map?/1) and valid_alias?(target) and
+      valid_allow_dns?(target)
   end
 
   defp valid_target?(_target), do: false
@@ -271,9 +389,20 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   defp valid_alias?(target) do
     case {Map.get(target, :host), Map.get(target, :ip)} do
       {nil, nil} -> true
-      {host, ip} when is_binary(host) and is_binary(ip) -> host != "" and ip?(ip)
+      {host, ip} when is_binary(host) and is_binary(ip) -> dns_subdomain?(host) and ip?(ip)
       _ -> false
     end
+  end
+
+  defp valid_allow_dns?(target), do: Map.get(target, :allow_dns, false) in [true, false]
+
+  # A `hostAliases` hostname, which the API server validates as a DNS-1123
+  # subdomain.
+  defp dns_subdomain?(host) do
+    byte_size(host) in 1..253 and
+      host
+      |> String.split(".")
+      |> Enum.all?(&(byte_size(&1) <= 63 and Regex.match?(@dns_label, &1)))
   end
 
   defp string_map?(map),
@@ -281,14 +410,50 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
       is_map(map) and map != %{} and
         Enum.all?(map, fn {k, v} -> is_binary(k) and is_binary(v) end)
 
-  defp cidr?(cidr) when is_binary(cidr) do
-    case String.split(cidr, "/") do
-      [ip, bits] -> ip?(ip) and match?({_n, ""}, Integer.parse(bits))
-      _ -> false
+  defp cidr?(cidr), do: match?({:ok, _ip, _bits}, parse_cidr(cidr))
+
+  defp parse_cidr(cidr) when is_binary(cidr) do
+    with [ip, bits] <- String.split(cidr, "/"),
+         {:ok, address} <- :inet.parse_strict_address(String.to_charlist(ip)),
+         {bits, ""} when bits >= 0 <- Integer.parse(bits),
+         true <- bits <= address_width(address) do
+      {:ok, address, bits}
+    else
+      _ -> :error
     end
   end
 
-  defp cidr?(_cidr), do: false
+  defp parse_cidr(_cidr), do: :error
+
+  # Inside a private range, or a prefix long enough to name a host or a
+  # small subnet rather than the internet.
+  defp narrow?(cidr) do
+    {:ok, address, bits} = parse_cidr(cidr)
+
+    case address_width(address) do
+      32 -> bits >= 24 or Enum.any?(@narrow_v4, &within?(address, bits, &1))
+      128 -> bits >= 56 or Enum.any?(@narrow_v6, &within?(address, bits, &1))
+    end
+  end
+
+  defp within?(address, bits, range) do
+    {:ok, base, range_bits} = parse_cidr(range)
+    shift = address_width(address) - range_bits
+
+    bits >= range_bits and
+      Bitwise.bsr(address_int(address), shift) == Bitwise.bsr(address_int(base), shift)
+  end
+
+  defp address_width(address) when tuple_size(address) == 4, do: 32
+  defp address_width(address) when tuple_size(address) == 8, do: 128
+
+  defp address_int(address) do
+    segment = div(address_width(address), tuple_size(address))
+
+    address
+    |> Tuple.to_list()
+    |> Enum.reduce(0, &(Bitwise.bsl(&2, segment) + &1))
+  end
 
   defp ip?(ip), do: match?({:ok, _}, :inet.parse_strict_address(String.to_charlist(ip)))
 
@@ -392,12 +557,12 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   @doc """
   Every object a session's services derive, for `destroy/1`: the `:separate`
   Pods (with their own grace), Services and NetworkPolicies, every service's
-  `:files` ConfigMap, and the sandbox's own Service when it declared
-  `:sandbox_ports`. Deleted unconditionally, each 404 being success.
+  `:files` ConfigMap and `env` Secret, and the sandbox's own Service when it
+  declared `:sandbox_ports`. Deleted unconditionally, each 404 being success.
   """
   @spec derived_objects(String.t(), [ref()], boolean()) :: [
           {:pod, String.t(), non_neg_integer()}
-          | {:service | :network_policy | :config_map, String.t()}
+          | {:service | :network_policy | :config_map | :secret, String.t()}
         ]
   def derived_objects(session_key, refs, sandbox_service?) do
     separate = Enum.filter(refs, &(&1.placement == :separate))
@@ -406,7 +571,8 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
       Enum.map(separate, &{:service, object_name(session_key, &1.name)}) ++
       if(sandbox_service?, do: [{:service, object_name(session_key, @sandbox_alias)}], else: []) ++
       Enum.map(separate, &{:network_policy, object_name(session_key, &1.name)}) ++
-      Enum.map(refs, &{:config_map, Files.config_map_name(session_key, &1.name)})
+      Enum.map(refs, &{:config_map, Files.config_map_name(session_key, &1.name)}) ++
+      Enum.map(refs, &{:secret, Secrets.secret_name(session_key, &1.name)})
   end
 
   @doc """
@@ -748,7 +914,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     }
     |> maybe_put("command", service.entrypoint)
     |> maybe_put("args", service.command)
-    |> maybe_put("env", env(service.env))
+    |> maybe_put("env", Secrets.env(ctx.session_key, service.name, service.env))
     |> maybe_put("resources", resources(service.host_config))
     |> maybe_put("lifecycle", Drain.lifecycle(service))
     |> maybe_put("volumeMounts", presence(mounts(ctx, service)))
@@ -781,16 +947,22 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     |> put_run_as(service)
   end
 
+  # Root is decided numerically, by the same check `Service.normalize/2`
+  # gates `weaken: [:user]` on, so `"00"` is root here too. No `user:` means
+  # the image's own, which the kubelet must then prove is not root — unless
+  # `:user` was declared in `weaken:`.
   defp put_run_as(security_context, service) do
     case run_as(service) do
       {:ok, {uid, gid}} ->
         security_context
         |> Map.put("runAsUser", uid)
         |> maybe_put("runAsGroup", gid)
-        |> Map.put("runAsNonRoot", uid != 0)
+        |> Map.put("runAsNonRoot", not Service.root_user?(service.user))
 
-      _ ->
-        security_context
+      _none ->
+        if :user in service.weaken,
+          do: security_context,
+          else: Map.put(security_context, "runAsNonRoot", true)
     end
   end
 
@@ -807,12 +979,6 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     |> maybe_put("runtimeClassName", config[:runtime_class])
     |> maybe_put("nodeSelector", config[:node_selector])
     |> maybe_put("tolerations", config[:tolerations])
-  end
-
-  defp env(env) when map_size(env) == 0, do: nil
-
-  defp env(env) do
-    env |> Enum.sort() |> Enum.map(fn {name, value} -> %{"name" => name, "value" => value} end)
   end
 
   defp resources(host_config) do
@@ -968,7 +1134,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
         "crowd_control.role" => "service",
         "crowd_control.service" => service
       },
-      "annotations" => %{"crowd_control.owner" => to_string(ctx.owner)}
+      "annotations" => Kubernetes.object_annotations(ctx)
     }
   end
 

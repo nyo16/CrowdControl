@@ -45,11 +45,14 @@ defmodule CrowdControl.Preset.LogShipper do
 
   ## Draining
 
-  `drain: 3_000` and `shutdown_limit: 20` are set, so teardown waits for the
+  `drain: 15_000` and `shutdown_limit: 20` are set, so teardown waits for the
   file source to reach EOF before SIGTERM (a Kubernetes `preStop` sleep, or a
   Compose wait before `stop`) and then gives Vector its graceful-shutdown limit
-  (`VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS`) plus a margin. Without it the last
-  ~2 s of a session are lost.
+  (`VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS`) plus a margin. Without it the end of
+  a session is lost. The drain is how long Vector keeps reading after the
+  sandbox stops, so it must cover Vector's own latency: measured on
+  Kubernetes, a line written after a minute of idle took ~10 s to reach the
+  aggregator.
 
   ## Options
 
@@ -86,7 +89,7 @@ defmodule CrowdControl.Preset.LogShipper do
     * `:image` — default `timberio/vector:0.61.0-distroless-libc`, pinned by
       digest.
     * `:user` — default `"65532:65532"` (the image runs as root otherwise).
-    * `:drain`, `:shutdown_limit` — defaults `3_000` ms and `20` s.
+    * `:drain`, `:shutdown_limit` — defaults `15_000` ms and `20` s.
     * `:sandbox` — Compose: the sandbox service name, default `"sandbox"`;
       Vector `depends_on` it so the capture directory is copied up with the
       sandbox's ownership before Vector mounts it.
@@ -100,6 +103,7 @@ defmodule CrowdControl.Preset.LogShipper do
   sandbox's too.
   """
 
+  alias CrowdControl.Backend.Kubernetes.Services
   alias CrowdControl.Preset.YAML
 
   @default_name "vector"
@@ -109,7 +113,7 @@ defmodule CrowdControl.Preset.LogShipper do
   @default_capture "/var/log/cc/out.jsonl"
   # Keep in step with `CrowdControl.Session`'s `:max_line_bytes` default.
   @default_max_line_bytes 1_048_576
-  @default_drain 3_000
+  @default_drain 15_000
   @default_shutdown_limit 20
   @default_network "log"
   @default_sandbox "sandbox"
@@ -183,6 +187,11 @@ defmodule CrowdControl.Preset.LogShipper do
   The `{:external, target}` aggregator service for a Kubernetes shipper, or
   `nil` on Compose. Its port is the sink address's; its `host` alias is the
   address's host when that is a name.
+
+  The aggregator is on the sandbox's own network, so its target is held to
+  `CrowdControl.Backend.Kubernetes.Services.check_external/2` here, as
+  `provision/1` would: a private or narrow `ip_block`, and no kube-dns
+  unless the target says `allow_dns: true`.
   """
   @spec aggregator(keyword()) :: map() | nil
   def aggregator(opts) do
@@ -195,9 +204,22 @@ defmodule CrowdControl.Preset.LogShipper do
           ports: [port]
         }
         |> CrowdControl.Preset.validate!(__MODULE__)
+        |> reachable_target!()
 
       _compose ->
         nil
+    end
+  end
+
+  defp reachable_target!(spec) do
+    {:ok, service} = CrowdControl.Service.normalize(spec, :sidecar)
+
+    case Services.check_external(service, nil) do
+      :ok ->
+        spec
+
+      {:error, {:k8s, reason}} ->
+        refuse!("the aggregator #{inspect(spec.placement)} is refused: #{inspect(reason)}")
     end
   end
 
