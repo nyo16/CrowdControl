@@ -129,6 +129,29 @@ defmodule CrowdControl.Backend.Docker.API do
     end
   end
 
+  @doc """
+  The default user an image runs as (`GET /images/{name}/json`, `Config.User`).
+
+  `""` — Docker's answer for an image that sets no `USER` — means root. An
+  image the daemon does not have is `{:error, {:docker, {:not_found, _}}}`.
+
+  The name goes into the path unencoded: the Engine API routes
+  `repo/name:tag`, `name@sha256:…` and `repo/name:tag@sha256:…` as raw path
+  segments (checked against a live daemon).
+  """
+  @spec image_user(config(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def image_user(config, image) when is_binary(image) do
+    with {:ok, body} <- request(config, :get, "/images/#{image}/json") do
+      case body do
+        %{"Config" => %{"User" => user}} when is_binary(user) -> {:ok, user}
+        # No `Config`, or a null `User`: Docker sets neither for an image built
+        # without a `USER`, so this is the same root default as `""`.
+        %{} -> {:ok, ""}
+        _other -> {:error, {:docker, {:unexpected_body, "/images/#{image}/json"}}}
+      end
+    end
+  end
+
   @doc false
   # Public so the table of real-world version strings is assertable without a
   # daemon: "26.1.4", "25.0.5-ce", "28.0.0-rc.1", and the patch-less "27.1".
