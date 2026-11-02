@@ -28,7 +28,8 @@ defmodule CrowdControl.Backend.Kubernetes do
                                mv -f <status>.partial <status>' \
                            </dev/null >/dev/null 2>&1 &
 
-      write      POST   .../exec   sh -c 'printf %s <escaped> >> <fifo>'
+      write      POST   .../exec   sh -c 'head -c <n> >> <fifo>'
+                 frame bytes on the stdin channel, never in argv
 
       read       POST   .../exec   tail -c +<byte_offset + 1> -f <tee>
                  over a long-lived `Kubereq.PodExec` websocket
@@ -138,8 +139,8 @@ defmodule CrowdControl.Backend.Kubernetes do
 
     * `:image` — Pod image (required). Needs the CLI plus `sh`, `tail`, `tee` and
       `head` on `PATH`; busybox and coreutils both suffice. `head -c` is what
-      bounds the credential read — see `API.exec_stdin/5` for why stdin EOF
-      cannot be used for that
+      bounds the credential read and every `write/2` — see `API.exec_stdin/5`
+      for why stdin EOF cannot be used for that
     * `:namespace` — default: the kubeconfig context's namespace, else `"default"`
     * `:kubeconfig` — a `%Kubereq.Kubeconfig{}`, a pipeline module, or
       `{module, opts}`; default `Kubereq.Kubeconfig.Default`, which covers both
@@ -935,21 +936,29 @@ defmodule CrowdControl.Backend.Kubernetes do
 
   # --- write ---
 
+  # The frame travels the exec websocket's stdin channel, exactly like the env
+  # file, rather than argv. In argv (`printf %s <escaped> >> fifo`, as this used
+  # to be) one frame was capped by Linux's MAX_ARG_STRLEN of 128 KiB per argv
+  # string, and an SDK MCP tool result can exceed it. Over stdin there is no
+  # size limit, and the frame is no longer an attacker-influenced string inside
+  # an `sh -c` script at all: the only interpolations are a byte count and the
+  # FIFO path. `head -c N`, not `cat`, for the reason given at
+  # `env_write_command/2`: the command must end on its own so channel 3 arrives.
+  #
+  # Ordering holds because `exec_stdin/5` returns only after channel 3, i.e.
+  # after `head` has written the whole frame and exited.
   @impl true
   def write(%__MODULE__{pod_name: name} = handle, data) when is_binary(name) do
     payload = IO.iodata_to_binary(data)
+    command = "head -c #{byte_size(payload)} >> #{Shell.escape(handle.fifo_path)}"
 
-    # The prompt is attacker-influenced input crossing an `sh -c` boundary.
-    # Shell.escape/1 is the same escaper Backend.Local uses for env values and
-    # the one security_test.exs is the oracle for -- deliberately not a second
-    # implementation.
-    command = "printf %s #{Shell.escape(payload)} >> #{Shell.escape(handle.fifo_path)}"
-
-    case API.exec_once(handle.config, name, ["/bin/sh", "-c", command], container: @container) do
-      {:ok, _output} -> :ok
+    case API.exec_stdin(handle.config, name, ["/bin/sh", "-c", command], payload,
+           container: @container
+         ) do
+      :ok -> :ok
       # A timeout here is not a failure, it is an *unknown*. `bounded/2` kills the
       # exec task brutally and the Mint socket dies with it, but the API server
-      # may already have run the `printf` — so the prompt may or may not be in the
+      # may already have run the `head` — so the frame may or may not be in the
       # FIFO. Reported as a generic timeout, the obvious response is to retry,
       # which delivers the prompt twice. Naming it lets a caller decide.
       {:error, {:k8s, :exec_timeout}} -> {:error, {:k8s, :write_indeterminate}}

@@ -23,8 +23,10 @@ defmodule CrowdControl.Backend.Docker do
                           | tee <teefile>;
                         mv -f <status>.partial <status>'
 
-      write      POST /containers/{id}/exec  (started detached)
+      write      POST /containers/{id}/exec  (started detached, then
+                 GET /exec/{id}/json until it has exited)
                  sh -c 'printf %s <escaped> >> <fifo>'
+                 a frame over 120 KiB is {:error, :frame_too_large}
 
       read       POST /containers/{id}/exec  (started attached)
                  tail -c +<byte_offset + 1> -f <teefile>
@@ -86,6 +88,9 @@ defmodule CrowdControl.Backend.Docker do
     * `:fifo_path` — default `/var/run/cc.fifo`
     * `:max_stream_bytes` — cap on total output; `nil` (default) is unbounded
     * `:max_inflight_bytes` — reader backpressure watermark, default 4 MiB
+    * `:write_timeout` — how long `write/2` waits for its exec to exit, in
+      ms, default 10000; past it the write is
+      `{:error, {:docker, :write_indeterminate}}`
     * `:proxy_url`, `:session_token` — see the egress proxy contract in
       `SECURITY.md`
 
@@ -471,6 +476,22 @@ defmodule CrowdControl.Backend.Docker do
 
   # --- write ---
 
+  # The frame is in argv: the `sh -c` script string. Linux caps one argv string
+  # at MAX_ARG_STRLEN (128 KiB), so a bigger frame would fail inside the daemon
+  # with an error that names none of this. It is refused here instead, below
+  # the limit and measured on the script as escaped, which is what the kernel
+  # sees. `Backend.Kubernetes` sends frames over the exec stdin channel and has
+  # no such limit; the Engine API's exec has no stdin without a hijacked
+  # attach, which `Req` cannot speak (see the moduledoc).
+  @max_frame_bytes 120 * 1024
+  @default_write_timeout 10_000
+
+  # The exec is started detached, so `start` returning says nothing about the
+  # `printf` having run. Two writes in a row could otherwise both be in flight
+  # and reach the FIFO in either order, which reorders control frames. So the
+  # exec is inspected until it has exited, and its exit code is the write's
+  # result: a `printf` into a FIFO that is gone fails rather than reading as a
+  # delivered prompt.
   @impl true
   def write(%__MODULE__{container_id: id} = handle, data) when is_binary(id) do
     payload = IO.iodata_to_binary(data)
@@ -481,12 +502,48 @@ defmodule CrowdControl.Backend.Docker do
     # implementation.
     command = "printf %s #{Shell.escape(payload)} >> #{Shell.escape(handle.fifo_path)}"
 
-    with {:ok, exec_id} <- create_exec(handle, ["/bin/sh", "-c", command], attach: false) do
-      start_exec_detached(handle, exec_id)
+    with :ok <- check_frame_size(command),
+         {:ok, exec_id} <- create_exec(handle, ["/bin/sh", "-c", command], attach: false),
+         :ok <- start_exec_detached(handle, exec_id) do
+      deadline = System.monotonic_time(:millisecond) + write_timeout(handle)
+      await_exec(handle, exec_id, deadline, 5)
     end
   end
 
   def write(%__MODULE__{}, _data), do: {:error, :not_provisioned}
+
+  defp check_frame_size(command) when byte_size(command) > @max_frame_bytes,
+    do: {:error, :frame_too_large}
+
+  defp check_frame_size(_command), do: :ok
+
+  defp write_timeout(handle), do: handle.config[:write_timeout] || @default_write_timeout
+
+  # `ExitCode` is null until the process has run, and `Running` can read false
+  # before it starts as well as after it ends, so only a non-null exit code
+  # means done. Out of budget, the frame may or may not have reached the FIFO:
+  # that is an unknown, named as one, so a caller does not blindly retry and
+  # deliver it twice (the same reasoning as `Backend.Kubernetes.write/2`).
+  defp await_exec(handle, exec_id, deadline, backoff) do
+    case API.request(handle.config, :get, "/exec/#{exec_id}/json") do
+      {:ok, %{"Running" => false, "ExitCode" => 0}} ->
+        :ok
+
+      {:ok, %{"Running" => false, "ExitCode" => code}} when is_integer(code) ->
+        {:error, {:docker, {:exit_status, code}}}
+
+      {:ok, _running_or_not_started} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, {:docker, :write_indeterminate}}
+        else
+          Process.sleep(backoff)
+          await_exec(handle, exec_id, deadline, min(backoff * 2, 100))
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   # --- read / reattach ---
 

@@ -63,7 +63,7 @@ defmodule CrowdControl.Backend.LocalTest do
   end
 
   describe "env file mechanism" do
-    test "no env means no env dir and no shell wrapper" do
+    test "no env means no env dir (the release scrub runs inline, without one)" do
       handle = exec_fake_cli([])
 
       assert handle.env_dir == nil
