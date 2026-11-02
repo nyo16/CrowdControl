@@ -687,3 +687,101 @@ Provider rate-limit and quota handling belongs with the proxy and is out of
 scope for this library. So is workspace push/pull: the optional
 `push_workspace/2` and `pull_artifacts/2` callbacks exist in the behaviour
 but ship with no implementation.
+
+## Forward-proxy contract
+
+This is a **different proxy** from the one above. The egress proxy contract
+(`:proxy_url` on Docker, `:proxy_service` on Compose) covers the API-credential
+proxy the *CLI* talks to. A forward proxy carries a *browser's* general web
+traffic in the strict two-tier layout — sandbox on `sbx`, browser on `sbx` and
+`brw`, forward proxy on `brw` plus the NAT bridge — and the sandbox cannot reach
+it. `CrowdControl.Preset.EgressProxy` (Smokescreen, port 4750) is the reference;
+no image ships, and any other proxy in that seat MUST:
+
+1. **Match a hostname allowlist on `CONNECT`**, without TLS interception.
+2. **Deny loopback, link-local, RFC 1918, ULA, CGNAT and IPv6-embedded
+   destinations *after* resolution, and dial the address it checked**, so an
+   allowlisted name that resolves somewhere private — DNS rebinding, a cloud
+   metadata address — is still refused. A dual-homed proxy can reach the host
+   LAN through its NAT bridge, which is why its own check matters.
+3. **Deny IP-literal targets** unless they are allowlisted.
+4. **Allow port 443 only** (80 optionally).
+5. **Log one structured line per decision** with an allow/deny field.
+6. **Have a readiness probe that works without a shell**, or say it has none.
+
+An allowlist is no stronger than its entries: with no TLS inspection, a client
+that may `CONNECT allowed.cdn.example:443` can then speak to any tenant behind
+that IP. Never allowlist a shared CDN or hosting suffix.
+
+### The network layer is the boundary, not the browser's proxy setting
+
+A proxy setting only constrains clients that choose to use it:
+
+- **`playwright run-server` clients choose their own proxy.** The server passes
+  a client's `proxy` launch option through unchanged, so an agent can launch
+  Chromium with no proxy or a different one. The preset's image uses
+  `launchServer` with the proxy fixed server-side, which is defence in depth,
+  not the control.
+- **Chromium bypasses loopback, and with it `169.254.169.254`, unless the bypass
+  list says `<-loopback>`.** Playwright adds `<-loopback>` itself when a proxy is
+  set and the bypass names no loopback host, which is why
+  `CrowdControl.Preset.Browser` refuses `localhost`, `127.0.0.1`, `::1`,
+  `<loopback>` and `<-loopback>` in `:proxy_bypass`. A raw Chrome or CDP image
+  must pass `--proxy-bypass-list=<-loopback>` itself, and never `direct://`.
+- **WebRTC ignores `--proxy-server`** and sends UDP on every interface by
+  default. The preset's image passes
+  `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, but the guarantee
+  is that UDP has no route.
+
+So egress MUST be impossible without the proxy: on Compose the browser has
+`egress: :none` and only internal networks, and the sandbox may share no network
+with an `egress: :allow` service
+(`{:error, {:compose, {:sandbox_shares_network_with_egress, network, service}}}`);
+on Kubernetes the browser's NetworkPolicy admits only its peers' ports and the
+proxy is the only Pod with internet egress (TCP 443, private ranges excluded).
+
+### The browser's ports have no authentication
+
+Playwright MCP (8931) has no authentication and its README says it is not a
+security boundary; the `launchServer` WebSocket (3000) is protected only by its
+per-session path, a `ccpw_` token that is a capability — anyone who knows it and
+can reach the port controls the browser. Both are protected by the network
+alone: only parties sharing `sbx` with the browser reach them. The MCP server's
+`--allowed-hosts` only rejects a request whose `Host` is not `browser:8931`; `--allowed-origins` and
+`--blocked-origins` are **not** a boundary (upstream: they do not affect
+redirects), so this library does not rely on them.
+
+### Log redaction is best-effort, and the aggregator can be spoofed
+
+`CrowdControl.Preset.LogShipper` redacts every line before shipping it, with
+gitleaks-derived filters plus CrowdControl's `ccst_` and `ccpw_` tokens, and
+drops a line it cannot process rather than forwarding it unredacted. A regex list
+always trails new credential formats and cannot see a secret the model encoded
+or split: redaction is defence in depth, not a guarantee, and a shipped
+transcript should be stored as if it may contain secrets.
+
+Nor is a shipped line proof of origin. On Kubernetes the shipper is a `:pod`
+sidecar sharing the sandbox's network namespace, and the sandbox Pod's policy
+allows the aggregator, so code in the sandbox can push the aggregator anything,
+including forged events that look like the shipper's (`.cc.host` is the Pod's
+hostname, which the sandbox shares). On every substrate the capture itself is
+written from inside the sandbox, so its content is the sandbox's word too. The
+aggregator should treat its input as written by the sandbox.
+
+### Docker Engine 25.0.5 or newer
+
+Before Docker Engine 25.0.5 (and 26.0.0), the embedded DNS on an `Internal: true`
+network forwarded queries upstream (CVE-2024-29018): a DNS exfiltration path out
+of a network with no route. `CrowdControl.Provider.Compose` asks the daemon's
+version once per `:docker_host` whenever per-service networks or an
+`egress: :allow` sidecar are in use, and refuses an older one with
+`{:error, {:version, :docker, have, {25, 0, 5}}}` before creating anything. The
+sandbox's own isolation still assumes a patched daemon in every configuration.
+
+### `:files` is configuration, never secrets
+
+A service's `:files` are staged into the container on Compose and become a
+ConfigMap on Kubernetes, readable by anyone with `get configmaps` in the
+namespace; they are also never scanned. Credentials belong in `env:` on Compose
+(which `scrub/1` strips before the Store) and in an operator-managed Secret on
+Kubernetes, where a service's `env` sits in its Pod object.

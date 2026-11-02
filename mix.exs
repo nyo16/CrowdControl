@@ -135,7 +135,15 @@ defmodule CrowdControl.MixProject do
           CrowdControl.Provider.Endpoint,
           CrowdControl.Provider.Docker,
           CrowdControl.Provider.Compose,
-          CrowdControl.Provider.Gce
+          CrowdControl.Provider.Gce,
+          CrowdControl.Service
+        ],
+        # CrowdControl.Preset.YAML is @moduledoc false, so it stays out.
+        Presets: [
+          CrowdControl.Preset,
+          CrowdControl.Preset.Browser,
+          CrowdControl.Preset.EgressProxy,
+          CrowdControl.Preset.LogShipper
         ],
         Persistence: [
           CrowdControl.Store,
@@ -154,6 +162,10 @@ defmodule CrowdControl.MixProject do
           CrowdControl.Backend.Docker.Demux,
           CrowdControl.Backend.Docker.HostConfig,
           CrowdControl.Backend.Kubernetes.API,
+          CrowdControl.Backend.Kubernetes.Drain,
+          CrowdControl.Backend.Kubernetes.Files,
+          CrowdControl.Backend.Kubernetes.Services,
+          CrowdControl.VersionGate,
           CrowdControl.Backend.Sandboxd.API,
           CrowdControl.Provider.Gce.API,
           CrowdControl.Provider.Gce.Tunnel,

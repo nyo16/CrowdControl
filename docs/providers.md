@@ -872,6 +872,88 @@ Only messages travel, never `%GcpCompute.Error{}`'s `:body`: that field can hold
 metadata is not always rendered through `Inspect` — which is exactly the leak
 [operations.md](operations.md)'s `LogRedactor` section covers from the other side.
 
+## Kubernetes `:services`
+
+`CrowdControl.Backend.Kubernetes` is a backend, not a provider, but it takes the
+same sidecar specs as `Provider.Compose` — a `CrowdControl.Service` map, with the
+same `egress`, `networks:`, `host_config:`/`weaken:`, `:files`, `:ready`, `drain`
+and `shutdown_limit` — so one stack definition means the same thing on both. The
+full rules are in `CrowdControl.Backend.Kubernetes.Services`; this is the map.
+
+### Placement is required, because a Pod boundary is posture
+
+Compose ignores `placement:` (with a warning). Kubernetes refuses a service
+without one, `{:error, {:k8s, {:placement_required, name}}}`, for the same reason
+`egress` has no default: posture is never inferred.
+
+| `placement` | Objects created | `egress: :allow` | Sees the capture | Floor |
+|---|---|---|---|---|
+| `:pod` | none of its own: a native sidecar (`restartPolicy: Always`) in the sandbox Pod's `initContainers`, after `cc-init` | refused, `{:k8s, {:pod_sidecar_egress_forbidden, name}}` — it shares the sandbox's network namespace | yes, through a `read_only: true` mount of the capture directory | Kubernetes 1.29 |
+| `:separate` | Pod, ClusterIP Service (when it has `ports`) and NetworkPolicy, all `cc-<session_key>-<name>` | allowed, on a network the sandbox is not on | no | — |
+| `{:external, target}` | nothing; peers sharing its network get an egress rule to the `target` selector or `ip_block` | n/a | n/a | — |
+
+A `:separate` name is at most 27 characters (the object name must fit a 63-char
+DNS label), and `cc`, `cc-init`, `deny-all` and `sandbox` are reserved. Using
+`:services` or `:sandbox_ports` requires an explicit `:network`, and any
+`:separate` service runs the enforcement probe whatever `:network` says.
+
+### Edges come from `networks:`, as on Compose
+
+The sandbox is on `sbx`, and so is a service that names no network. Two parties
+sharing a network may reach each other's declared `ports` — the sandbox's are
+`:sandbox_ports`, which also creates a `cc-<session_key>-sandbox` Service so a
+browser can open a dev server under test as `sandbox:<port>`. Nothing else is
+allowed in or out. An `egress: :allow` service only answers peers (no
+in-session edge starts from it, so a compromised proxy cannot turn into the
+browser), may share no network with the sandbox
+(`{:k8s, {:sandbox_shares_network_with_egress, "sbx", name}}`, invariant 1 in
+Kubernetes form), and gets kube-dns plus TCP 443 to the internet minus RFC 1918,
+link-local, CGNAT and ULA. An external's `sbx` membership means the sandbox Pod
+alone, so a `:pod` log shipper's aggregator is not handed to a browser that also
+sits on `sbx`.
+
+### No DNS: `hostAliases` instead
+
+No policy allows kube-dns to the sandbox or to an `egress: :none` service —
+a recursive resolver is an exfiltration channel. Every Pod instead gets
+`hostAliases` mapping each peer's name to its Service ClusterIP, read back off
+the created Service, so `browser:8931` and `ws://browser:3000/…` resolve exactly
+as on Compose. An external with `host` and `ip` becomes an alias too; one named
+only by a hostname is unreachable from a Pod with no DNS, which is why
+`CrowdControl.Preset.LogShipper` requires the aggregator's ClusterIP as `ip:`.
+
+### Create order, rollback and the orphan sweep
+
+`provision/1` validates every spec and checks the version floors before its first
+request, then creates ConfigMaps (`:files`) → NetworkPolicies → Services (their
+ClusterIPs read back) → service Pods → one shared `:provision_timeout` for every
+service Pod's readiness → the sandbox Pod. A service that never becomes ready is
+`{:error, {:k8s, {:service_not_ready, name, reason}}}`. Any failure runs
+`destroy/1`, which derives every object name from the sandbox Pod's
+`crowd_control.services` annotation and deletes each, 404 being success; with a
+drained `:pod` sidecar it deletes with a grace of `drain + shutdown_limit + 5`
+seconds and the sidecar carries a `preStop` sleep (Kubernetes 1.30).
+
+A node dying between the first service object and the sandbox Pod leaves objects
+nothing names. `CrowdControl.Backend.Kubernetes.sweep_orphans/1`, which the
+reaper calls after a successful `list_live/1`, finds them by label
+(`crowd_control.role` `service` or `service-config`, this owner's hash),
+re-checks the raw owner annotation, and deletes only those older than
+`:provision_timeout` plus a minute whose session has no live sandbox Pod; the
+reaper reports the count as `swept`. `list_live/1` itself now selects
+`crowd_control.role!=service`, so a service Pod is never mistaken for a sandbox.
+
+### Version floors
+
+Checked by `CrowdControl.VersionGate` before anything is created, and only when
+the feature is in use; a failure is `{:error, {:version, component, have, need}}`.
+
+| Feature | Needs |
+|---|---|
+| `placement: :pod` sidecars | Kubernetes 1.29 |
+| `preStop` sleep on a drained sidecar | Kubernetes 1.30 |
+| Compose per-service networks, `egress: :allow` sidecars | Docker Engine 25.0.5 (CVE-2024-29018) |
+
 ## Choosing one
 
 | | `Provider.Docker` | `Provider.Compose` | `Provider.Gce` |

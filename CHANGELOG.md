@@ -40,6 +40,36 @@
 - **`release_env: :inherit`** on `Backend.Local`, opting out of the release
   environment scrub below.
 - **`:write_timeout`** on `Backend.Docker` (default 10 s).
+- **`CrowdControl.Service`** — one sidecar spec for Compose and Kubernetes,
+  with new fields `networks`, `host_config`, `weaken`, `files`, `placement`,
+  `drain` (ms) and `shutdown_limit` (s, default 20).
+- **Compose per-service networks and overrides.** `:networks` declares extra
+  internal networks a service joins through `networks:`; once in use, the
+  sandbox may share no network with an `egress: :allow` service other than
+  `:proxy_service` (`{:compose, {:sandbox_shares_network_with_egress, net, svc}}`).
+  `host_config:` overrides the stack's hardening per service: resource keys
+  freely, weakening keys only when named in `weaken:`, `privileged` never.
+- **`:files` on a service** — config files staged with
+  `PUT /containers/{id}/archive` on Compose, a ConfigMap on Kubernetes. For
+  configuration, never secrets.
+- **Drain for log sidecars.** A service with `drain:` is stopped gracefully
+  after a wait (Compose `stop?t=shutdown_limit + 5`; Kubernetes `preStop` sleep
+  and a matching delete grace period).
+- **Kubernetes `:services`** with a required `placement` — `:pod` (native
+  sidecar), `:separate` (own Pod, Service and NetworkPolicy) or
+  `{:external, target}` — NetworkPolicy edges from `networks:`, DNS-free peer
+  discovery through `hostAliases`, and `:sandbox_ports`.
+  `Kubernetes.sweep_orphans/1`, called by the reaper (reported as `swept`),
+  removes service objects a crash left behind.
+- **`CrowdControl.VersionGate`** — version floors checked before anything is
+  created: Kubernetes 1.29 for `:pod` sidecars, 1.30 for `preStop` sleep,
+  Docker Engine 25.0.5 for per-service networks and `egress: :allow` sidecars
+  (`{:error, {:version, component, have, need}}`).
+- **Presets** — `CrowdControl.Preset.browser_stack/1`, `Preset.Browser`
+  (Playwright), `Preset.EgressProxy` (Smokescreen) and `Preset.LogShipper`
+  (Vector, redacting by default), returning plain service specs.
+- **Images** — a `sandbox-browser` Dockerfile stage and example
+  `examples/images/browser` and `examples/images/smokescreen` images.
 
 ### Changed
 
@@ -60,6 +90,19 @@
   before its sandbox is destroyed.
 - **`:telemetry` is declared as an optional dependency** (it previously
   arrived only transitively); without it every event is a no-op.
+- **Compose session tokens carry a `ccst_` prefix**, so log redaction can
+  match them.
+- **Kubernetes `list_live/1` selects `crowd_control.role!=service`**, so a
+  service Pod is never reattached to or destroyed as a sandbox.
+- **`placement` is required for Kubernetes `:services`**
+  (`{:k8s, {:placement_required, name}}`); Compose ignores it with a warning.
+- **New Kubernetes RBAC verbs:** `create, get, list, delete` on `services` and
+  `configmaps`, `list` on `networkpolicies`, and `get` on `pods/log`. Grant the
+  `list`s wherever the reaper runs, for the orphan sweep.
+- **The Dockerfile's runtime stage is named `runtime`**, with a trailing
+  `FROM runtime` keeping it the default target.
+- **Compose hardening is a per-service default** rather than one posture per
+  stack.
 
 ### Fixed
 
