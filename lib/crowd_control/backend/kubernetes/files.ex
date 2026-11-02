@@ -18,8 +18,9 @@ defmodule CrowdControl.Backend.Kubernetes.Files do
   with the Pod's `fsGroup`, so `:uid`/`:gid` are ignored on Kubernetes.
 
   **Never credentials.** A ConfigMap is readable by anyone with `get` on the
-  namespace; secrets go through an operator-managed Secret reference instead.
-  See `CrowdControl.Service`.
+  namespace; secrets go through a service's `env`, which this backend puts in
+  a per-session Secret (`CrowdControl.Backend.Kubernetes.Secrets`). See
+  `CrowdControl.Service`.
   """
 
   alias CrowdControl.Backend.Kubernetes
@@ -113,6 +114,26 @@ defmodule CrowdControl.Backend.Kubernetes.Files do
         "readOnly" => true
       }
     end)
+  end
+
+  @doc """
+  The bytes `files` occupy in the ConfigMap `manifest/3` builds: UTF-8
+  content as is, anything else base64-encoded in `binaryData` (4/3 its raw
+  size). This, not the raw total `CrowdControl.Service.normalize/2` checks,
+  is what the `:files` budget is held to on Kubernetes.
+
+      iex> alias CrowdControl.Backend.Kubernetes.Files
+      iex> Files.payload_size([%{content: "abc"}, %{content: <<255, 0, 1>>}])
+      7
+  """
+  @spec payload_size([%{required(:content) => binary(), optional(atom()) => term()}]) ::
+          non_neg_integer()
+  def payload_size(files) do
+    files
+    |> Enum.map(fn %{content: content} ->
+      if String.valid?(content), do: byte_size(content), else: 4 * div(byte_size(content) + 2, 3)
+    end)
+    |> Enum.sum()
   end
 
   @doc """

@@ -7,12 +7,14 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
   alias CrowdControl.Backend.Kubernetes.API
   alias CrowdControl.Backend.Kubernetes.Drain
   alias CrowdControl.Backend.Kubernetes.Files
+  alias CrowdControl.Backend.Kubernetes.Secrets
   alias CrowdControl.Backend.Kubernetes.Services
   alias CrowdControl.Preset.LogShipper
   alias CrowdControl.Service
 
   doctest CrowdControl.Backend.Kubernetes.Drain
   doctest CrowdControl.Backend.Kubernetes.Files
+  doctest CrowdControl.Backend.Kubernetes.Secrets
   doctest CrowdControl.Backend.Kubernetes.Services
 
   @key "0123456789abcdef0123456789abcdef"
@@ -231,7 +233,10 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     ready: %{tcp_port: 8931},
     user: "10001:10001",
     env: %{"PW_WS_TOKEN" => "ccpw_0123456789abcdef"},
-    host_config: %{shm_size: 1_073_741_824, tmpfs: %{"/tmp" => "rw,nosuid,size=512m"}},
+    host_config: %{
+      shm_size: 1_073_741_824,
+      tmpfs: %{"/tmp" => "rw,noexec,nosuid,size=512m"}
+    },
     placement: :separate
   }
 
@@ -253,7 +258,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     command: ["--config", "/etc/vector/vector.yaml"],
     volumes: [%{name: "capture", target: "/var/log/cc", read_only: true}],
     files: [%{path: "/etc/vector/vector.yaml", content: "data_dir: x\n", mode: 0o444}],
-    host_config: %{tmpfs: %{"/var/lib/vector" => "rw,size=8m"}},
+    host_config: %{tmpfs: %{"/var/lib/vector" => "rw,noexec,nosuid,size=8m"}},
     user: "65532:65532",
     drain: 3_000,
     shutdown_limit: 20,
@@ -505,7 +510,18 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       [container] = spec["containers"]
       assert container["readinessProbe"]["tcpSocket"] == %{"port" => 8931}
       assert container["securityContext"]["runAsUser"] == 10_001
-      assert container["env"] == [%{"name" => "PW_WS_TOKEN", "value" => "ccpw_0123456789abcdef"}]
+
+      # By reference to the session's Secret: the token is not in the Pod.
+      assert container["env"] == [
+               %{
+                 "name" => "PW_WS_TOKEN",
+                 "valueFrom" => %{
+                   "secretKeyRef" => %{"name" => "cc-#{@key}-browser-env", "key" => "PW_WS_TOKEN"}
+                 }
+               }
+             ]
+
+      refute JSON.encode!(pod) =~ "ccpw_0123456789abcdef"
 
       volumes = Map.new(spec["volumes"], &{&1["name"], &1["emptyDir"]})
       assert volumes["cc-browser-shm"] == %{"medium" => "Memory", "sizeLimit" => "1073741824"}
@@ -589,6 +605,261 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     end
   end
 
+  describe "service env (blocker: a credential readable with `get pods`)" do
+    test "the Secret: named, labelled, annotated like every session object, values in data" do
+      session = Map.put(session("node-a"), :sweep_after_ms, 1_234)
+
+      manifest =
+        Secrets.manifest(session, "browser", %{"PW_WS_TOKEN" => "ccpw_x", "B" => <<255>>})
+
+      assert manifest["kind"] == "Secret"
+      assert manifest["type"] == "Opaque"
+      assert manifest["metadata"]["name"] == "cc-#{@key}-browser-env"
+      assert manifest["metadata"]["namespace"] == "ns1"
+
+      assert manifest["metadata"]["labels"] == %{
+               "crowd_control.session" => @key,
+               "crowd_control.owner_hash" => Kubernetes.owner_label("node-a"),
+               "crowd_control.service" => "browser",
+               "crowd_control.role" => "service-secret"
+             }
+
+      assert manifest["metadata"]["annotations"] == %{
+               "crowd_control.owner" => "node-a",
+               "crowd_control.sweep_after_ms" => "1234"
+             }
+
+      assert manifest["data"] == %{
+               "PW_WS_TOKEN" => Base.encode64("ccpw_x"),
+               "B" => Base.encode64(<<255>>)
+             }
+
+      refute Map.has_key?(manifest, "stringData")
+    end
+
+    test "create, get, delete and list address the namespaced secrets path" do
+      {config, log} = recorder(fn _req -> {200, %{"items" => [], "metadata" => %{}}} end)
+      manifest = Secrets.manifest(session("o"), "proxy", %{"K" => "v"})
+
+      assert {:ok, _} = API.create_secret(config, manifest)
+      assert {:ok, _} = API.get_secret(config, "cc-x-proxy-env")
+      assert {:ok, _} = API.delete_secret(config, "cc-x-proxy-env")
+      assert {:ok, []} = API.list_secrets(config, [{"crowd_control.role", "service-secret"}])
+
+      assert [
+               %{method: :post, path: "/api/v1/namespaces/ns1/secrets"},
+               %{method: :get, path: "/api/v1/namespaces/ns1/secrets/cc-x-proxy-env/"},
+               %{method: :delete, path: "/api/v1/namespaces/ns1/secrets/cc-x-proxy-env"},
+               %{method: :get, path: "/api/v1/namespaces/ns1/secrets", query: query}
+             ] = log.()
+
+      assert query["labelSelector"] == "crowd_control.role=service-secret"
+    end
+
+    test "no literal value in any Pod provision/1 creates, a :pod sidecar's included" do
+      vector = Map.put(@vector, :env, %{"VECTOR_SINK_TOKEN" => "s3cr3t-vector-token"})
+      stack = [vector, @browser, @proxy, @aggregator]
+      {config, log} = recorder(&cluster/1)
+
+      assert {:ok, _handle} = Kubernetes.provision(provision_opts(config, stack))
+
+      posts = for %{method: :post, path: path, body: body} <- log.(), do: {kind(path), body}
+      pods = for {:pods, body} <- posts, do: body
+
+      assert length(pods) == 3
+
+      for pod <- pods, value <- ["s3cr3t-vector-token", "ccpw_0123456789abcdef"] do
+        refute JSON.encode!(pod) =~ value, "#{pod["metadata"]["name"]} carries #{value}"
+        refute JSON.encode!(pod) =~ Base.encode64(value)
+      end
+
+      sandbox = Enum.find(pods, &(&1["metadata"]["name"] == "cc-#{@key}"))
+      [_init, sidecar] = sandbox["spec"]["initContainers"]
+
+      assert sidecar["env"] == [
+               %{
+                 "name" => "VECTOR_SINK_TOKEN",
+                 "valueFrom" => %{
+                   "secretKeyRef" => %{
+                     "name" => "cc-#{@key}-vector-env",
+                     "key" => "VECTOR_SINK_TOKEN"
+                   }
+                 }
+               }
+             ]
+
+      # The annotation destroy/1 derives names from: refs, never env.
+      annotation = sandbox["metadata"]["annotations"]["crowd_control.services"]
+      refute annotation =~ "VECTOR_SINK_TOKEN"
+      refute annotation =~ "PW_WS_TOKEN"
+
+      # The values are in the session's Secrets, one per service with env.
+      secrets = Map.new(for({:secrets, body} <- posts, do: {body["metadata"]["name"], body}))
+      assert Map.keys(secrets) == ["cc-#{@key}-browser-env", "cc-#{@key}-vector-env"]
+
+      assert secrets["cc-#{@key}-vector-env"]["data"] == %{
+               "VECTOR_SINK_TOKEN" => Base.encode64("s3cr3t-vector-token")
+             }
+    end
+
+    test "an env name that cannot be a Secret key is refused before any request" do
+      bad = %{@browser | env: %{"BAD KEY" => "v"}}
+
+      assert Kubernetes.provision(provision_opts(fn _ -> raise "no request" end, [bad])) ==
+               {:error, {:k8s, {:bad_service, {"browser", :env}}}}
+    end
+  end
+
+  describe "declared weakenings render (D9; W-19)" do
+    setup do
+      handle = handle(readonly_rootfs: true)
+      ctx = Kubernetes.service_context(handle)
+
+      hardy = %{
+        name: "hardy",
+        image: "hardy:1",
+        egress: :none,
+        user: "1000:1000",
+        host_config: %{
+          cap_add: ["SYS_ADMIN"],
+          no_new_privileges: false,
+          readonly_rootfs: false,
+          memory: 268_435_456,
+          cpus: 0.5,
+          tmpfs: %{"/scratch" => "rw,noexec,nosuid,size=16m"}
+        },
+        weaken: [:cap_add, :no_new_privileges, :readonly_rootfs],
+        placement: :separate
+      }
+
+      plain = %{
+        name: "plain",
+        image: "plain:1",
+        egress: :none,
+        user: "1001",
+        placement: :separate
+      }
+
+      %{ctx: ctx, hardy: hardy, plain: plain}
+    end
+
+    test "each declared key renders, and only on its own service", ctx do
+      {:ok, services} = Services.normalize([services: [ctx.hardy, ctx.plain]], ctx.ctx)
+      [hardy, plain] = Enum.map(services, &container(Services.pod_manifest(ctx.ctx, &1, [])))
+
+      # `readonly_rootfs: false` overrides the stack's `true`: no key at all.
+      assert hardy["securityContext"] == %{
+               "allowPrivilegeEscalation" => true,
+               "capabilities" => %{"drop" => ["ALL"], "add" => ["SYS_ADMIN"]},
+               "seccompProfile" => %{"type" => "RuntimeDefault"},
+               "runAsUser" => 1_000,
+               "runAsGroup" => 1_000,
+               "runAsNonRoot" => true
+             }
+
+      assert hardy["resources"] == %{"limits" => %{"memory" => "268435456", "cpu" => "500m"}}
+
+      # The sibling keeps every default of the stack.
+      assert plain["securityContext"] == %{
+               "allowPrivilegeEscalation" => false,
+               "capabilities" => %{"drop" => ["ALL"]},
+               "seccompProfile" => %{"type" => "RuntimeDefault"},
+               "readOnlyRootFilesystem" => true,
+               "runAsUser" => 1_001,
+               "runAsNonRoot" => true
+             }
+
+      refute Map.has_key?(plain, "resources")
+    end
+
+    test "a service may harden past the stack: readonly_rootfs: true needs no declaration",
+         ctx do
+      ctx_rw = Kubernetes.service_context(handle([]))
+      locked = put_in(ctx.plain, [:host_config], %{readonly_rootfs: true})
+
+      {:ok, [service]} = Services.normalize([services: [locked]], ctx_rw)
+
+      assert container(Services.pod_manifest(ctx_rw, service, []))["securityContext"][
+               "readOnlyRootFilesystem"
+             ]
+
+      {:ok, [service]} = Services.normalize([services: [ctx.plain]], ctx_rw)
+
+      refute Map.has_key?(
+               container(Services.pod_manifest(ctx_rw, service, []))["securityContext"],
+               "readOnlyRootFilesystem"
+             )
+    end
+
+    test "an undeclared weakening and a malformed tmpfs size are refused", ctx do
+      undeclared = %{ctx.hardy | weaken: [:no_new_privileges, :readonly_rootfs]}
+
+      assert {:error, {:k8s, {:weakening_not_declared, {"hardy", :cap_add}}}} =
+               Services.normalize([services: [undeclared, ctx.plain]], ctx.ctx)
+
+      malformed =
+        put_in(ctx.hardy, [:host_config, :tmpfs], %{"/scratch" => "rw,noexec,nosuid,size=lots"})
+
+      assert {:error, {:k8s, {:bad_host_config, {"hardy", :tmpfs}}}} =
+               Services.normalize([services: [malformed, ctx.plain]], ctx.ctx)
+    end
+  end
+
+  describe "user and files posture (G1/G2)" do
+    setup do
+      ctx = Kubernetes.service_context(handle([]))
+      %{ctx: ctx, base: %{name: "svc", image: "svc:1", egress: :none, placement: :separate}}
+    end
+
+    test "no user: the kubelet must prove the image is not root, unless :user is declared",
+         %{ctx: ctx, base: base} do
+      assert security(ctx, base) == %{
+               "allowPrivilegeEscalation" => false,
+               "capabilities" => %{"drop" => ["ALL"]},
+               "seccompProfile" => %{"type" => "RuntimeDefault"},
+               "runAsNonRoot" => true
+             }
+
+      refute Map.has_key?(security(ctx, Map.put(base, :weaken, [:user])), "runAsNonRoot")
+    end
+
+    test "root is numeric: \"00\" and \"000:1000\" are uid 0, and need weaken: [:user]",
+         %{ctx: ctx, base: base} do
+      for user <- ["00", "000:1000"] do
+        assert {:error, {:k8s, {:weakening_not_declared, {"svc", :user}}}} =
+                 Services.normalize([services: [Map.put(base, :user, user)]], ctx)
+      end
+
+      declared = Map.put(base, :weaken, [:user])
+
+      assert %{"runAsUser" => 0, "runAsNonRoot" => false} =
+               security = security(ctx, Map.put(declared, :user, "00"))
+
+      refute Map.has_key?(security, "runAsGroup")
+
+      assert %{"runAsUser" => 0, "runAsGroup" => 1_000, "runAsNonRoot" => false} =
+               security(ctx, Map.put(declared, :user, "000:1000"))
+
+      assert %{"runAsUser" => 1_000, "runAsNonRoot" => true} =
+               security(ctx, Map.put(base, :user, "1000"))
+    end
+
+    test "the :files budget counts the ConfigMap's base64, not the raw bytes",
+         %{ctx: ctx, base: base} do
+      # 800 000 raw bytes pass `Service.normalize/2`; base64 makes them 1 066 668.
+      raw = 800_000
+      binary = [%{path: "/data/blob", content: :binary.copy(<<255>>, raw)}]
+      text = [%{path: "/data/blob", content: String.duplicate("a", raw)}]
+
+      assert raw < Service.max_files_bytes()
+
+      assert {:error, {:k8s, {:files_too_large, {"svc", 1_066_668}}}} =
+               Services.normalize([services: [Map.put(base, :files, binary)]], ctx)
+
+      assert {:ok, _} = Services.normalize([services: [Map.put(base, :files, text)]], ctx)
+    end
+  end
+
   describe "list_live (blocker: a browser Pod reattached as a sandbox)" do
     test "the selector excludes role=service and still matches unlabelled sandboxes" do
       sandbox =
@@ -611,7 +882,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
   end
 
   describe "provision order and rollback (blocker: orphans after a failed create)" do
-    test "version → ConfigMaps → policies → Services → service Pods → ready → sandbox" do
+    test "version → ConfigMaps → Secrets → policies → Services → service Pods → ready → sandbox" do
       {config, log} = recorder(&cluster/1)
 
       assert {:ok, handle} = Kubernetes.provision(provision_opts(config, @stack))
@@ -624,6 +895,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       assert creates == [
                {:configmaps, "cc-#{@key}-vector-files"},
                {:configmaps, "cc-#{@key}-proxy-files"},
+               {:secrets, "cc-#{@key}-browser-env"},
                {:networkpolicies, "cc-#{@key}-deny-all"},
                {:networkpolicies, "cc-#{@key}-browser"},
                {:networkpolicies, "cc-#{@key}-proxy"},
@@ -669,6 +941,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       deleted = for %{method: :delete, path: path} <- requests, do: Path.basename(path)
 
       refute "cc-#{@key}" in created, "the sandbox Pod must not be created after a failure"
+      assert "cc-#{@key}-browser-env" in created
 
       for name <- created, name != "cc-#{@key}-proxy" do
         assert name in deleted, "#{name} was created and never deleted"
@@ -708,7 +981,10 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
             {:networkpolicies, "cc-#{@key}-deny-all"},
             {:configmaps, "cc-#{@key}-vector-files"},
             {:configmaps, "cc-#{@key}-browser-files"},
-            {:configmaps, "cc-#{@key}-proxy-files"}
+            {:configmaps, "cc-#{@key}-proxy-files"},
+            {:secrets, "cc-#{@key}-vector-env"},
+            {:secrets, "cc-#{@key}-browser-env"},
+            {:secrets, "cc-#{@key}-proxy-env"}
           ] do
         assert expected in deleted, "#{inspect(expected)} was not deleted"
       end
@@ -746,7 +1022,11 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
           object("cc-dead-deny-all", "dead", "sandbox", nil, created: old),
           object("cc-live-deny-all", "live", "sandbox", nil, created: old)
         ],
-        configmaps: [object("cc-dead-proxy-files", "dead", "service-config", nil, created: old)]
+        configmaps: [object("cc-dead-proxy-files", "dead", "service-config", nil, created: old)],
+        secrets: [
+          object("cc-dead-browser-env", "dead", "service-secret", nil, created: old),
+          object("cc-live-browser-env", "live", "service-secret", nil, created: old)
+        ]
       }
 
       {config, log} =
@@ -758,7 +1038,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
             {200, %{}}
         end)
 
-      assert {:ok, 6} =
+      assert {:ok, 7} =
                Kubernetes.sweep_orphans([owner: "node-a", provision_timeout: 1_000] ++ config)
 
       requests = log.()
@@ -772,6 +1052,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
                {:networkpolicies, "cc-dead-deny-all"},
                {:pods, "cc-dead-browser"},
                {:pods, "cc-done-browser"},
+               {:secrets, "cc-dead-browser-env"},
                {:services, "cc-dead-browser"}
              ]
 
@@ -786,6 +1067,8 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       assert {:networkpolicies, "crowd_control.owner_hash=#{hash}"} in lists
 
       assert {:configmaps, "crowd_control.owner_hash=#{hash},crowd_control.role=service-config"} in lists
+
+      assert {:secrets, "crowd_control.owner_hash=#{hash},crowd_control.role=service-secret"} in lists
     end
 
     test "a failed list deletes nothing (fail open)" do
@@ -931,7 +1214,8 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
           object("cc-ending-deny-all", "ending", "sandbox", nil, created: old),
           object("cc-draining-proxy", "draining", "service", old)
         ],
-        configmaps: []
+        configmaps: [],
+        secrets: []
       }
 
       {config, log} =
@@ -970,7 +1254,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       later = System.system_time(:millisecond)
       posts = for %{method: :post, body: body} <- log.(), do: body["metadata"]
 
-      assert length(posts) == 10
+      assert length(posts) == 11
 
       for metadata <- posts do
         stamp = metadata["annotations"]["crowd_control.sweep_after_ms"]
@@ -998,7 +1282,8 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
         networkpolicies: [
           object("cc-slow-deny-all", "slow", "sandbox", created, sweep_after: slow)
         ],
-        configmaps: []
+        configmaps: [],
+        secrets: []
       }
 
       {config, log} =
@@ -1149,6 +1434,16 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
         shipper.(%{namespace_selector: %{"kubernetes.io/metadata.name" => "kube-system"}})
       end
     end
+  end
+
+  defp container(pod) do
+    [container] = pod["spec"]["containers"]
+    container
+  end
+
+  defp security(ctx, spec) do
+    {:ok, [service]} = Services.normalize([services: [spec]], ctx)
+    container(Services.pod_manifest(ctx, service, []))["securityContext"]
   end
 
   # Nothing the sandbox needs was POSTed, and everything that was is DELETEd.
@@ -1314,6 +1609,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
   defp kind(path) do
     cond do
       path =~ "/configmaps" -> :configmaps
+      path =~ "/secrets" -> :secrets
       path =~ "/networkpolicies" -> :networkpolicies
       path =~ "/services" -> :services
       path =~ "/pods" -> :pods

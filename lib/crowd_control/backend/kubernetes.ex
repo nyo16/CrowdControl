@@ -82,6 +82,11 @@ defmodule CrowdControl.Backend.Kubernetes do
   This is the same env-file indirection `CrowdControl.Backend.Local` uses, with
   the same `CrowdControl.Backend.Shell.escape/1` oracle.
 
+  That is the CLI's env, which a session supplies per `exec/4`. A sidecar
+  service's `env` is fixed at provision and read by a container this backend
+  never execs into, so it takes the per-session Secret route instead (see
+  "Services" below): out of the Pod spec, at the cost of the `secrets` RBAC.
+
   ## Live and resume are the same code path
 
   `start_reader/3` is `reattach/2` at offset 0, as under Docker. One addition:
@@ -172,6 +177,10 @@ defmodule CrowdControl.Backend.Kubernetes do
     * `:timeout` — HTTP receive timeout, default 30s
     * `:exec_timeout` — wall-clock bound on every short exec, default 15s
     * `:provision_timeout` — wall-clock bound on reaching `Running`, default 120s
+    * `:orphan_margin_ms` — what the orphan sweep adds to `:provision_timeout`
+      before a session's objects count as abandoned, default 60s; read both
+      when provisioning (the `crowd_control.sweep_after_ms` stamp) and by
+      `sweep_orphans/1`. Mainly for tests, which cannot wait out a minute
     * `:pod_poll_ms` — reader's idle Pod-liveness poll, default 60s
     * `:max_inflight_bytes` — reader backpressure watermark, default 4 MiB
     * `:proxy_url`, `:session_token` — see the egress proxy contract in
@@ -237,19 +246,19 @@ defmodule CrowdControl.Backend.Kubernetes do
   `:separate` service exists, whatever `:network` says.
 
   `provision/1` validates every spec and checks the version floor before its
-  first create, then creates in this order: ConfigMaps (`:files`) →
-  NetworkPolicies → Services → service Pods → wait for every service Pod's
-  readiness (one `:provision_timeout` for all) → confirm `<pod>-deny-all`
-  still exists (`{:k8s, {:policy_missing, name}}` if not) → the sandbox Pod.
-  Any failure runs `destroy/1`, which derives every name from the
-  `crowd_control.services` annotation the sandbox Pod carries and deletes
-  each unconditionally, 404 being success. A crash between the first service
-  object and the sandbox Pod is the one case `destroy/1` cannot reach; the
-  reaper's `sweep_orphans/1` call removes those once no live sandbox Pod
-  claims their session and they are past both the reaper's
-  `:provision_timeout` plus a minute and their own
+  first create, then creates in this order: ConfigMaps (`:files`) → Secrets
+  (`env`) → NetworkPolicies → Services → service Pods → wait for every
+  service Pod's readiness (one `:provision_timeout` for all) → confirm
+  `<pod>-deny-all` still exists (`{:k8s, {:policy_missing, name}}` if not) →
+  the sandbox Pod. Any failure runs `destroy/1`, which derives every name
+  from the `crowd_control.services` annotation the sandbox Pod carries and
+  deletes each unconditionally, 404 being success. A crash between the first
+  service object and the sandbox Pod is the one case `destroy/1` cannot
+  reach; the reaper's `sweep_orphans/1` call removes those once no live
+  sandbox Pod claims their session and they are past both the reaper's
+  `:provision_timeout` plus `:orphan_margin_ms` and their own
   `crowd_control.sweep_after_ms` annotation (the provisioning session's
-  `:provision_timeout` plus a minute, as wall-clock milliseconds).
+  `:provision_timeout` plus its margin, as wall-clock milliseconds).
 
   A Pod with a drained sidecar is deleted with a grace period, and it keeps
   running for it. Its NetworkPolicy is what keeps it isolated, so `destroy/1`
@@ -261,9 +270,12 @@ defmodule CrowdControl.Backend.Kubernetes do
   long when anything is drained. A Pod whose DELETE fails (anything but a
   404) keeps its policy too, whatever its grace.
 
-  A service's `env` lands in its Pod object, so it is readable by anyone with
-  `get pods` — credentials belong in an operator-managed Secret, and `:files`
-  (a ConfigMap) is for configuration only.
+  A service's `env` goes in a per-session Secret, `cc-<key>-<name>-env`
+  (`crowd_control.role=service-secret`), which its container reads by
+  `secretKeyRef`: no literal value is in any Pod spec, a `:pod` sidecar's
+  included, nor in the `crowd_control.services` annotation. The Secret is
+  readable by anyone with `get secrets` in the namespace and deleted with
+  the session. `:files` (a ConfigMap) is for configuration only.
 
   ## RBAC
 
@@ -277,11 +289,12 @@ defmodule CrowdControl.Backend.Kubernetes do
                                                 # with a :separate service
       services        create, get, list, delete # :separate services, :sandbox_ports
       configmaps      create, get, list, delete # services with :files
+      secrets         create, get, list, delete # services with env
 
-  `list` on `services`, `configmaps` and `networkpolicies` is what the
-  reaper's orphan sweep needs, so grant it wherever the reaper runs this
-  backend, even before any session uses `:services`; without it the sweep
-  logs a warning and deletes nothing.
+  `list` on `services`, `configmaps`, `secrets` and `networkpolicies` is
+  what the reaper's orphan sweep needs, so grant it wherever the reaper runs
+  this backend, even before any session uses `:services`; without it the
+  sweep logs a warning and deletes nothing.
   """
 
   @behaviour CrowdControl.Backend
@@ -296,6 +309,7 @@ defmodule CrowdControl.Backend.Kubernetes do
   alias CrowdControl.Backend.Kubernetes.API
   alias CrowdControl.Backend.Kubernetes.Drain
   alias CrowdControl.Backend.Kubernetes.Files
+  alias CrowdControl.Backend.Kubernetes.Secrets
   alias CrowdControl.Backend.Kubernetes.Services
   alias CrowdControl.Backend.Shell
   alias CrowdControl.Store
@@ -313,7 +327,8 @@ defmodule CrowdControl.Backend.Kubernetes do
   # `:provision_timeout` between its first service object and the sandbox Pod
   # (the readiness wait shares one deadline), and the margin covers the create
   # round trips either side of it. Both the sweep's floor and the
-  # `crowd_control.sweep_after_ms` stamp add it.
+  # `crowd_control.sweep_after_ms` stamp add it; `:orphan_margin_ms`
+  # overrides it (mainly for tests).
   @orphan_margin_ms 60_000
 
   @sweep_after_annotation "crowd_control.sweep_after_ms"
@@ -463,17 +478,19 @@ defmodule CrowdControl.Backend.Kubernetes do
       else: :ok
   end
 
-  # Each object exists before anything that refers to it: ConfigMaps before the
-  # Pods that mount them; every NetworkPolicy before the Pod it selects, so no
-  # Pod has a moment without its policy; Services before the Pods whose
-  # `hostAliases` carry their ClusterIPs; service Pods Ready before the
-  # sandbox, so the agent's first request finds them.
+  # Each object exists before anything that refers to it: ConfigMaps and
+  # Secrets before the Pods that mount or read them; every NetworkPolicy
+  # before the Pod it selects, so no Pod has a moment without its policy;
+  # Services before the Pods whose `hostAliases` carry their ClusterIPs;
+  # service Pods Ready before the sandbox, so the agent's first request finds
+  # them.
   #
   # Any failure deletes everything created so far through `destroy/1`, whose
   # every DELETE treats 404 as success. With no services the sequence, and its
   # failure behaviour, is exactly what it was before services existed.
   defp create_objects(handle, services) do
     with :ok <- created(handle, create_config_maps(handle, services)),
+         :ok <- created(handle, create_secrets(handle, services)),
          :ok <- created(handle, ensure_network_policy(handle, services)),
          :ok <- created(handle, create_service_policies(handle, services)),
          {:ok, ips} <- created(handle, create_services(handle, services)),
@@ -490,8 +507,10 @@ defmodule CrowdControl.Backend.Kubernetes do
   # floor uses *its* `:provision_timeout`, which a session may exceed.
   defp sweep_after(opts) do
     System.system_time(:millisecond) + (opts[:provision_timeout] || @default_provision_timeout) +
-      @orphan_margin_ms
+      orphan_margin(opts)
   end
+
+  defp orphan_margin(config), do: config[:orphan_margin_ms] || @orphan_margin_ms
 
   # The readiness wait can outlast the reaper's own floor, and a sweep that
   # misjudged the session then deletes its `<pod>-deny-all` — after which the
@@ -528,16 +547,33 @@ defmodule CrowdControl.Backend.Kubernetes do
   defp derives_objects?(handle), do: handle.services != [] or handle.sandbox_ports != []
 
   defp create_config_maps(handle, services) do
-    session = %{
+    services
+    |> Enum.filter(&(&1.placement in [:pod, :separate] and &1.files != []))
+    |> each_ok(
+      &API.create_config_map(
+        handle.config,
+        Files.manifest(object_session(handle), &1.name, &1.files)
+      )
+    )
+  end
+
+  # A service's env, kept out of every Pod spec: the Pods read it by
+  # `secretKeyRef` (see `Kubernetes.Secrets`).
+  defp create_secrets(handle, services) do
+    services
+    |> Enum.filter(&(&1.placement in [:pod, :separate] and &1.env != %{}))
+    |> each_ok(
+      &API.create_secret(handle.config, Secrets.manifest(object_session(handle), &1.name, &1.env))
+    )
+  end
+
+  defp object_session(handle) do
+    %{
       session_key: handle.session_key,
       owner: handle.owner,
       namespace: handle.namespace,
       sweep_after_ms: handle.sweep_after_ms
     }
-
-    services
-    |> Enum.filter(&(&1.placement in [:pod, :separate] and &1.files != []))
-    |> each_ok(&API.create_config_map(handle.config, Files.manifest(session, &1.name, &1.files)))
   end
 
   defp create_service_policies(handle, services) do
@@ -2051,6 +2087,7 @@ defmodule CrowdControl.Backend.Kubernetes do
   defp delete_object(config, {:service, name}), do: API.delete_service(config, name)
   defp delete_object(config, {:network_policy, name}), do: API.delete_network_policy(config, name)
   defp delete_object(config, {:config_map, name}), do: API.delete_config_map(config, name)
+  defp delete_object(config, {:secret, name}), do: API.delete_secret(config, name)
 
   @impl true
   def scrub(%__MODULE__{} = handle) do
@@ -2158,22 +2195,23 @@ defmodule CrowdControl.Backend.Kubernetes do
   @doc """
   Delete the session objects a crash left behind, for `CrowdControl.Reaper`.
 
-  `provision/1` creates a session's ConfigMaps, NetworkPolicies (the
-  sandbox's own `<pod>-deny-all` among them), Services and service Pods
+  `provision/1` creates a session's ConfigMaps, Secrets, NetworkPolicies
+  (the sandbox's own `<pod>-deny-all` among them), Services and service Pods
   *before* its sandbox Pod, and `destroy/1` finds them through the sandbox
   Pod's annotation — so a VM dying between the two leaves objects nothing
   will ever name. This finds them by label instead: every object with
-  `crowd_control.role` `service` or `service-config` (or `sandbox`, for a
-  NetworkPolicy) and this owner's hash, whose session has no live Pod (a
-  sandbox Pending or Running, or any of its Pods still terminating — a
-  terminating Pod still runs and still needs its policy), whose raw
-  `crowd_control.owner` annotation matches exactly (the hash is a selector,
-  not proof), and that is past both `:provision_timeout` plus a minute and
-  its own `crowd_control.sweep_after_ms` annotation — the provisioning
-  session's `:provision_timeout` plus a minute, which may be longer — so an
+  `crowd_control.role` `service`, `service-config` or `service-secret` (or
+  `sandbox`, for a NetworkPolicy) and this owner's hash, whose session has
+  no live Pod (a sandbox Pending or Running, or any of its Pods still
+  terminating — a terminating Pod still runs and still needs its policy),
+  whose raw `crowd_control.owner` annotation matches exactly (the hash is a
+  selector, not proof), and that is past both `:provision_timeout` plus
+  `:orphan_margin_ms` (default a minute) and its own
+  `crowd_control.sweep_after_ms` annotation — the provisioning session's
+  `:provision_timeout` plus its margin, which may be longer — so an
   in-flight provision is never swept from under itself.
 
-  All four lists must succeed before anything is deleted; any failure is
+  All five lists must succeed before anything is deleted; any failure is
   returned and nothing is touched. Returns how many objects were deleted
   (404 included: something else got there first).
   """
@@ -2181,20 +2219,20 @@ defmodule CrowdControl.Backend.Kubernetes do
   def sweep_orphans(config) do
     owner = config[:owner] || Store.owner_id()
     by_owner = [{"crowd_control.owner_hash", owner_label(owner)}]
-    services_role = by_owner ++ [{"crowd_control.role", "service"}]
+    by_role = &(by_owner ++ [{"crowd_control.role", &1}])
 
     with {:ok, pods} <- API.list_all(config, nil, label_selectors: by_owner),
-         {:ok, services} <- API.list_services(config, services_role),
+         {:ok, services} <- API.list_services(config, by_role.("service")),
          {:ok, policies} <- API.list_network_policies(config, by_owner),
-         {:ok, config_maps} <-
-           API.list_config_maps(config, by_owner ++ [{"crowd_control.role", "service-config"}]) do
+         {:ok, config_maps} <- API.list_config_maps(config, by_role.("service-config")),
+         {:ok, secrets} <- API.list_secrets(config, by_role.("service-secret")) do
       {service_pods, sandboxes} = Enum.split_with(pods, &(role(&1) == "service"))
 
       live =
         Enum.filter(sandboxes, &live_sandbox?/1) ++ Enum.filter(service_pods, &terminating?/1)
 
       live = MapSet.new(live, &session_of/1)
-      floor = (config[:provision_timeout] || @default_provision_timeout) + @orphan_margin_ms
+      floor = (config[:provision_timeout] || @default_provision_timeout) + orphan_margin(config)
       now = System.system_time(:millisecond)
 
       swept =
@@ -2204,7 +2242,8 @@ defmodule CrowdControl.Backend.Kubernetes do
              Enum.filter(policies, &(role(&1) in ["service", "sandbox"])),
              &{:network_policy, &1}
            ) ++
-           Enum.map(config_maps, &{:config_map, &1}))
+           Enum.map(config_maps, &{:config_map, &1}) ++
+           Enum.map(secrets, &{:secret, &1}))
         |> Enum.filter(fn {_kind, object} -> orphan?(object, live, owner, floor, now) end)
         |> Enum.count(&sweep_object(config, &1))
 

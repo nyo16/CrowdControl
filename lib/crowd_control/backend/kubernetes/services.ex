@@ -37,6 +37,16 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
       sandbox reaches must be private or narrow, and kube-dns needs
       `allow_dns: true` — see `check_external/2`.
 
+  A `:pod` or `:separate` service's `env` lives in a per-session Secret
+  (`CrowdControl.Backend.Kubernetes.Secrets`) and reaches the container
+  through `secretKeyRef`, so no literal value is in any Pod spec. Its
+  `:files` live in a per-session ConfigMap (`Kubernetes.Files`), whose
+  payload — binary content base64-encoded — must fit
+  `CrowdControl.Service.max_files_bytes/0` (`{:files_too_large, {name, size}}`).
+  A container with no `user:` gets `runAsNonRoot: true` unless `:user` is
+  declared in `weaken:`; a numeric root uid (`"0"`, `"00"`, `"0:1000"`) is
+  `runAsNonRoot: false`, which only `weaken: [:user]` lets through.
+
   ## Edges come from network membership
 
   The `networks:` list that decides who shares a Compose network decides the
@@ -71,6 +81,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   alias CrowdControl.Backend.Kubernetes
   alias CrowdControl.Backend.Kubernetes.Drain
   alias CrowdControl.Backend.Kubernetes.Files
+  alias CrowdControl.Backend.Kubernetes.Secrets
   alias CrowdControl.Service
 
   @sandbox_network "sbx"
@@ -106,6 +117,9 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   @default_tmpfs_size "64Mi"
 
   @dns_label ~r/\A[a-z0-9]([-a-z0-9]*[a-z0-9])?\z/
+
+  # The Secret key alphabet: each env name is a key of the service's Secret.
+  @secret_key ~r/\A[-._a-zA-Z0-9]+\z/
 
   @typedoc """
   What `destroy/1` needs to know about one service, persisted on the sandbox
@@ -189,7 +203,9 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
          :ok <- check_placement(service),
          :ok <- check_user(service),
          :ok <- check_mounts(service, ctx),
-         :ok <- check_tmpfs(service) do
+         :ok <- check_tmpfs(service),
+         :ok <- check_env(service),
+         :ok <- check_files(service) do
       check_external(service, ctx.namespace)
     end
   end
@@ -254,6 +270,25 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
         :error -> {:halt, {:error, {:k8s, {:bad_host_config, {name, :tmpfs}}}}}
       end
     end)
+  end
+
+  # Each name becomes a key of the service's Secret, which the API server
+  # would refuse only once other objects exist.
+  defp check_env(%Service{env: env, name: name}) do
+    if Enum.all?(Map.keys(env), &Regex.match?(@secret_key, &1)),
+      do: :ok,
+      else: {:error, {:k8s, {:bad_service, {name, :env}}}}
+  end
+
+  # `Service.normalize/2` counts raw bytes; the ConfigMap carries binary
+  # content base64-encoded, 4/3 the size, and is refused over the budget by
+  # the API server only once other objects exist.
+  defp check_files(%Service{files: files, name: name}) do
+    size = Files.payload_size(files)
+
+    if size <= Service.max_files_bytes(),
+      do: :ok,
+      else: {:error, {:k8s, {:files_too_large, {name, size}}}}
   end
 
   @doc """
@@ -522,12 +557,12 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   @doc """
   Every object a session's services derive, for `destroy/1`: the `:separate`
   Pods (with their own grace), Services and NetworkPolicies, every service's
-  `:files` ConfigMap, and the sandbox's own Service when it declared
-  `:sandbox_ports`. Deleted unconditionally, each 404 being success.
+  `:files` ConfigMap and `env` Secret, and the sandbox's own Service when it
+  declared `:sandbox_ports`. Deleted unconditionally, each 404 being success.
   """
   @spec derived_objects(String.t(), [ref()], boolean()) :: [
           {:pod, String.t(), non_neg_integer()}
-          | {:service | :network_policy | :config_map, String.t()}
+          | {:service | :network_policy | :config_map | :secret, String.t()}
         ]
   def derived_objects(session_key, refs, sandbox_service?) do
     separate = Enum.filter(refs, &(&1.placement == :separate))
@@ -536,7 +571,8 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
       Enum.map(separate, &{:service, object_name(session_key, &1.name)}) ++
       if(sandbox_service?, do: [{:service, object_name(session_key, @sandbox_alias)}], else: []) ++
       Enum.map(separate, &{:network_policy, object_name(session_key, &1.name)}) ++
-      Enum.map(refs, &{:config_map, Files.config_map_name(session_key, &1.name)})
+      Enum.map(refs, &{:config_map, Files.config_map_name(session_key, &1.name)}) ++
+      Enum.map(refs, &{:secret, Secrets.secret_name(session_key, &1.name)})
   end
 
   @doc """
@@ -878,7 +914,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     }
     |> maybe_put("command", service.entrypoint)
     |> maybe_put("args", service.command)
-    |> maybe_put("env", env(service.env))
+    |> maybe_put("env", Secrets.env(ctx.session_key, service.name, service.env))
     |> maybe_put("resources", resources(service.host_config))
     |> maybe_put("lifecycle", Drain.lifecycle(service))
     |> maybe_put("volumeMounts", presence(mounts(ctx, service)))
@@ -911,16 +947,22 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     |> put_run_as(service)
   end
 
+  # Root is decided numerically, by the same check `Service.normalize/2`
+  # gates `weaken: [:user]` on, so `"00"` is root here too. No `user:` means
+  # the image's own, which the kubelet must then prove is not root — unless
+  # `:user` was declared in `weaken:`.
   defp put_run_as(security_context, service) do
     case run_as(service) do
       {:ok, {uid, gid}} ->
         security_context
         |> Map.put("runAsUser", uid)
         |> maybe_put("runAsGroup", gid)
-        |> Map.put("runAsNonRoot", uid != 0)
+        |> Map.put("runAsNonRoot", not Service.root_user?(service.user))
 
-      _ ->
-        security_context
+      _none ->
+        if :user in service.weaken,
+          do: security_context,
+          else: Map.put(security_context, "runAsNonRoot", true)
     end
   end
 
@@ -937,12 +979,6 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     |> maybe_put("runtimeClassName", config[:runtime_class])
     |> maybe_put("nodeSelector", config[:node_selector])
     |> maybe_put("tolerations", config[:tolerations])
-  end
-
-  defp env(env) when map_size(env) == 0, do: nil
-
-  defp env(env) do
-    env |> Enum.sort() |> Enum.map(fn {name, value} -> %{"name" => name, "value" => value} end)
   end
 
   defp resources(host_config) do
