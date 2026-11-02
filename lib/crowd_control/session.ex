@@ -101,6 +101,9 @@ defmodule CrowdControl.Session do
       answer at once. Past it a new request is answered at once with an error
       (a deny for a permission request, a JSON-RPC error for an MCP message)
       and is not persisted. Defaults to `64`.
+    * `:reattach_reply_timeout` - test-only. ms a reattached session waits for
+      its `initialize` reply before it falls back to the permission requests it
+      persisted. Defaults to `60_000`.
 
   `context` is `%{session: pid, store_key: key, request_id: id, subtype: subtype}`.
   Callbacks run under `CrowdControl.CallbackSupervisor`, so one that blocks on a
@@ -125,7 +128,10 @@ defmodule CrowdControl.Session do
   `CrowdControl.CLI.min_version/0`: `CrowdControl.Backend.Local` checks
   `--version` before spawning (start fails with `{:cli_version, have, need}`),
   and every backend checks the `system/init` frame, broadcasting
-  `{:error, {:cli_version, have, need}}` and stopping.
+  `{:error, {:cli_version, have, need}}` and stopping. A version that cannot be
+  read (no Claude Code `--version` banner, or an unparsable one) passes the
+  gate with a logged warning (D8): refusing would lock out a CLI whose banner
+  merely changed shape.
   """
 
   # :transient, not :temporary. `:temporary` is right when the OS process dies
@@ -165,7 +171,8 @@ defmodule CrowdControl.Session do
     :on_control_request,
     :permission_timeout,
     :interrupt_grace,
-    :max_pending_control
+    :max_pending_control,
+    :reattach_reply_timeout
   ]
 
   defstruct [
@@ -609,8 +616,12 @@ defmodule CrowdControl.Session do
   # sandbox image and are checked at `system/init` instead.
   defp check_cli_version(Backend.Local, %Control{features?: true}, executable, env, opts) do
     case local_cli_version(executable, probe_env(env, opts)) do
-      {:ok, have} -> version_gate(have)
-      :unknown -> :ok
+      {:ok, have} ->
+        version_gate(have)
+
+      :unknown ->
+        Logger.warning("Could not read the Claude Code version; skipping the version gate")
+        :ok
     end
   end
 
@@ -668,6 +679,7 @@ defmodule CrowdControl.Session do
           else: :ok
 
       :error ->
+        Logger.warning("Unparsable Claude Code version #{inspect(have)}; skipping the gate")
         :ok
     end
   end
@@ -1773,7 +1785,8 @@ defmodule CrowdControl.Session do
   defp write_reattach_frame(frame, state) do
     with :ok <- write_frame(state, frame),
          id when is_binary(id) <- control_request_id(frame) do
-      state = track_outbound(state, id, :reattach, @reattach_reply_timeout)
+      timeout = Keyword.get(state.opts, :reattach_reply_timeout, @reattach_reply_timeout)
+      state = track_outbound(state, id, :reattach, timeout)
       put_control(state, %{state.control | reconciling: true})
     else
       nil ->

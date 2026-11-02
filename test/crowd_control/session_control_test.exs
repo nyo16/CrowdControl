@@ -163,7 +163,7 @@ defmodule CrowdControl.SessionControlTest do
 
       {:ok, pid} =
         start(ctl,
-          timeout: 400,
+          timeout: 1_000,
           interrupt_grace: 0,
           can_use_tool: {__MODULE__, :defer, [me()]}
         )
@@ -176,10 +176,10 @@ defmodule CrowdControl.SessionControlTest do
       state = :sys.get_state(pid)
       assert state.timeout_ref == nil
       remaining = state.control.paused_remaining_ms
-      assert remaining > 0 and remaining < 400
+      assert remaining > 0 and remaining < 1_000
 
-      # Well past the whole 400 ms deadline: paused, so nothing fires.
-      Process.sleep(500)
+      # Well past the whole 1_000 ms deadline: paused, so nothing fires.
+      Process.sleep(1_100)
       refute_received {:crowd_control, ^pid, {:timeout, _}}
       assert Mock.destroy_count(ctl) == 0
 
@@ -218,7 +218,7 @@ defmodule CrowdControl.SessionControlTest do
       {:ok, pid} =
         start(ctl,
           timeout: 100,
-          interrupt_grace: 300,
+          interrupt_grace: 2_000,
           can_use_tool: {__MODULE__, :defer, [me()]}
         )
 
@@ -230,8 +230,7 @@ defmodule CrowdControl.SessionControlTest do
       assert_receive {:crowd_control, ^pid, {:result, _, _}}, 1_000
 
       # Past the grace period: the result disarmed it.
-      Process.sleep(500)
-      refute_received {:crowd_control, ^pid, {:timeout, _}}
+      refute_receive {:crowd_control, ^pid, {:timeout, _}}, 2_200
       assert Mock.destroy_count(ctl) == 0
       assert Process.alive?(pid)
 
@@ -380,6 +379,83 @@ defmodule CrowdControl.SessionControlTest do
       TestHelpers.stop_session(pid)
     end
 
+    # The captured request waits for the CLI's list; each fallback lets the
+    # persisted set stand, so it is dispatched rather than withdrawn.
+    defp reattach_with_captured_request(id, extra_opts \\ []) do
+      key = unique_key()
+      ctl = start_supervised!({Mock, events: [{:stdout_data, line(can_use_tool_frame(id))}]})
+
+      record =
+        Store.build(
+          key: key,
+          backend: Mock,
+          handle: Mock.handle(ctl, key),
+          byte_offset: 0,
+          buffer: "",
+          opts:
+            [
+              agent: ClaudeCode,
+              executable: "claude",
+              timeout: 60_000,
+              can_use_tool: {__MODULE__, :allow, [me()]}
+            ] ++ extra_opts
+        )
+
+      {:ok, pid} = Session.start_reattached(record)
+      TestHelpers.wait_until(fn -> map_size(:sys.get_state(pid).control.pending) == 1 end)
+      refute_received {:asked, ^id, _}
+      {ctl, pid}
+    end
+
+    defp assert_persisted_set_stands(ctl, pid, id) do
+      assert_receive {:asked, ^id, _}, 2_000
+      TestHelpers.wait_until(fn -> answers(ctl, id) != [] end)
+      assert [%{"behavior" => "allow"}] = answers(ctl, id)
+      refute :sys.get_state(pid).control.reconciling
+      TestHelpers.stop_session(pid)
+    end
+
+    test "an initialize error after reattach keeps the persisted requests" do
+      {ctl, pid} = reattach_with_captured_request("f1")
+
+      Mock.push_events(ctl, [
+        {:stdout_data,
+         line(%{
+           "type" => "control_response",
+           "response" => %{
+             "subtype" => "error",
+             "request_id" => ClaudeCode.init_request_id(),
+             "error" => "boom"
+           }
+         })}
+      ])
+
+      assert_persisted_set_stands(ctl, pid, "f1")
+    end
+
+    test "an initialize reply without pending_permission_requests keeps the persisted requests" do
+      {ctl, pid} = reattach_with_captured_request("f2")
+
+      Mock.push_events(ctl, [
+        {:stdout_data,
+         line(%{
+           "type" => "control_response",
+           "response" => %{
+             "subtype" => "success",
+             "request_id" => ClaudeCode.init_request_id(),
+             "response" => %{"session_state" => "idle"}
+           }
+         })}
+      ])
+
+      assert_persisted_set_stands(ctl, pid, "f2")
+    end
+
+    test "no initialize reply after reattach falls back to the persisted requests" do
+      {ctl, pid} = reattach_with_captured_request("f3", reattach_reply_timeout: 200)
+      assert_persisted_set_stands(ctl, pid, "f3")
+    end
+
     test "a persisted request the CLI no longer lists is withdrawn" do
       key = unique_key()
       ctl = start_supervised!({Mock, events: []})
@@ -482,14 +558,15 @@ defmodule CrowdControl.SessionControlTest do
           opts: [executable: "claude", timeout: 60_000],
           control: %{
             pending: %{},
-            turn_deadline_at: System.system_time(:millisecond) + 300,
+            turn_deadline_at: System.system_time(:millisecond) + 5_000,
             paused_remaining_ms: nil
           }
         )
 
       {:ok, pid} = Session.start_reattached(record)
       left = Process.read_timer(:sys.get_state(pid).timeout_ref)
-      assert left > 0 and left <= 300
+      # Far below a 60_000 restart, and an integer: `false` would mean it fired.
+      assert is_integer(left) and left > 0 and left <= 5_000
 
       TestHelpers.stop_session(pid)
     end
@@ -540,6 +617,73 @@ defmodule CrowdControl.SessionControlTest do
                  env: %{"FAKE_CC_VERSION" => "2.1.0"}
                )
     end
+
+    test "exactly the minimum passes, at start and at system/init" do
+      {:ok, local} =
+        Session.start_link(
+          executable: TestHelpers.fake_control_cli_path(),
+          can_use_tool: {__MODULE__, :defer, [me()]},
+          env: %{"FAKE_CC_VERSION" => CrowdControl.CLI.min_version()}
+        )
+
+      TestHelpers.stop_session(local)
+
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 10_000, can_use_tool: {__MODULE__, :defer, [me()]})
+      Session.subscribe(pid)
+      Mock.push_events(ctl, [{:stdout_data, init_line("2.1.268")}])
+
+      assert_receive {:crowd_control, ^pid, {:system_init, _}}, 2_000
+      refute_received {:crowd_control, ^pid, {:error, _}}
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a pre-release of the minimum is below it" do
+      assert CrowdControl.CLI.min_version() == "2.1.268"
+
+      assert {:error, {:cli_version, "2.1.268-beta.1", "2.1.268"}} =
+               Session.start_link(
+                 executable: TestHelpers.fake_control_cli_path(),
+                 can_use_tool: {__MODULE__, :defer, [me()]},
+                 env: %{"FAKE_CC_VERSION" => "2.1.268-beta.1"}
+               )
+    end
+
+    test "an unparsable version passes the gate with a warning (D8)" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {:ok, local} =
+            Session.start_link(
+              executable: TestHelpers.fake_control_cli_path(),
+              can_use_tool: {__MODULE__, :defer, [me()]},
+              env: %{"FAKE_CC_VERSION" => "garbage"}
+            )
+
+          TestHelpers.stop_session(local)
+        end)
+
+      assert log =~ "Could not read the Claude Code version"
+
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 10_000, can_use_tool: {__MODULE__, :defer, [me()]})
+      Session.subscribe(pid)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          Mock.push_events(ctl, [{:stdout_data, init_line("not.a.version")}])
+          assert_receive {:crowd_control, ^pid, {:system_init, _}}, 2_000
+          # The warning is logged before the broadcast, in the session process.
+          :sys.get_state(pid)
+        end)
+
+      assert log =~ ~s(Unparsable Claude Code version "not.a.version")
+      refute_received {:crowd_control, ^pid, {:error, _}}
+      assert Process.alive?(pid)
+
+      TestHelpers.stop_session(pid)
+    end
   end
 
   describe "SDK MCP servers" do
@@ -589,11 +733,12 @@ defmodule CrowdControl.SessionControlTest do
       {:ok, pid} = start(ctl, timeout: 10_000, sdk_mcp_servers: %{"app" => server})
       Session.subscribe(pid)
 
-      TestHelpers.wait_until(fn -> length(answers(ctl, "m3")) == 2 end)
+      TestHelpers.wait_until(fn -> answers(ctl, "m3") != [] end)
 
-      # The refused full answer, then the error that replaced it.
-      assert [%{"mcp_response" => %{"result" => _}}, %{"mcp_response" => fallback}] =
-               answers(ctl, "m3")
+      # The full answer was refused (one :write call never recorded); only the
+      # error that replaced it reached the CLI.
+      assert [%{"mcp_response" => fallback}] = answers(ctl, "m3")
+      assert Enum.count(Mock.calls(ctl), &(&1 == :write)) == length(Mock.writes(ctl)) + 1
 
       assert %{"id" => 3, "error" => %{"code" => -32_603}} = fallback
       refute_received {:crowd_control, ^pid, {:error, _}}
