@@ -58,7 +58,9 @@ defmodule CrowdControl.Backend.Docker.HostConfig do
   and a default would let one of them inherit the other's posture silently.
 
   Recognised keys in `config`: `:cap_drop`, `:security_opt`, `:pids_limit`,
-  `:cpus`, `:memory`, `:readonly_rootfs`, `:tmpfs`.
+  `:cpus`, `:memory`, `:readonly_rootfs`, `:tmpfs`, `:shm_size` (bytes of
+  `/dev/shm`; Chromium needs far more than Docker's 64 MiB) and `:init` (run
+  an init as PID 1, so orphaned grandchildren are reaped).
 
   Mounts arrive through `opts` as `:volumes`, already normalized by
   `CrowdControl.Volume.normalize/2` — deliberately not read out of `config`.
@@ -66,6 +68,14 @@ defmodule CrowdControl.Backend.Docker.HostConfig do
   top-level `:volumes` means something else entirely (stack-level volume
   *declarations*, which it creates and mounts itself), so scraping the key
   would silently reinterpret one caller's option as another's.
+
+  `opts[:overrides]` is one container's `host_config:` map from a
+  `CrowdControl.Service`, applied over the result: the resource keys
+  (`:shm_size`, `:init`, `:pids_limit`, `:memory`, `:cpus`, `:tmpfs`, merged
+  over any default tmpfs) and the weakening keys (`:cap_add`,
+  `:no_new_privileges`, `:readonly_rootfs`). This function renders; whether a
+  weakening was *declared* is `CrowdControl.Service.normalize/2`'s gate, which
+  runs before anything reaches here.
   """
   @spec build(keyword(), keyword()) :: map()
   def build(config, opts) do
@@ -77,10 +87,70 @@ defmodule CrowdControl.Backend.Docker.HostConfig do
       "SecurityOpt" => config[:security_opt] || ["no-new-privileges:true"],
       "PidsLimit" => Keyword.get(config, :pids_limit, @default_pids_limit)
     }
-    |> maybe_put("NanoCpus", config[:cpus] && trunc(config[:cpus] * 1_000_000_000))
+    |> maybe_put("NanoCpus", nano_cpus(config[:cpus]))
     |> maybe_put("Memory", config[:memory])
+    |> maybe_put("ShmSize", config[:shm_size])
+    |> maybe_put("Init", config[:init])
     |> put_readonly_rootfs(config)
+    |> apply_overrides(Keyword.get(opts, :overrides, %{}))
     |> put_binds(Keyword.get(opts, :volumes, []))
+  end
+
+  defp nano_cpus(nil), do: nil
+  defp nano_cpus(cpus), do: trunc(cpus * 1_000_000_000)
+
+  # Fixed key order so a body is a function of its inputs: `readonly_rootfs`
+  # before `tmpfs`, because turning the rootfs read-only installs the default
+  # tmpfs map that an explicit `tmpfs` is then merged over.
+  @override_order [
+    :pids_limit,
+    :memory,
+    :cpus,
+    :shm_size,
+    :init,
+    :cap_add,
+    :no_new_privileges,
+    :readonly_rootfs,
+    :tmpfs
+  ]
+
+  defp apply_overrides(host_config, overrides) when overrides == %{}, do: host_config
+
+  defp apply_overrides(host_config, overrides) do
+    Enum.reduce(@override_order, host_config, fn key, acc ->
+      case Map.fetch(overrides, key) do
+        {:ok, value} -> override(acc, key, value)
+        :error -> acc
+      end
+    end)
+  end
+
+  defp override(hc, :pids_limit, v), do: Map.put(hc, "PidsLimit", v)
+  defp override(hc, :memory, v), do: Map.put(hc, "Memory", v)
+  defp override(hc, :cpus, v), do: Map.put(hc, "NanoCpus", nano_cpus(v))
+  defp override(hc, :shm_size, v), do: Map.put(hc, "ShmSize", v)
+  defp override(hc, :init, v), do: Map.put(hc, "Init", v)
+  defp override(hc, :cap_add, []), do: hc
+  defp override(hc, :cap_add, caps), do: Map.put(hc, "CapAdd", caps)
+
+  defp override(hc, :no_new_privileges, true) do
+    Map.update!(hc, "SecurityOpt", &Enum.uniq(&1 ++ ["no-new-privileges:true"]))
+  end
+
+  defp override(hc, :no_new_privileges, false) do
+    Map.update!(hc, "SecurityOpt", fn opts ->
+      Enum.reject(opts, &String.starts_with?(&1, "no-new-privileges"))
+    end)
+  end
+
+  defp override(hc, :readonly_rootfs, true) do
+    hc |> Map.put("ReadonlyRootfs", true) |> Map.put_new("Tmpfs", @default_tmpfs)
+  end
+
+  defp override(hc, :readonly_rootfs, false), do: Map.drop(hc, ["ReadonlyRootfs", "Tmpfs"])
+
+  defp override(hc, :tmpfs, mounts) do
+    Map.update(hc, "Tmpfs", mounts, &Map.merge(&1, mounts))
   end
 
   # `Binds` rather than `Mounts`: both reach the same place, and the string form

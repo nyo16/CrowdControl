@@ -441,20 +441,80 @@ above observable rather than notional.
   exist, so it exists only as an explicit, typed-out act.
 
 Hardening (`:cpus`, `:memory`, `:cap_drop`, `:security_opt`, `:pids_limit`,
-`:user`, `:readonly_rootfs`, `:tmpfs`) comes from top-level options and applies to
-**every** container in the stack, through
-`CrowdControl.Backend.Docker.HostConfig`. There are deliberately no per-service
-overrides: one posture per stack is the whole reason that module exists, and a
-sidecar quietly weaker than the sandbox it shares a network with is not a useful
-thing to be able to express.
+`:user`, `:readonly_rootfs`, `:tmpfs`, `:shm_size`, `:init`) comes from top-level
+options and is the **default for every container** in the stack, through
+`CrowdControl.Backend.Docker.HostConfig`.
+
+### Hardened by default, per-service overrides, weakening explicit
+
+This replaces the earlier "one posture per stack" rule. A service may override the
+stack's HostConfig with `host_config:`:
+
+* **Resource keys** — `:shm_size`, `:init`, `:pids_limit`, `:memory`, `:cpus`,
+  `:tmpfs` (merged over the read-only defaults) — need no declaration. Chromium
+  needs far more `/dev/shm` than Docker's 64 MiB, and an init to reap its
+  children; neither weakens anything.
+* **Weakening keys** — `:cap_add`, `no_new_privileges: false`,
+  `readonly_rootfs: false`, and a root `user:` — must each also be named in the
+  service's `weaken: [...]` list, or `acquire/1` refuses with
+  `{:error, {:compose, {:weakening_not_declared, service, key}}}`.
+* **`privileged`** is refused outright, `{:error, {:compose, {:privileged_refused,
+  service}}}`, declared or not.
+
+The risk this accepts is specific. In the strict two-tier browser layout the
+browser shares a network with the sandbox *and* has a path to the egress proxy, so
+a weakened browser — root, added capabilities, no `no-new-privileges` — is the most
+valuable target a compromised sandbox can reach. That is why weakening is per key,
+written down, and never inferred.
+
+### Per-service networks
+
+`:networks: [%{name: "brw"}]` declares extra networks, created as
+`<project>-<name>` with `Internal: true`; `sbx`, `pub` and `egress` are reserved. A
+service's `networks:` lists its memberships (default `["sbx"]`, so a stack that
+declares none is built exactly as before): the first is its create-time endpoint,
+the rest are attached by `/connect` after create, and `egress: :allow` still adds
+the NAT bridge, so posture comes from `egress`, never from a membership. The
+sandbox must stay on `sbx`, which the forwarder reaches it across.
+
+Once a stack uses per-service networks, the sandbox may share **no** network with
+an `egress: :allow` service other than the `:proxy_service`, whose SECURITY.md
+contract is the one sanctioned relay:
+`{:error, {:compose, {:sandbox_shares_network_with_egress, network, service}}}`.
+The strict two-tier browser layout is the sandbox on `sbx`, the browser on `sbx`
+and `brw`, and the forward proxy on `brw` plus the NAT bridge.
+
+**Docker version floor.** Per-service networks and any `egress: :allow` sidecar
+need Docker Engine 25.0.5 or 26.0.0+: before that, the embedded DNS on an internal
+network forwarded queries upstream (CVE-2024-29018), an exfiltration path out of a
+network with no route. `GET /version` is asked once per `:docker_host` (cached in
+`:persistent_term`), only when one of those is in use, and an older daemon is
+`{:error, {:version, :docker, have, {25, 0, 5}}}` before anything is created.
+
+`placement:` on a service is Kubernetes-only and ignored on Compose with a warning.
 
 ### Everything is validated before a single byte reaches the daemon
 
 A stack is N resources, and discovering an invalid service spec after four of them
 exist means rolling back four resources to report a typo. So `acquire/1` runs every
-gate first — session key, project name, network spec, volume declarations, service
-specs, mount targets, `:ready` specs, proxy wiring — and only then creates the
+gate first — session key, project name, network spec, volume and network
+declarations, service specs (through `CrowdControl.Service`, the shape Kubernetes
+shares), mount targets, network memberships, `:files` destinations, `:ready`
+specs, proxy wiring, and the Docker version floor — and only then creates the
 networks, the volumes, and the containers in dependency order.
+
+**`:files`** are staged between `POST /containers/create` and `start` with
+`PUT /containers/{id}/archive`: an in-memory `:erl_tar` archive carrying each
+file's `mode`, `uid` and `gid`, one upload per destination root (the writable
+mount a file sits under, else `/`). The daemon refuses an archive into a read-only
+rootfs with `403` unless the destination is inside a volume, so that, a read-only
+mount, and a path under a tmpfs (written beneath it, hidden at start) are all
+`{:error, {:compose, {:files_not_writable, {service, path}}}}` before any request.
+Paths are absolute and free of `.`/`..` segments, unique, and at most 1 MiB in
+total. `:files` is for configuration, never credentials — those go through `env:`
+(and, on Kubernetes, where `:files` becomes a ConfigMap readable by anyone with
+`get` on the namespace, through an operator-managed Secret). Nothing scans the
+content.
 
 Ordering comes from each spec's `:depends_on`, resolved by a topological sort
 (`order_services/1`). Readiness comes from `:ready`, which becomes a container
@@ -496,9 +556,23 @@ containers off one at a time and leaving a half-torn-down stack behind. The
 `com.docker.compose.oneoff=False` label filter additionally excludes
 `Provider.Docker`'s single containers, which carry no compose labels at all.
 `scrub/1` drops the top-level credential keys via
-`CrowdControl.Store.scrub_opts/1` and then strips each service spec's `:env` too,
-because `Store.scrub_opts/1` cannot see into `:services` and a service spec's
-`:env` is exactly where a proxy's upstream key or a database password lives.
+`CrowdControl.Store.scrub_opts/1` and then strips each service spec's `:env` (and
+`:files`) too, because `Store.scrub_opts/1` cannot see into `:services` and a
+service spec's `:env` is exactly where a proxy's upstream key or a database
+password lives.
+
+Extra `:networks` are torn down with the fixed three, found the same two ways as
+named volumes: the names the handle knows, plus a `crowd_control.session` label
+query, so a stack rebuilt by `list_live/1` leaks none of them.
+
+**Drain.** A service with `drain:` set — a log shipper — is not SIGKILLed by the
+force-remove. `release/1` first waits the longest `drain` (ms) once, so the
+shipper's file source reaches EOF after the session's last byte, then sends
+`POST /containers/{id}/stop?t=<shutdown_limit + 5>`, giving it its own graceful
+shutdown limit plus a margin before the daemon's SIGKILL. The budget is a
+container label too, so a reaper-rebuilt handle drains the same way. A failed stop
+is logged and never blocks the force-remove; the sandbox and forwarder are not
+drained; a rolled-back `acquire/1` does not wait on a drain at all.
 
 ## `Provider.Gce`
 

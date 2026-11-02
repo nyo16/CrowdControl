@@ -1765,6 +1765,25 @@ defmodule CrowdControl.Backend.Kubernetes do
     }
   end
 
+  @doc false
+  # The version gate, for the provision path to call before its first create.
+  # `features` are `CrowdControl.VersionGate` features (`:pod_sidecars`,
+  # `:prestop_sleep`); with none, no request is made at all, so a session that
+  # asks for nothing version-dependent never pays the round trip. A failed
+  # lookup is a failed gate — the floor is never assumed met.
+  @spec ensure_versions(keyword(), [CrowdControl.VersionGate.feature()]) :: :ok | {:error, term()}
+  def ensure_versions(config, features) do
+    case CrowdControl.VersionGate.components(features) do
+      [] ->
+        :ok
+
+      _components ->
+        with {:ok, version} <- API.server_version(config) do
+          CrowdControl.VersionGate.check(features, %{kubernetes: version})
+        end
+    end
+  end
+
   # A declaration is not enforcement. Any API server accepts a NetworkPolicy
   # object; only a CNI with a policy controller acts on one. OrbStack, for
   # instance, accepts them and enforces nothing -- so a `:deny_all` sandbox
