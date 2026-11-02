@@ -27,12 +27,8 @@
 #
 # Environment:
 #   FAKE_CC_VERSION      version for `--version` and system/init (2.1.292)
-#   FAKE_CC_SESSION_ID   the session id
-#   FAKE_CC_MODE         permission (default) | mcp | mcp_permission | hook | plain
+#   FAKE_CC_MODE         permission (default) | mcp | mcp_permission | hook
 #   FAKE_CC_TOOLS        tool calls per turn in permission mode (1)
-#   FAKE_CC_MCP_SERVER   mcp modes: server name (app)
-#   FAKE_CC_MCP_TOOL     mcp modes: tool name (echo)
-#   FAKE_CC_MCP_ARGS     mcp modes: JSON arguments ({"text":"hi"})
 #   FAKE_CC_HOOK_ID      hook mode: callback_id to call
 #   FAKE_CC_LOG          append every stdin line to this file
 
@@ -49,7 +45,7 @@ defmodule FakeControlCli do
 
     loop(%{
       inited: false,
-      session_id: System.get_env("FAKE_CC_SESSION_ID", "fake-control-#{System.pid()}"),
+      session_id: "fake-control-#{System.pid()}",
       mode: System.get_env("FAKE_CC_MODE", "permission"),
       tools: String.to_integer(System.get_env("FAKE_CC_TOOLS", "1")),
       turns: 0,
@@ -130,7 +126,6 @@ defmodule FakeControlCli do
     state = %{state | turns: state.turns + 1, denials: [], outputs: []}
 
     case state.mode do
-      "plain" -> finish(state)
       "mcp" -> ask_mcp(state)
       "mcp_permission" -> ask_mcp_permission(state)
       "hook" -> ask_hook(state)
@@ -186,10 +181,8 @@ defmodule FakeControlCli do
     call_mcp(server, tool, args, state)
   end
 
-  defp mcp_tool do
-    {System.get_env("FAKE_CC_MCP_SERVER", "app"), System.get_env("FAKE_CC_MCP_TOOL", "echo"),
-     JSON.decode!(System.get_env("FAKE_CC_MCP_ARGS", ~s({"text":"hi"})))}
-  end
+  # mcp modes always call the `echo` tool of the `app` server.
+  defp mcp_tool, do: {"app", "echo", %{"text" => "hi"}}
 
   defp call_mcp(server, tool, args, state) do
     id = uuid()
@@ -314,14 +307,28 @@ defmodule FakeControlCli do
   end
 
   defp answered(%{kind: kind}, response, state) when kind in [:mcp, :hook] do
-    payload =
-      case response do
-        %{"subtype" => "success"} -> Map.get(response, "response", %{})
-        %{"error" => error} -> %{"error" => error}
-      end
+    case response do
+      %{"subtype" => "success"} ->
+        mcp_or_hook_answered(kind, Map.get(response, "response", %{}), state)
 
+      %{"error" => error} ->
+        mcp_or_hook_answered(kind, %{"error" => error}, state)
+
+      # A malformed host answer ends the turn with an explained error.
+      other ->
+        malformed_answer(other, state)
+    end
+  end
+
+  defp mcp_or_hook_answered(kind, payload, state) do
     emit(tool_result("toolu_#{kind}", JSON.encode!(payload), false))
     finish(%{state | outputs: [JSON.encode!(payload)]})
+  end
+
+  defp malformed_answer(response, state) do
+    errors = ["malformed control_response: #{JSON.encode!(response)}"]
+    emit(result("error_during_execution", state, %{"errors" => errors}))
+    state
   end
 
   defp next_tool(index, state) do
