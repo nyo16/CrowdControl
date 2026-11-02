@@ -2,8 +2,8 @@ defmodule CrowdControl.SessionTest do
   use ExUnit.Case, async: true
 
   alias CrowdControl.Agent.Omp
-  alias CrowdControl.Backend.Local
-  alias CrowdControl.{Session, TestHelpers}
+  alias CrowdControl.Backend.{Local, Mock}
+  alias CrowdControl.{Result, Session, TestHelpers}
 
   describe "init/1" do
     test "fails to start with a nonexistent executable" do
@@ -674,6 +674,257 @@ defmodule CrowdControl.SessionTest do
     end
   end
 
+  # Against fake_control_cli.exs, which speaks the control protocol the way
+  # claude 2.1.292 was observed to (research/verify-control.md).
+  describe "control protocol" do
+    test "a sync allow runs the tool with the input the callback returned" do
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :allow_edited, [self()]})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "go")
+
+      assert_receive {:asked, _id, %{"tool_name" => "Bash"}}, 5_000
+      assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
+      assert result["result"] == "ran: echo edited"
+      assert result["permission_denials"] == []
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a deny refuses the tool and the turn carries on" do
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :deny, ["not in this repo"]})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "go")
+
+      assert_receive {:crowd_control, ^pid, {:result, "success", _} = result}, 5_000
+      assert [%{"tool_name" => "Bash"}] = Result.permission_denials(result)
+      assert tool_result_text(pid) == "not in this repo"
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a deny with interrupt stops the turn as aborted" do
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :deny_interrupt, []})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "go")
+
+      assert_receive {:crowd_control, ^pid, {:result, "error_during_execution", _} = result},
+                     5_000
+
+      assert {:error, %CrowdControl.Error{kind: :aborted}} = Result.classify(result)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test ":defer surfaces the request to subscribers and respond/3 answers it" do
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [self()]})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "go")
+
+      assert_receive {:crowd_control, ^pid, {:control_request, id, "can_use_tool", request}},
+                     5_000
+
+      assert {:ok, [%{request_id: ^id, status: :deferred}]} = Session.pending_requests(pid)
+
+      assert {:error, {:invalid_decision, :yes}} = Session.respond(pid, id, :yes)
+      assert :ok = Session.respond(pid, "no-such-request", {:deny, "x"})
+      assert :ok = Session.respond(pid, id, {:allow, request["input"]})
+
+      assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
+      assert result["result"] == "ran: echo 0 > out0.txt"
+      assert {:ok, []} = Session.pending_requests(pid)
+
+      # A second answer for a settled id is a no-op, not an error.
+      assert :ok = Session.respond(pid, id, {:deny, "too late"})
+
+      TestHelpers.stop_session(pid)
+    end
+
+    @tag :capture_log
+    test "a crashing callback becomes a deny, so the CLI never hangs" do
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :crash, []})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "go")
+
+      assert_receive {:crowd_control, ^pid, {:result, "success", _} = result}, 5_000
+      assert [_denial] = Result.permission_denials(result)
+      assert tool_result_text(pid) == "callback crashed"
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a fun callback is refused before anything starts" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: message}, _}} =
+               Session.start_link(
+                 executable: TestHelpers.fake_control_cli_path(),
+                 can_use_tool: fn _request, _context -> :defer end
+               )
+
+      assert message =~ "MFA"
+
+      assert {:error, {%ArgumentError{}, _}} =
+               Session.start_link(
+                 executable: TestHelpers.fake_control_cli_path(),
+                 hooks: %{"PreToolUse" => [%{hooks: [fn _request, _context -> :ok end]}]}
+               )
+    end
+
+    test "interrupt/1 withdraws the pending request and the turn ends aborted" do
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [self()]})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "go")
+
+      assert_receive {:crowd_control, ^pid, {:control_request, id, "can_use_tool", _}}, 5_000
+      assert {:ok, %{"still_queued" => []}} = Session.interrupt(pid)
+
+      assert_receive {:crowd_control, ^pid, {:control_cancelled, ^id}}, 5_000
+      assert_receive {:crowd_control, ^pid, {:result, _, _} = result}, 5_000
+      assert {:error, %CrowdControl.Error{kind: :aborted}} = Result.classify(result)
+      assert {:ok, []} = Session.pending_requests(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "two permission prompts in one turn are asked one after the other" do
+      {:ok, pid} =
+        start_control_session(
+          can_use_tool: {__MODULE__, :allow, [self()]},
+          env: %{"FAKE_CC_TOOLS" => "2"}
+        )
+
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "go")
+
+      assert_receive {:asked, first, %{"input" => %{"command" => "echo 0 > out0.txt"}}}, 5_000
+      assert_receive {:asked, second, %{"input" => %{"command" => "echo 1 > out1.txt"}}}, 5_000
+      assert first != second
+
+      assert_receive {:crowd_control, ^pid, {:result, "success", result}}, 5_000
+      assert result["result"] == "ran: echo 0 > out0.txt\nran: echo 1 > out1.txt"
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "host requests round-trip through control/3 and its shorthands" do
+      {:ok, pid} = start_control_session(can_use_tool: {__MODULE__, :defer, [self()]})
+
+      assert {:ok, %{}} = Session.set_model(pid, "sonnet")
+      assert {:ok, %{"mode" => "plan"}} = Session.set_permission_mode(pid, "plan")
+
+      assert {:error, "Unsupported control request subtype: bogus"} =
+               Session.control(pid, %{"subtype" => "bogus"})
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "omp has no control protocol, so every control call is :unsupported" do
+      {:ok, pid} =
+        Session.start_link(agent: :omp, executable: TestHelpers.fake_omp_path(), timeout: 10_000)
+
+      assert {:error, :unsupported} = Session.interrupt(pid)
+      assert {:error, :unsupported} = Session.set_model(pid, "x")
+      assert {:error, :unsupported} = Session.set_permission_mode(pid, "plan")
+      assert {:error, :unsupported} = Session.control(pid, %{"subtype" => "interrupt"})
+      assert {:error, :unsupported} = Session.respond(pid, "id", {:deny, "x"})
+      assert {:error, :unsupported} = Session.pending_requests(pid)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "an allow always carries updatedInput, even when the input is unchanged" do
+      input = %{"command" => "ls", "description" => "list"}
+
+      frame = %{
+        "type" => "control_request",
+        "request_id" => "perm-1",
+        "request" => %{"subtype" => "can_use_tool", "tool_name" => "Bash", "input" => input}
+      }
+
+      ctl = start_supervised!({Mock, events: [{:stdout_data, JSON.encode!(frame) <> "\n"}]})
+
+      {:ok, pid} =
+        Session.start_link(
+          backend: {Mock, mock: ctl},
+          executable: "claude",
+          timeout: 10_000,
+          can_use_tool: {__MODULE__, :allow_unchanged, []}
+        )
+
+      TestHelpers.wait_until(fn -> control_responses(ctl) != [] end)
+
+      assert [%{"request_id" => "perm-1", "response" => answer}] = control_responses(ctl)
+      assert answer == %{"behavior" => "allow", "updatedInput" => input}
+
+      # The handshake went first: initialize, before any answer.
+      assert [first | _] = Mock.writes(ctl)
+      assert JSON.decode!(first)["request"]["subtype"] == "initialize"
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "keep_alive is dropped, and a withdrawn request is cancelled" do
+      frame = %{
+        "type" => "control_request",
+        "request_id" => "perm-2",
+        "request" => %{"subtype" => "can_use_tool", "tool_name" => "Bash", "input" => %{}}
+      }
+
+      ctl =
+        start_supervised!(
+          {Mock,
+           events: [
+             {:stdout_data, ~s({"type":"keep_alive"}\n)},
+             {:stdout_data, JSON.encode!(frame) <> "\n"}
+           ]}
+        )
+
+      {:ok, pid} =
+        Session.start_link(
+          backend: {Mock, mock: ctl},
+          executable: "claude",
+          timeout: 10_000,
+          can_use_tool: {__MODULE__, :defer, [self()]}
+        )
+
+      assert_receive {:asked, "perm-2", _request}, 2_000
+
+      # A subscriber that attaches after the deferral still learns of it.
+      Session.subscribe(pid)
+
+      assert_receive {:crowd_control, ^pid, {:control_request, "perm-2", "can_use_tool", _}},
+                     2_000
+
+      refute_received {:crowd_control, ^pid, :keep_alive}
+      assert Session.get_messages(pid) == []
+
+      Mock.push_events(ctl, [
+        {:stdout_data, ~s({"type":"control_cancel_request","request_id":"perm-2"}\n)}
+      ])
+
+      assert_receive {:crowd_control, ^pid, {:control_cancelled, "perm-2"}}, 2_000
+      assert {:ok, []} = Session.pending_requests(pid)
+      assert control_responses(ctl) == []
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a session without control features keeps its control state empty" do
+      {:ok, pid} = start_fake_session()
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "hello")
+      assert_receive {:crowd_control, ^pid, {:result, "success", _}}, 5_000
+
+      control = :sys.get_state(pid).control
+      refute control.features?
+      assert control.pending == %{}
+      assert control.outbound == %{}
+      assert control.interrupt_grace == 0
+
+      TestHelpers.stop_session(pid)
+    end
+  end
+
   defp start_fake_session(extra_opts \\ []) do
     opts =
       Keyword.merge(
@@ -683,4 +934,56 @@ defmodule CrowdControl.SessionTest do
 
     Session.start_link(opts)
   end
+
+  defp start_control_session(extra_opts) do
+    Session.start_link(
+      Keyword.merge(
+        [executable: TestHelpers.fake_control_cli_path(), timeout: 15_000],
+        extra_opts
+      )
+    )
+  end
+
+  # The content of the first tool_result the CLI reported.
+  defp tool_result_text(pid) do
+    Enum.find_value(Session.get_messages(pid), fn
+      {:user, %{"message" => %{"content" => [%{"type" => "tool_result", "content" => text}]}}} ->
+        text
+
+      _other ->
+        nil
+    end)
+  end
+
+  # The `response` objects of every control_response the session wrote.
+  defp control_responses(ctl) do
+    for write <- Mock.writes(ctl),
+        %{"type" => "control_response", "response" => response} <- [JSON.decode!(write)],
+        do: response
+  end
+
+  # --- control callbacks: apply(m, f, [request, context | extra]) ---
+
+  def allow(request, context, test) do
+    send(test, {:asked, context.request_id, request})
+    {:allow, request["input"]}
+  end
+
+  def allow_unchanged(request, _context), do: {:allow, request["input"]}
+
+  def allow_edited(request, context, test) do
+    send(test, {:asked, context.request_id, request})
+    {:allow, Map.put(request["input"], "command", "echo edited")}
+  end
+
+  def deny(_request, _context, message), do: {:deny, message}
+
+  def deny_interrupt(_request, _context), do: {:deny, "stop right there", interrupt: true}
+
+  def defer(request, context, test) do
+    send(test, {:asked, context.request_id, request})
+    :defer
+  end
+
+  def crash(_request, _context), do: raise("callback bug")
 end
