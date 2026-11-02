@@ -58,10 +58,11 @@ defmodule CrowdControl.Backend.KubernetesBrowserTest do
   # file (see K8sLive.skip_reasons/1): ExUnit has no runtime skip. No
   # kubeconfig skips the module rather than aborting the run.
   @live K8sLive.skip_reasons(__ENV__.file)
+  @enforced? @live.policy == nil
   @moduletag skip: @live.cluster
 
   setup_all do
-    {:ok, kubeconfig: K8sLive.kubeconfig(), enforced?: @live.policy == nil}
+    {:ok, kubeconfig: K8sLive.kubeconfig(), enforced?: @enforced?}
   end
 
   setup context do
