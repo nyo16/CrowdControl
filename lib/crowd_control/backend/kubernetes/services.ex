@@ -32,7 +32,10 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
           %{ip_block: "10.20.0.0/16", except: ["10.20.1.0/24"]}
 
       `ports` are required. `host` and `ip` (both or neither) become a
-      `hostAliases` entry, since nothing here can resolve a name.
+      `hostAliases` entry, since nothing here can resolve a name. An
+      external runs nothing, so it may not carry `egress: :allow`; one the
+      sandbox reaches must be private or narrow, and kube-dns needs
+      `allow_dns: true` — see `check_external/2`.
 
   ## Edges come from network membership
 
@@ -92,6 +95,12 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   @private_v6 ["fc00::/7", "fe80::/10"]
   @internet_ports [443]
 
+  # Where an `{:external, %{ip_block: _}}` reached from `sbx` may point
+  # without a long prefix: RFC 1918, CGNAT and ULA. Not link-local, whose
+  # 169.254.169.254 is a cloud metadata endpoint.
+  @narrow_v4 ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"]
+  @narrow_v6 ["fc00::/7"]
+
   @probe_period_seconds 2
   @probe_failure_threshold 60
   @default_tmpfs_size "64Mi"
@@ -114,7 +123,8 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
           namespace: String.t(),
           config: keyword(),
           capture_dir: String.t(),
-          capture_volume: String.t()
+          capture_volume: String.t(),
+          sweep_after_ms: non_neg_integer() | nil
         }
 
   # --- validation ---
@@ -180,7 +190,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
          :ok <- check_user(service),
          :ok <- check_mounts(service, ctx),
          :ok <- check_tmpfs(service) do
-      check_external(service)
+      check_external(service, ctx.namespace)
     end
   end
 
@@ -246,24 +256,97 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
     end)
   end
 
-  defp check_external(%Service{placement: {:external, target}, name: name, ports: ports}) do
-    if ports != [] and valid_target?(target),
-      do: :ok,
-      else: {:error, {:k8s, {:bad_external, name}}}
+  @doc """
+  Validate one `{:external, target}` service for a session in `namespace`
+  (`nil` when not yet known); any other placement is `:ok`. `normalize/2`
+  runs it for every service, and `CrowdControl.Preset.LogShipper` for its
+  aggregator, so a preset refuses what `provision/1` would.
+
+  An external is a hole in a deny-all, so each one is held to what it is
+  for:
+
+    * it needs `ports` and a well-formed target — a selector map, or an
+      `ip_block` whose prefix fits its family, with `host` (a DNS-1123
+      name) and `ip` both or neither (`{:bad_external, name}`);
+    * it runs nothing, so it has no egress of its own to declare
+      (`egress: :allow` is `{:external_egress_forbidden, name}`);
+    * reached from `sbx`, an `ip_block` must sit inside RFC 1918, CGNAT or
+      ULA space or be at least a /24 (IPv4) or /56 (IPv6) — anything wider
+      is internet egress for the sandbox nobody declared
+      (`{:external_too_broad, {name, cidr}}`);
+    * port 53, or a selector reaching `kube-system`, is kube-dns, which no
+      policy here opens by accident: it needs `allow_dns: true` in the
+      target (`{:external_dns_not_declared, {name, 53 | "kube-system"}}`).
+  """
+  @spec check_external(Service.t(), String.t() | nil) :: :ok | {:error, {:k8s, term()}}
+  def check_external(
+        %Service{placement: {:external, target}, name: name, ports: ports} = service,
+        namespace
+      ) do
+    cond do
+      ports == [] or not valid_target?(target) ->
+        {:error, {:k8s, {:bad_external, name}}}
+
+      service.egress == :allow ->
+        {:error, {:k8s, {:external_egress_forbidden, name}}}
+
+      true ->
+        with :ok <- check_breadth(service, target) do
+          check_dns(service, target, namespace)
+        end
+    end
   end
 
-  defp check_external(_service), do: :ok
+  def check_external(%Service{}, _namespace), do: :ok
+
+  defp check_breadth(service, %{ip_block: cidr}) do
+    if on_sandbox_network?(service) and not narrow?(cidr),
+      do: {:error, {:k8s, {:external_too_broad, {service.name, cidr}}}},
+      else: :ok
+  end
+
+  defp check_breadth(_service, _selector_target), do: :ok
+
+  defp check_dns(%Service{name: name, ports: ports}, target, namespace) do
+    cond do
+      Map.get(target, :allow_dns, false) ->
+        :ok
+
+      53 in ports ->
+        {:error, {:k8s, {:external_dns_not_declared, {name, 53}}}}
+
+      reaches_kube_system?(target, namespace) ->
+        {:error, {:k8s, {:external_dns_not_declared, {name, "kube-system"}}}}
+
+      true ->
+        :ok
+    end
+  end
+
+  # A namespace selector naming `kube-system` under any key, or a bare pod
+  # selector — which a NetworkPolicy scopes to its own namespace — in a
+  # session that runs there.
+  defp reaches_kube_system?(%{ip_block: _}, _namespace), do: false
+
+  defp reaches_kube_system?(target, namespace) do
+    case target[:namespace_selector] do
+      nil -> namespace == "kube-system"
+      labels -> "kube-system" in Map.values(labels)
+    end
+  end
 
   defp valid_target?(%{ip_block: cidr} = target) do
     cidr?(cidr) and Enum.all?(Map.get(target, :except, []), &cidr?/1) and
       not Map.has_key?(target, :namespace_selector) and
-      not Map.has_key?(target, :pod_selector) and valid_alias?(target)
+      not Map.has_key?(target, :pod_selector) and valid_alias?(target) and
+      valid_allow_dns?(target)
   end
 
   defp valid_target?(%{} = target) do
     selectors = Enum.reject([target[:namespace_selector], target[:pod_selector]], &is_nil/1)
 
-    selectors != [] and Enum.all?(selectors, &string_map?/1) and valid_alias?(target)
+    selectors != [] and Enum.all?(selectors, &string_map?/1) and valid_alias?(target) and
+      valid_allow_dns?(target)
   end
 
   defp valid_target?(_target), do: false
@@ -271,9 +354,20 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   defp valid_alias?(target) do
     case {Map.get(target, :host), Map.get(target, :ip)} do
       {nil, nil} -> true
-      {host, ip} when is_binary(host) and is_binary(ip) -> host != "" and ip?(ip)
+      {host, ip} when is_binary(host) and is_binary(ip) -> dns_subdomain?(host) and ip?(ip)
       _ -> false
     end
+  end
+
+  defp valid_allow_dns?(target), do: Map.get(target, :allow_dns, false) in [true, false]
+
+  # A `hostAliases` hostname, which the API server validates as a DNS-1123
+  # subdomain.
+  defp dns_subdomain?(host) do
+    byte_size(host) in 1..253 and
+      host
+      |> String.split(".")
+      |> Enum.all?(&(byte_size(&1) <= 63 and Regex.match?(@dns_label, &1)))
   end
 
   defp string_map?(map),
@@ -281,14 +375,50 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
       is_map(map) and map != %{} and
         Enum.all?(map, fn {k, v} -> is_binary(k) and is_binary(v) end)
 
-  defp cidr?(cidr) when is_binary(cidr) do
-    case String.split(cidr, "/") do
-      [ip, bits] -> ip?(ip) and match?({_n, ""}, Integer.parse(bits))
-      _ -> false
+  defp cidr?(cidr), do: match?({:ok, _ip, _bits}, parse_cidr(cidr))
+
+  defp parse_cidr(cidr) when is_binary(cidr) do
+    with [ip, bits] <- String.split(cidr, "/"),
+         {:ok, address} <- :inet.parse_strict_address(String.to_charlist(ip)),
+         {bits, ""} when bits >= 0 <- Integer.parse(bits),
+         true <- bits <= address_width(address) do
+      {:ok, address, bits}
+    else
+      _ -> :error
     end
   end
 
-  defp cidr?(_cidr), do: false
+  defp parse_cidr(_cidr), do: :error
+
+  # Inside a private range, or a prefix long enough to name a host or a
+  # small subnet rather than the internet.
+  defp narrow?(cidr) do
+    {:ok, address, bits} = parse_cidr(cidr)
+
+    case address_width(address) do
+      32 -> bits >= 24 or Enum.any?(@narrow_v4, &within?(address, bits, &1))
+      128 -> bits >= 56 or Enum.any?(@narrow_v6, &within?(address, bits, &1))
+    end
+  end
+
+  defp within?(address, bits, range) do
+    {:ok, base, range_bits} = parse_cidr(range)
+    shift = address_width(address) - range_bits
+
+    bits >= range_bits and
+      Bitwise.bsr(address_int(address), shift) == Bitwise.bsr(address_int(base), shift)
+  end
+
+  defp address_width(address) when tuple_size(address) == 4, do: 32
+  defp address_width(address) when tuple_size(address) == 8, do: 128
+
+  defp address_int(address) do
+    segment = div(address_width(address), tuple_size(address))
+
+    address
+    |> Tuple.to_list()
+    |> Enum.reduce(0, &(Bitwise.bsl(&2, segment) + &1))
+  end
 
   defp ip?(ip), do: match?({:ok, _}, :inet.parse_strict_address(String.to_charlist(ip)))
 
@@ -968,7 +1098,7 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
         "crowd_control.role" => "service",
         "crowd_control.service" => service
       },
-      "annotations" => %{"crowd_control.owner" => to_string(ctx.owner)}
+      "annotations" => Kubernetes.object_annotations(ctx)
     }
   end
 

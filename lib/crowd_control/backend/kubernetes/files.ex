@@ -40,15 +40,25 @@ defmodule CrowdControl.Backend.Kubernetes.Files do
   @doc """
   The ConfigMap manifest for `service`'s `files` in the session `session`
   describes — anything carrying `:session_key`, `:owner` and `:namespace`,
-  such as a `%CrowdControl.Backend.Kubernetes{}` handle. `files` are already
-  validated by `CrowdControl.Service.validate_files/2`.
+  such as a `%CrowdControl.Backend.Kubernetes{}` handle, and optionally the
+  `:sweep_after_ms` every provisioned object is stamped with. `files` are
+  already validated by `CrowdControl.Service.validate_files/2`.
   """
   @spec manifest(
-          %{session_key: String.t(), owner: String.t() | nil, namespace: String.t()},
+          %{
+            required(:session_key) => String.t(),
+            required(:owner) => String.t() | nil,
+            required(:namespace) => String.t(),
+            optional(:sweep_after_ms) => non_neg_integer() | nil
+          },
           String.t(),
           [CrowdControl.Service.file()]
         ) :: map()
-  def manifest(%{session_key: session_key, owner: owner, namespace: namespace}, service, files) do
+  def manifest(
+        %{session_key: session_key, owner: owner, namespace: namespace} = session,
+        service,
+        files
+      ) do
     {data, binary_data} =
       files
       |> keyed()
@@ -66,7 +76,7 @@ defmodule CrowdControl.Backend.Kubernetes.Files do
           "crowd_control.service" => service,
           "crowd_control.role" => "service-config"
         },
-        "annotations" => %{"crowd_control.owner" => to_string(owner)}
+        "annotations" => Kubernetes.object_annotations(session)
       },
       "data" => Map.new(data, fn {key, file} -> {key, file.content} end),
       "binaryData" =>

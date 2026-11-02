@@ -99,6 +99,7 @@ defmodule CrowdControl.Preset.LogShipper do
   sandbox's too.
   """
 
+  alias CrowdControl.Backend.Kubernetes.Services
   alias CrowdControl.Preset.YAML
 
   @default_name "vector"
@@ -181,6 +182,11 @@ defmodule CrowdControl.Preset.LogShipper do
   The `{:external, target}` aggregator service for a Kubernetes shipper, or
   `nil` on Compose. Its port is the sink address's; its `host` alias is the
   address's host when that is a name.
+
+  The aggregator is on the sandbox's own network, so its target is held to
+  `CrowdControl.Backend.Kubernetes.Services.check_external/2` here, as
+  `provision/1` would: a private or narrow `ip_block`, and no kube-dns
+  unless the target says `allow_dns: true`.
   """
   @spec aggregator(keyword()) :: map() | nil
   def aggregator(opts) do
@@ -193,9 +199,22 @@ defmodule CrowdControl.Preset.LogShipper do
           ports: [port]
         }
         |> CrowdControl.Preset.validate!(__MODULE__)
+        |> reachable_target!()
 
       _compose ->
         nil
+    end
+  end
+
+  defp reachable_target!(spec) do
+    {:ok, service} = CrowdControl.Service.normalize(spec, :sidecar)
+
+    case Services.check_external(service, nil) do
+      :ok ->
+        spec
+
+      {:error, {:k8s, reason}} ->
+        refuse!("the aggregator #{inspect(spec.placement)} is refused: #{inspect(reason)}")
     end
   end
 

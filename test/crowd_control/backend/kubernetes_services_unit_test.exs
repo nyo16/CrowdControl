@@ -8,6 +8,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
   alias CrowdControl.Backend.Kubernetes.Drain
   alias CrowdControl.Backend.Kubernetes.Files
   alias CrowdControl.Backend.Kubernetes.Services
+  alias CrowdControl.Preset.LogShipper
   alias CrowdControl.Service
 
   doctest CrowdControl.Backend.Kubernetes.Drain
@@ -807,6 +808,362 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     end
   end
 
+  describe "teardown order (blocker: a terminating sandbox with no NetworkPolicy)" do
+    test "a drained sandbox Pod is gone before its deny-all or any derived object is deleted" do
+      {:ok, polls} = Agent.start_link(fn -> [{200, terminating_pod("cc-#{@key}")}] end)
+
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: "/api/v1/namespaces/ns1/pods/cc-" <> _} ->
+            Agent.get_and_update(polls, fn
+              [next | rest] -> {next, rest}
+              [] -> {{404, %{"message" => "not found"}}, []}
+            end)
+
+          %{method: :delete} ->
+            {200, %{}}
+        end)
+
+      refs = [
+        %{name: "vector", placement: :pod, grace: 28},
+        %{name: "browser", placement: :separate, grace: 0}
+      ]
+
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+
+      requests = Enum.map(log.(), &{&1.method, kind(&1.path), Path.basename(&1.path)})
+
+      assert [
+               {:delete, :pods, "cc-#{@key}"},
+               {:get, :pods, "cc-#{@key}"},
+               {:get, :pods, "cc-#{@key}"} | after_gone
+             ] = requests
+
+      assert {:delete, :networkpolicies, "cc-#{@key}-deny-all"} in after_gone
+      assert {:delete, :networkpolicies, "cc-#{@key}-browser"} in after_gone
+      assert {:delete, :pods, "cc-#{@key}-browser"} in after_gone
+      assert {:delete, :configmaps, "cc-#{@key}-vector-files"} in after_gone
+
+      sandbox_delete = hd(log.())
+      assert sandbox_delete.query["gracePeriodSeconds"] == "28"
+    end
+
+    test "a drained :separate service keeps its own policy until it is gone" do
+      {:ok, polls} = Agent.start_link(fn -> [{200, terminating_pod("cc-#{@key}-proxy")}] end)
+
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: "/api/v1/namespaces/ns1/pods/cc-" <> _} ->
+            Agent.get_and_update(polls, fn
+              [next | rest] -> {next, rest}
+              [] -> {{404, %{"message" => "not found"}}, []}
+            end)
+
+          %{method: :delete} ->
+            {200, %{}}
+        end)
+
+      refs = [%{name: "proxy", placement: :separate, grace: 45}]
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+
+      requests = Enum.map(log.(), &{&1.method, kind(&1.path), Path.basename(&1.path)})
+      at = fn request -> for {^request, i} <- Enum.with_index(requests), do: i end
+
+      # The sandbox itself has no drained sidecar: grace 0, no wait.
+      assert hd(requests) == {:delete, :pods, "cc-#{@key}"}
+      assert hd(log.()).query["gracePeriodSeconds"] == "0"
+
+      # Terminating, then 404: two polls, and only then its policy.
+      assert [first_poll, last_poll] = at.({:get, :pods, "cc-#{@key}-proxy"})
+      assert [proxy_delete] = at.({:delete, :pods, "cc-#{@key}-proxy"})
+      assert [policy_delete] = at.({:delete, :networkpolicies, "cc-#{@key}-proxy"})
+      assert proxy_delete < first_poll and last_poll < policy_delete
+    end
+
+    test "with no drained service the order is unchanged: no wait, everything deleted" do
+      {config, log} = recorder(fn _req -> {200, %{}} end)
+      refs = [%{name: "browser", placement: :separate, grace: 0}]
+
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+
+      requests = log.()
+      refute Enum.any?(requests, &(&1.method == :get)), "a grace-0 delete is never awaited"
+
+      assert [{:pods, "cc-#{@key}"} | _] =
+               for(
+                 %{method: :delete, path: path} <- requests,
+                 do: {kind(path), Path.basename(path)}
+               )
+
+      assert List.last(requests).path =~ ~r"/networkpolicies/cc-#{@key}-deny-all$"
+    end
+
+    test "a sandbox Pod whose delete failed keeps its deny-all" do
+      {config, log} =
+        recorder(fn
+          %{method: :delete, path: "/api/v1/namespaces/ns1/pods/" <> _} ->
+            {500, %{"message" => "etcd is unhappy"}}
+
+          %{method: :delete} ->
+            {200, %{}}
+        end)
+
+      assert Kubernetes.destroy(handle(config, services: [])) == :ok
+
+      refute Enum.any?(log.(), &(&1.path =~ "networkpolicies")),
+             "a Pod that may still run must keep its only NetworkPolicy"
+    end
+
+    test "the sweep leaves every object of a session whose Pod is still terminating" do
+      old = System.system_time(:millisecond) - 600_000
+
+      pods = [
+        object("cc-ending", "ending", "sandbox", old, deleting: true),
+        object("cc-ending-browser", "ending", "service", old),
+        # No sandbox left, but its drained service Pod is still running out its grace.
+        object("cc-draining-proxy", "draining", "service", old, deleting: true)
+      ]
+
+      by_kind = %{
+        pods: pods,
+        services: [],
+        networkpolicies: [
+          object("cc-ending-deny-all", "ending", "sandbox", nil, created: old),
+          object("cc-draining-proxy", "draining", "service", old)
+        ],
+        configmaps: []
+      }
+
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: path} ->
+            {200, %{"items" => by_kind[kind(path)], "metadata" => %{}}}
+
+          %{method: :delete} ->
+            raise "nothing may be deleted"
+        end)
+
+      assert {:ok, 0} = Kubernetes.sweep_orphans([owner: "node-a"] ++ config)
+      refute Enum.any?(log.(), &(&1.method == :delete))
+    end
+
+    test "PID 1 forwards SIGTERM to the CLI's process group" do
+      [_shell, _flag, script] =
+        hd(Kubernetes.pod_manifest(handle([]))["spec"]["containers"])["command"]
+
+      # The launcher is a `setsid` session leader: its pid is the group's.
+      assert script =~ "trap forward TERM"
+      assert script =~ ~s{p=$(cat '/var/run/cc.launcher' 2>/dev/null)}
+      assert script =~ ~s{kill -TERM -"$p"}
+    end
+  end
+
+  describe "sweep window (blocker: a slow provision swept from under itself)" do
+    test "every object provision/1 creates carries the session's sweep_after_ms" do
+      {config, log} = recorder(&cluster/1)
+      before = System.system_time(:millisecond)
+
+      # Keyword lookups take the first entry, so the override goes in front.
+      opts = [provision_timeout: 300_000] ++ provision_opts(config, @stack)
+      assert {:ok, _handle} = Kubernetes.provision(opts)
+
+      later = System.system_time(:millisecond)
+      posts = for %{method: :post, body: body} <- log.(), do: body["metadata"]
+
+      assert length(posts) == 10
+
+      for metadata <- posts do
+        stamp = metadata["annotations"]["crowd_control.sweep_after_ms"]
+        assert is_binary(stamp), "#{metadata["name"]} has no sweep_after_ms"
+        assert String.to_integer(stamp) in (before + 360_000)..(later + 360_000)
+      end
+    end
+
+    test "the sweep waits for the later of its own floor and the object's stamp" do
+      now = System.system_time(:millisecond)
+      created = now - 200_000
+
+      # Provisioned with `provision_timeout: 300_000` 200 s ago: past the
+      # reaper's 180 s floor, not past its own 360 s.
+      slow = now + 160_000
+      # The same age, stamped by a session whose window has passed.
+      done = now - 1_000
+
+      by_kind = %{
+        pods: [
+          object("cc-slow-browser", "slow", "service", created, sweep_after: slow),
+          object("cc-done-browser", "done", "service", created, sweep_after: done)
+        ],
+        services: [],
+        networkpolicies: [
+          object("cc-slow-deny-all", "slow", "sandbox", created, sweep_after: slow)
+        ],
+        configmaps: []
+      }
+
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: path} ->
+            {200, %{"items" => by_kind[kind(path)], "metadata" => %{}}}
+
+          %{method: :delete} ->
+            {200, %{}}
+        end)
+
+      assert {:ok, 1} = Kubernetes.sweep_orphans([owner: "node-a"] ++ config)
+
+      assert [{:pods, "cc-done-browser"}] =
+               for(
+                 %{method: :delete, path: path} <- log.(),
+                 do: {kind(path), Path.basename(path)}
+               )
+    end
+
+    test "a deny-all gone before the sandbox Pod fails the provision and rolls back" do
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: "/apis/networking.k8s.io/v1/namespaces/ns1/networkpolicies/" <> _} ->
+            {404, %{"message" => "not found"}}
+
+          req ->
+            cluster(req)
+        end)
+
+      assert Kubernetes.provision(provision_opts(config, @stack)) ==
+               {:error, {:k8s, {:policy_missing, "cc-#{@key}-deny-all"}}}
+
+      assert_rolled_back(log.())
+    end
+  end
+
+  describe "service readiness (blocker: a sandbox beside a dead browser)" do
+    test "an ImagePullBackOff service fails the provision, and nothing is left" do
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: "/api/v1/namespaces/ns1/pods", query: query} = req ->
+            if query["fieldSelector"] =~ "-browser",
+              do: {200, %{"items" => [pulling_pod()], "metadata" => %{"resourceVersion" => "1"}}},
+              else: cluster(req)
+
+          %{method: :get, path: "/api/v1/namespaces/ns1/pods/cc-" <> name} = req ->
+            if String.ends_with?(String.trim_trailing(name, "/"), "-browser"),
+              do: {200, pulling_pod()},
+              else: cluster(req)
+
+          req ->
+            cluster(req)
+        end)
+
+      assert Kubernetes.provision(provision_opts(config, @stack)) ==
+               {:error, {:k8s, {:service_not_ready, {"browser", "ImagePullBackOff"}}}}
+
+      assert_rolled_back(log.())
+    end
+  end
+
+  describe "externals (blocker: sandbox egress through an {:external, _})" do
+    test "an ip_block the sandbox reaches is private or narrow" do
+      too_broad = fn cidr ->
+        normalize([%{@aggregator | placement: {:external, %{ip_block: cidr}}}])
+      end
+
+      for cidr <- ["0.0.0.0/0", "::/0", "8.0.0.0/8", "2001:db8::/48", "172.0.0.0/8"] do
+        assert too_broad.(cidr) == {:error, {:k8s, {:external_too_broad, {"aggregator", cidr}}}}
+      end
+
+      for cidr <- [
+            "10.0.0.0/8",
+            "172.20.0.0/16",
+            "192.168.4.0/24",
+            "100.64.0.0/10",
+            "fd00::/8",
+            "203.0.113.0/24",
+            "203.0.113.7/32",
+            "2001:db8:0:100::/56"
+          ] do
+        assert {:ok, _} = too_broad.(cidr)
+      end
+    end
+
+    test "an external runs nothing, so it has no egress to declare" do
+      assert normalize([%{@aggregator | egress: :allow}]) ==
+               {:error, {:k8s, {:external_egress_forbidden, "aggregator"}}}
+    end
+
+    test "kube-dns needs allow_dns: true, by port or by namespace" do
+      {:external, target} = @aggregator.placement
+      dns = %{@aggregator | ports: [53]}
+
+      assert normalize([dns]) ==
+               {:error, {:k8s, {:external_dns_not_declared, {"aggregator", 53}}}}
+
+      kube_system = %{
+        @aggregator
+        | placement:
+            {:external,
+             %{target | namespace_selector: %{"kubernetes.io/metadata.name" => "kube-system"}}}
+      }
+
+      assert normalize([kube_system]) ==
+               {:error, {:k8s, {:external_dns_not_declared, {"aggregator", "kube-system"}}}}
+
+      declared = %{dns | placement: {:external, Map.put(target, :allow_dns, true)}}
+      assert {:ok, _} = normalize([declared])
+
+      # Refused before the first request.
+      assert Kubernetes.provision(provision_opts(fn _ -> raise "no request" end, [dns])) ==
+               {:error, {:k8s, {:external_dns_not_declared, {"aggregator", 53}}}}
+    end
+
+    test "a CIDR prefix must fit its family, and an alias host must be DNS-1123" do
+      for target <- [
+            %{ip_block: "10.0.0.0/33"},
+            %{ip_block: "fd00::/129"},
+            %{ip_block: "10.0.0.0/-1"},
+            %{ip_block: "10.0.0.0/8", except: ["10.1.0.0/40"]},
+            %{ip_block: "10.0.0.0/8", host: "Not_A_Host", ip: "10.0.0.1"},
+            %{ip_block: "10.0.0.0/8", allow_dns: "yes"}
+          ] do
+        assert normalize([%{@aggregator | placement: {:external, target}}]) ==
+                 {:error, {:k8s, {:bad_external, "aggregator"}}},
+               inspect(target)
+      end
+    end
+
+    test "the LogShipper refuses an aggregator provision/1 would" do
+      shipper = fn aggregator ->
+        LogShipper.services(
+          placement: :pod,
+          sink: {:vector, address: "10.96.0.9:6000"},
+          aggregator: aggregator
+        )
+      end
+
+      assert [_vector, _aggregator] = shipper.(%{ip_block: "10.96.0.9/32"})
+
+      assert_raise ArgumentError, ~r/external_too_broad/, fn ->
+        shipper.(%{ip_block: "0.0.0.0/0"})
+      end
+
+      assert_raise ArgumentError, ~r/external_dns_not_declared/, fn ->
+        shipper.(%{namespace_selector: %{"kubernetes.io/metadata.name" => "kube-system"}})
+      end
+    end
+  end
+
+  # Nothing the sandbox needs was POSTed, and everything that was is DELETEd.
+  defp assert_rolled_back(requests) do
+    created = for %{method: :post, body: body} <- requests, do: body["metadata"]["name"]
+    deleted = for %{method: :delete, path: path} <- requests, do: Path.basename(path)
+
+    refute "cc-#{@key}" in created, "the sandbox Pod must not be created after a failure"
+    assert created != []
+
+    for name <- created do
+      assert name in deleted, "#{name} was created and never deleted"
+    end
+  end
+
   defp normalize(specs) do
     Services.normalize([services: specs], Kubernetes.service_context(handle([])))
   end
@@ -855,6 +1212,12 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
   # with a ClusterIP), every Pod Running and Ready, every delete a 404.
   defp cluster(%{method: :get, path: "/version"}), do: {200, %{"major" => "1", "minor" => "31"}}
 
+  defp cluster(%{
+         method: :get,
+         path: "/apis/networking.k8s.io/v1/namespaces/ns1/networkpolicies/" <> name
+       }),
+       do: {200, %{"metadata" => %{"name" => name}}}
+
   defp cluster(%{method: :post, path: "/api/v1/namespaces/ns1/services", body: body}) do
     ip = if body["metadata"]["name"] =~ "browser", do: "10.96.1.1", else: "10.96.1.2"
     {201, put_in(body, ["spec", "clusterIP"], ip)}
@@ -882,6 +1245,25 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     }
   end
 
+  defp terminating_pod(name) do
+    %{
+      "metadata" => %{"name" => name, "deletionTimestamp" => "2026-11-02T00:00:00Z"},
+      "status" => %{"phase" => "Running"}
+    }
+  end
+
+  defp pulling_pod do
+    %{
+      "metadata" => %{"name" => "cc-#{@key}-browser"},
+      "status" => %{
+        "phase" => "Pending",
+        "containerStatuses" => [
+          %{"state" => %{"waiting" => %{"reason" => "ImagePullBackOff", "message" => "no"}}}
+        ]
+      }
+    }
+  end
+
   defp object(name, session, role, created_at, opts \\ []) do
     labels =
       %{
@@ -899,7 +1281,13 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       %{
         "name" => name,
         "labels" => labels,
-        "annotations" => %{"crowd_control.owner" => Keyword.get(opts, :owner, "node-a")}
+        "annotations" =>
+          %{"crowd_control.owner" => Keyword.get(opts, :owner, "node-a")}
+          |> then(
+            &if opts[:sweep_after],
+              do: Map.put(&1, "crowd_control.sweep_after_ms", to_string(opts[:sweep_after])),
+              else: &1
+          )
       }
       |> then(fn metadata ->
         case opts[:created] do
@@ -914,6 +1302,11 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
             )
         end
       end)
+      |> then(
+        &if opts[:deleting],
+          do: Map.put(&1, "deletionTimestamp", "2026-11-02T00:00:00Z"),
+          else: &1
+      )
 
     %{"metadata" => metadata, "status" => %{"phase" => Keyword.get(opts, :phase, "Running")}}
   end
