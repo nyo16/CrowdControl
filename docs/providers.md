@@ -455,9 +455,14 @@ stack's HostConfig with `host_config:`:
   needs far more `/dev/shm` than Docker's 64 MiB, and an init to reap its
   children; neither weakens anything.
 * **Weakening keys** — `:cap_add`, `no_new_privileges: false`,
-  `readonly_rootfs: false`, and a root `user:` — must each also be named in the
-  service's `weaken: [...]` list, or `acquire/1` refuses with
-  `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`.
+  `readonly_rootfs: false`, a root `user:` (`:user`), a `kind: :host_path` mount on
+  a sidecar, read-only or not (`:host_path`), and a `:tmpfs` entry whose options
+  leave out `noexec` or `nosuid` or name `exec`/`suid` (`:tmpfs_exec`) — must each
+  also be named in the service's `weaken: [...]` list, or `acquire/1` refuses with
+  `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`. `user:` is a
+  uid or a lowercase name, optionally `:group`; root is decided numerically, so
+  `"0"`, `"00"`, `"0:1000"` and `"root"` all need `weaken: [:user]`, and `"+0"` or
+  `" 0"` is not a valid user at all. Env keys must match `[A-Za-z_][A-Za-z0-9_]*`.
 * **`privileged`** is refused outright, `{:error, {:compose, {:privileged_refused,
   service}}}`, declared or not.
 
@@ -477,10 +482,15 @@ the rest are attached by `/connect` after create, and `egress: :allow` still add
 the NAT bridge, so posture comes from `egress`, never from a membership. The
 sandbox must stay on `sbx`, which the forwarder reaches it across.
 
-Once a stack uses per-service networks, the sandbox may share **no** network with
-an `egress: :allow` service other than the `:proxy_service`, whose SECURITY.md
-contract is the one sanctioned relay:
+Once a stack uses per-service networks (a `:networks` declaration or any
+`networks:` membership), the sandbox may share **no** network with an
+`egress: :allow` service other than the `:proxy_service`, whose SECURITY.md
+contract is the one sanctioned relay — the sandbox reaches the Anthropic API only
+through it:
 `{:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}`.
+A stack using neither keeps the older single-network `sbx` model, where an
+`egress: :allow` sidecar on `sbx` is the declared relay, because on one network
+there is nowhere else to put it. Declaring `:networks` opts into the strict model.
 The strict two-tier browser layout is the sandbox on `sbx`, the browser on `sbx`
 and `brw`, and the forward proxy on `brw` plus the NAT bridge.
 
@@ -511,10 +521,14 @@ rootfs with `403` unless the destination is inside a volume, so that, a read-onl
 mount, and a path under a tmpfs (written beneath it, hidden at start) are all
 `{:error, {:compose, {:files_not_writable, {service, path}}}}` before any request.
 Paths are absolute and free of `.`/`..` segments, unique, and at most 1 MiB in
-total. `:files` is for configuration, never credentials — those go through `env:`
-(and, on Kubernetes, where `:files` becomes a ConfigMap readable by anyone with
-`get` on the namespace, through an operator-managed Secret). Nothing scans the
-content.
+total; a `:mode` is `0..0o777` (no setuid, setgid or sticky bits). `:files` is for
+configuration, never credentials — those go through `env:` on both substrates (on
+Kubernetes, where `:files` becomes a ConfigMap readable by anyone with `get` on the
+namespace, `env` becomes a per-session Secret; see "Kubernetes `:services`"
+below). Nothing scans the content. No service may stage `:files` under the
+sandbox's capture directory, and a sidecar mounting the capture volume must mount
+it `read_only: true`: either is
+`{:error, {:compose, {:capture_mount_writable, service}}}`.
 
 Ordering comes from each spec's `:depends_on`, resolved by a topological sort
 (`order_services/1`). Readiness comes from `:ready`, which becomes a container
@@ -555,11 +569,9 @@ rather than by compose project, so the reaper reaps stacks instead of picking
 containers off one at a time and leaving a half-torn-down stack behind. The
 `com.docker.compose.oneoff=False` label filter additionally excludes
 `Provider.Docker`'s single containers, which carry no compose labels at all.
-`scrub/1` drops the top-level credential keys via
-`CrowdControl.Store.scrub_opts/1` and then strips each service spec's `:env` (and
-`:files`) too, because `Store.scrub_opts/1` cannot see into `:services` and a
-service spec's `:env` is exactly where a proxy's upstream key or a database
-password lives.
+`scrub/1` runs the handle's config through `CrowdControl.Store.scrub_opts/1`,
+which drops the credential keys and keeps every service spec without its `:env`
+and `:files`, where a proxy's upstream key or a database password lives.
 
 Extra `:networks` are torn down with the fixed three, found the same two ways as
 named volumes: the names the handle knows, plus a `crowd_control.session` label
@@ -912,6 +924,16 @@ link-local, CGNAT and ULA. An external's `sbx` membership means the sandbox Pod
 alone, so a `:pod` log shipper's aggregator is not handed to a browser that also
 sits on `sbx`.
 
+An external is a hole in the sandbox's deny-all, so
+`CrowdControl.Backend.Kubernetes.Services.check_external/2` holds one the sandbox
+reaches to what it is for: an `ip_block` inside RFC 1918, CGNAT or ULA space or at
+least a /24 (IPv4) or /56 (IPv6), else `{:k8s, {:external_too_broad, {name, cidr}}}`;
+no `egress: :allow` (`{:k8s, {:external_egress_forbidden, name}}`); and no port 53
+or `kube-system` selector without `allow_dns: true` in the target
+(`{:k8s, {:external_dns_not_declared, {name, 53 | "kube-system"}}}`). A service
+container with no `user:` runs with `runAsNonRoot: true` unless `weaken: [:user]`
+says otherwise.
+
 ### No DNS: `hostAliases` instead
 
 No policy allows kube-dns to the sandbox or to an `egress: :none` service —
@@ -925,23 +947,46 @@ only by a hostname is unreachable from a Pod with no DNS, which is why
 ### Create order, rollback and the orphan sweep
 
 `provision/1` validates every spec and checks the version floors before its first
-request, then creates ConfigMaps (`:files`) → NetworkPolicies → Services (their
-ClusterIPs read back) → service Pods → one shared `:provision_timeout` for every
-service Pod's readiness → the sandbox Pod. A service that never becomes ready is
+request, then creates ConfigMaps (`:files`) → Secrets (`env`) → NetworkPolicies →
+Services (their ClusterIPs read back) → service Pods → one shared
+`:provision_timeout` for every service Pod's readiness → under `network: :deny_all`,
+a re-check that `<pod>-deny-all` still exists (`{:k8s, {:policy_missing, name}}`
+if not) → the sandbox Pod. A service that never becomes ready is
 `{:error, {:k8s, {:service_not_ready, {name, reason}}}}`. Any failure runs
 `destroy/1`, which derives every object name from the sandbox Pod's
 `crowd_control.services` annotation and deletes each, 404 being success; with a
 drained `:pod` sidecar it deletes with a grace of `drain + shutdown_limit + 5`
-seconds and the sidecar carries a `preStop` sleep (Kubernetes 1.30).
+seconds and the sidecar carries a `preStop` sleep (Kubernetes 1.30). A drained Pod
+keeps running through its grace, so `destroy/1` waits for it to be gone (grace plus
+10 s) before deleting its NetworkPolicies; one still there at the deadline keeps
+its policy for the sweep. The same holds for a drained `:separate` service Pod and
+its own policy.
+
+A service's `env` never reaches a Pod spec. Each service with a non-empty `env`
+gets a per-session Secret, `cc-<session_key>-<service>-env`, labelled
+`crowd_control.session`, `crowd_control.owner_hash`, `crowd_control.service` and
+`crowd_control.role=service-secret`, with one key per variable; its container reads
+each through `valueFrom.secretKeyRef`, `:pod` sidecars included, and the
+`crowd_control.services` annotation holds no values. Env names must be valid
+Secret keys, or the spec is `{:k8s, {:bad_service, {name, :env}}}` before any
+request. The Secret is deleted with the session's other objects, needs `secrets`
+RBAC (`create, get, list, delete`), and is readable by anyone with `get secrets` in
+the namespace. `:files` stay configuration: the ConfigMap's payload, binary content
+counted base64-encoded, must fit `CrowdControl.Service.max_files_bytes/0`
+(`{:k8s, {:files_too_large, {name, size}}}`).
 
 A node dying between the first service object and the sandbox Pod leaves objects
 nothing names. `CrowdControl.Backend.Kubernetes.sweep_orphans/1`, which the
 reaper calls after a successful `list_live/1`, finds them by label
-(`crowd_control.role` `service` or `service-config`, this owner's hash),
-re-checks the raw owner annotation, and deletes only those older than
-`:provision_timeout` plus a minute whose session has no live sandbox Pod; the
-reaper reports the count as `swept`. `list_live/1` itself now selects
-`crowd_control.role!=service`, so a service Pod is never mistaken for a sandbox.
+(`crowd_control.role` `service`, `service-config` or `service-secret`, this
+owner's hash), re-checks the raw owner annotation, and deletes only those whose
+session has no live Pod (a terminating one counts as live) and that are past both
+`:provision_timeout` plus `:orphan_margin_ms` (default a minute) and their own
+`crowd_control.sweep_after_ms` annotation — the provisioning session's
+`:provision_timeout` plus margin, stamped as wall-clock milliseconds just before
+its objects are created. The reaper reports the count as `swept`. `list_live/1`
+itself now selects `crowd_control.role!=service`, so a service Pod is never
+mistaken for a sandbox.
 
 ### Version floors
 

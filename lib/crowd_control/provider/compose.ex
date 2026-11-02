@@ -172,10 +172,15 @@ defmodule CrowdControl.Provider.Compose do
 
   Once a stack uses per-service networks (a `:networks` declaration or any
   `networks:` membership), the sandbox may share **no** network with an
-  `egress: :allow` service other than the `:proxy_service`:
+  `egress: :allow` service other than the `:proxy_service`, which is exempt
+  because the sandbox reaches the Anthropic API only through it:
   `{:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}`.
-  The strict two-tier browser layout is the sandbox on `sbx`, the browser on
-  `sbx` and `brw`, and the forward proxy on `brw` with `egress: :allow`.
+  A stack using neither keeps the single-network `sbx` model this module has
+  always built, where an `egress: :allow` sidecar on `sbx` is the declared
+  relay: with one network there is nowhere else to put it. Declaring
+  `:networks` opts into the strict model. Its two-tier browser layout is the
+  sandbox on `sbx`, the browser on `sbx` and `brw`, and the forward proxy on
+  `brw` with `egress: :allow`.
 
   ### Minimum Docker version
 

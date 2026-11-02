@@ -79,7 +79,43 @@ to the processes it execs.
 
 With `:can_use_tool`, `:hooks`, `:sdk_mcp_servers` or `:on_control_request`
 set, a Claude Code session answers the CLI's control requests from the host.
-Three properties matter for an audit.
+Five properties matter for an audit.
+
+**Control requests come from a stream the sandbox can write to.** The CLI's
+stdout, and on a remote backend the capture file the session reads it from,
+are reachable from model-driven code, so a `control_request` line is not
+proof that the CLI sent it. There is no way to authenticate the frames —
+stdout can be forged on every backend — so the protection is gating and
+bounding, and the rest is the callback's job:
+
+- **Hooks and SDK tools receive sandbox-controllable input.** A
+  `hook_callback`, an `mcp_message` and an `:on_control_request` request may
+  be forged, and so may every argument in them. Each callback and each
+  `CrowdControl.SdkMcp` tool must authorize its own arguments — check the
+  order id belongs to the caller, the path is inside the workspace — as it
+  would for any untrusted request. Hooks have no gate: they are notifications
+  with no approval step to pair them with.
+- **SDK tool calls are gated when `:can_use_tool` is set.** A `tools/call`
+  runs only if the CLI would have let the model make it: either a
+  `can_use_tool` allow for `mcp__<server>__<tool>` was answered earlier in the
+  same turn and the call's arguments equal the `updatedInput` that allow sent
+  back (each allow covers one call, and unused ones are cleared at the turn's
+  result), or the tool is pre-approved, because the CLI never asks about it.
+  Pre-approved means: it matches an `:allowed_tools` entry (the exact name,
+  `mcp__<server>` or `mcp__<server>__*`); the permission mode is
+  `bypassPermissions`, whether from `:permission_mode`, a `setMode` update in
+  an allow's permission updates, or a `set_permission_mode` the CLI
+  acknowledged; or an allow's `addRules` update granted a bare rule for it
+  this session. Anything else is answered with the JSON-RPC error `-32001`
+  `"tool call not approved"`, runs nothing, and emits a decision event with
+  `source: :gate`. What the gate has learnt is persisted with the session, so
+  a reattached session keeps it. Without `:can_use_tool` nothing is gated.
+- **Pending requests are capped.** At most `:max_pending_control` (default
+  64) requests wait on an answer at once. Past that, a new request is answered
+  at once with an error — a deny for `can_use_tool` (decision event
+  `source: :cap`), a JSON-RPC error for `mcp_message`, an error response for
+  the rest — and is never persisted, so a flood of forged requests bounds
+  both memory and Store writes. The first refusal in a turn is logged.
 
 **Requests are captured; answers are not.** A `can_use_tool` request,
 including its `input` (the full command or file content the model wants to
@@ -88,19 +124,29 @@ line — a remote sandbox's tee file included. The decision is written to the
 CLI's stdin and is never captured. The `[:crowd_control, :control, :decision]`
 telemetry event (`behavior`, `source`, `tool_name`, `request_id`) is the only
 record of who allowed or denied what; attach a handler if you need that
-trail. See `CrowdControl.Telemetry`.
+trail. See `CrowdControl.Telemetry`. The capture itself is only partly
+trusted: while model-driven code runs under the CLI's own uid, it can write
+to the CLI's output and to the capture file, so a captured line is the
+sandbox's word, not the CLI's.
 
 **Callbacks are MFA tuples, never funs.** Session options are written to
 `CrowdControl.Store` so a reattached session can keep answering, and with
 `Store.DETS` that means to disk. A closure cannot be persisted faithfully, so
-a fun is refused at start with `ArgumentError`. Keep secrets out of the
-`extra_args` for the same reason: they are persisted with the rest of the
-options.
+a fun is refused at start with `ArgumentError`, and so is a fun, pid,
+reference or port anywhere inside `extra_args`: persisted arguments must be
+plain data. Keep secrets out of the `extra_args` for the same reason: they
+are persisted with the rest of the options.
 
 **Callbacks are at-least-once.** A request persisted but unanswered when the
 host dies is dispatched again on reattach. A callback with side effects must
 be idempotent by `request_id`. An in-BEAM MCP tool is re-run only when
 declared `idempotent: true`.
+
+**Inline `:mcp_config` maps are argv.** Each inline map becomes one JSON
+argument to the CLI, visible to `ps` inside the sandbox and, on Kubernetes,
+part of the `pods/exec` request URI, which an API server audit policy covering
+`pods/exec` records even at the `Metadata` level. Keep credentials in a config
+file or the environment, never in an inline map.
 
 ## Remote sandbox backends
 
@@ -184,6 +230,11 @@ rather than narrowing it:
   an in-sandbox `ps` leak for a cluster-wide one.
 - **A `Secret` plus `envFrom`.** Same etcd residency, plus `secrets` RBAC on the
   backend's identity, plus a second object left behind on a crash.
+
+That reasoning is about the CLI's env, which a session supplies per exec. A
+sidecar service's `env` is fixed at provision and read by a container the
+backend never execs into, so the stdin channel cannot reach it; it takes the
+Secret route instead (see the RBAC paragraph below).
 
 **REGRESSION: there is no `PidsLimit` equivalent.** Docker sets a 512-PID
 fork-bomb ceiling deliberately and separately from `Memory`, because neither
@@ -318,14 +369,48 @@ conclusive on its own — so the common case still costs one Pod, not two.
                                               # or with a placement: :separate service
     services        create, get, list, delete # :separate services, :sandbox_ports
     configmaps      create, get, list, delete # services with :files
+    secrets         create, get, list, delete # services with env
 
-`list` on `services`, `configmaps` and `networkpolicies` is the reaper's
-orphan sweep: a session's service objects are created before its sandbox Pod,
-so a crash in between leaves objects only a label selector can find. Grant it
-wherever the reaper runs this backend; without it the sweep logs a warning and
-deletes nothing. A ConfigMap is readable by anyone with `get configmaps` in the
-namespace, and a service's `env` sits in its Pod object, so neither carries
-credentials — those belong in an operator-managed Secret.
+`list` on `services`, `configmaps`, `secrets` and `networkpolicies` is the
+reaper's orphan sweep: a session's service objects are created before its
+sandbox Pod, so a crash in between leaves objects only a label selector can
+find. Grant it wherever the reaper runs this backend; without it the sweep logs
+a warning and deletes nothing. A ConfigMap is readable by anyone with
+`get configmaps` in the namespace, so it carries no credentials. A service's
+`env` goes in a per-session Secret, `cc-<session_key>-<service>-env`
+(`crowd_control.role=service-secret`), which its container reads through
+`secretKeyRef`: no literal value is in any Pod spec, a `:pod` sidecar's
+included, nor in the sandbox Pod's `crowd_control.services` annotation. The
+Secret is readable by anyone with `get secrets` in the namespace and is deleted
+with the session, by the rollback of a failed provision, and by the orphan
+sweep.
+
+**Teardown keeps the sandbox isolated until it is gone.** A Pod with a drained
+sidecar is deleted with a grace period and keeps running through it, and its
+NetworkPolicy is what keeps it contained. So `destroy/1` waits for that Pod to
+be gone (its grace plus 10 s) before deleting the policies, and the same for a
+drained `:separate` service Pod and its own policy. A Pod still there at the
+deadline, or one whose DELETE failed, keeps its policy, and the orphan sweep,
+which counts a terminating Pod as live, removes it later. Every object carries
+a `crowd_control.sweep_after_ms` annotation (provision time plus the session's
+`:provision_timeout` plus `:orphan_margin_ms`, default a minute), and the sweep
+leaves it alone until then, so an in-flight provision is never swept. Under
+`network: :deny_all`, `<pod>-deny-all` is fetched again just before the
+sandbox Pod is created, and a missing one fails the provision with
+`{:k8s, {:policy_missing, name}}`.
+
+**Externals are held to what they are for.** An `{:external, target}` service
+the sandbox reaches is a hole in its deny-all. An `ip_block` must sit in
+RFC 1918, CGNAT or ULA space or be at least a /24 (IPv4) or /56 (IPv6)
+(`{:k8s, {:external_too_broad, {name, cidr}}}`); an external runs nothing, so
+`egress: :allow` on one is `{:k8s, {:external_egress_forbidden, name}}`; and
+port 53 or a selector reaching `kube-system` is kube-dns, refused unless the
+target says `allow_dns: true`
+(`{:k8s, {:external_dns_not_declared, {name, 53 | "kube-system"}}}`).
+
+**Services run as non-root unless declared.** A service with no `user:` gets
+`runAsNonRoot: true`, and a root uid (`"0"`, `"00"`, `"0:1000"`) needs
+`weaken: [:user]`, as on Compose.
 
 **One place this backend is stricter than Docker.** The sandbox container keeps
 `capabilities.drop: ["ALL"]` with *nothing* added. Creating the FIFO needs
@@ -540,6 +625,29 @@ discipline as `{:docker, :network_mode_required}`. The sandbox itself can never
 carry `:allow`: `{:error, {:compose, :sandbox_egress_forbidden}}`. The NAT
 bridge is created only if some sidecar asks; if none does, it does not exist.
 
+**Which hole, and where, depends on whether the stack uses per-service
+networks.** Once a stack declares `:networks` or gives any service a
+`networks:` membership, the sandbox may share **no** network with an
+`egress: :allow` service other than the `:proxy_service`:
+`{:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}`.
+The proxy is exempt because it is the sandbox's only route to the Anthropic
+API, and its contract (below) is the reason it exists. A stack using neither
+keeps the older single-network `sbx` sidecar model, in which every service sits
+on `sbx` and an `egress: :allow` sidecar there is the declared relay: with one
+network there is nowhere else to put it, and refusing it would break every
+such stack without making it safer. To opt into the strict model, declare
+`:networks` and move each `:allow` service other than the proxy onto a network
+the sandbox is not on — the two-tier browser layout is the sandbox on `sbx`,
+the browser on `sbx` and `brw`, and the forward proxy on `brw` only.
+
+**The capture file is the sandbox's alone.** A sidecar that reads the
+transcript must mount the sandbox's capture volume (the same named volume or
+host path) `read_only: true`, and no service may stage `:files` under the
+capture directory; either is
+`{:error, {:compose, {:capture_mount_writable, service}}}`, before any request.
+A writable mount could truncate or rewrite the capture under the session's
+byte offsets, and a pre-seeded capture is a forged transcript.
+
 **The forwarder is the blast radius.** Reaching the agent from the host requires
 a published port, and a published port requires a non-internal endpoint — the
 constraint described under the Docker provider above. So the provider puts a
@@ -566,14 +674,18 @@ token, sets `ANTHROPIC_BASE_URL` to the proxy's network alias and
 `ANTHROPIC_API_KEY` to that token in the sandbox's environment via
 `CrowdControl.Backend.Credentials.apply_credentials/2`, and **removes** any real
 `:api_key` rather than overriding it. The proxy receives `CC_SESSION_TOKEN` and
-the real `ANTHROPIC_API_KEY`. A proxy declared without `egress: :allow` is
-refused with `{:error, {:compose, {:proxy_needs_egress, name}}}`, because a
+the real `ANTHROPIC_API_KEY`. A caller-supplied `:session_token` must start
+with `ccst_`, the prefix log redaction matches, or `acquire/1` refuses with
+`{:error, {:compose, {:bad_session_token, :prefix}}}`. A proxy declared without
+`egress: :allow` is refused with
+`{:error, {:compose, {:proxy_needs_egress, name}}}`, because a
 proxy that cannot reach the upstream API fails inside the sandbox as if the
 model's own request were at fault. With no `:proxy_service`, an `:api_key` is
 passed into the sandbox environment unchanged — the honest no-proxy posture.
-Neither `:api_key` nor `:session_token` survives `scrub/1` into a Store record,
-and `Provider.Compose.scrub/1` additionally strips `:env` out of every persisted
-service spec, which `Store.scrub_opts/1` cannot see into.
+Neither `:api_key` nor `:session_token` survives into a Store record, and
+`Store.scrub_opts/1` keeps every persisted service spec without its `env` and
+`:files`, at every level of the opts, inside `backend:` and `provider:` tuples
+included.
 
 **`network: [internal: false]`** is accepted and gives the sandbox a NAT bridge
 with full internet. It is the one option that discards everything above, so it
@@ -748,9 +860,35 @@ security boundary; the `launchServer` WebSocket (3000) is protected only by its
 per-session path, a `ccpw_` token that is a capability — anyone who knows it and
 can reach the port controls the browser. Both are protected by the network
 alone: only parties sharing `sbx` with the browser reach them. The MCP server's
-`--allowed-hosts` only rejects a request whose `Host` is not `browser:8931`; `--allowed-origins` and
+`--allowed-hosts` only rejects a request whose `Host` is not `<name>:8931`,
+where `<name>` is the browser service's name (`browser` by default):
+`CrowdControl.Preset.Browser` passes it as `MCP_ALLOWED_HOSTS`, which the
+example image's `browser-sidecar.mjs` reads (default `browser:8931`), checks
+as a comma-separated list of `host:port` values, and exits 2 on anything
+malformed before Chromium starts. `--allowed-origins` and
 `--blocked-origins` are **not** a boundary (upstream: they do not affect
 redirects), so this library does not rely on them.
+
+### Inside the browser container
+
+- **Chromium runs with `--no-sandbox`.** Playwright launches it that way by
+  default (`chromiumSandbox: false`), and the example image does not change
+  it. The container's isolation — the hardened service defaults (dropped
+  capabilities, `no-new-privileges`), a `noexec,nosuid` `/tmp`, and the
+  network layer above — is the boundary, so a renderer compromise is a
+  compromise of the browser container.
+- **The `ccpw_` token is in the MCP child's argv.** `browser-sidecar.mjs`
+  starts `playwright mcp` with `--endpoint ws://127.0.0.1:3000/<token>`, so
+  anything that can list processes inside the browser container can read it.
+  Only the sidecar's own processes run there, and the token only guards a
+  port that container already serves.
+- **Versions and images are pinned.** The repository's `PLAYWRIGHT_VERSION`
+  file is the single Playwright version: the root `Dockerfile`'s
+  `sandbox-browser` stage reads it and refuses a disagreeing build arg, and
+  the example browser image needs
+  `--build-arg PLAYWRIGHT_VERSION=$(cat PLAYWRIGHT_VERSION)`. The example
+  images' base images and the `CrowdControl.Preset.LogShipper` default Vector
+  image are pinned by digest (`tag@sha256:…`).
 
 ### Log redaction is best-effort, and the aggregator can be spoofed
 
@@ -783,6 +921,9 @@ sandbox's own isolation still assumes a patched daemon in every configuration.
 
 A service's `:files` are staged into the container on Compose and become a
 ConfigMap on Kubernetes, readable by anyone with `get configmaps` in the
-namespace; they are also never scanned. Credentials belong in `env:` on Compose
-(which `scrub/1` strips before the Store) and in an operator-managed Secret on
-Kubernetes, where a service's `env` sits in its Pod object.
+namespace; they are also never scanned. Credentials belong in `env:` on both
+substrates. On Compose `env` is set on the container; on Kubernetes it goes in
+the per-session Secret `cc-<session_key>-<service>-env` and reaches the
+container through `secretKeyRef`, so no literal value is in a Pod spec (see
+the Kubernetes backend's RBAC paragraph above). Either way `Store.scrub_opts/1`
+keeps it out of the Store.

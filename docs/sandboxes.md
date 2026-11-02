@@ -502,7 +502,8 @@ never connects to a bare `host:port` — and an `https://` address is refused, s
 has no TLS settings to honour it with.
 
 **Drain.** The sandbox's last bytes land just before teardown, so a shipper killed at the same
-moment loses roughly the last two seconds. A service with `drain:` (ms; the preset sets `3_000`)
+moment loses roughly the last two seconds. A service with `drain:` (ms; the preset sets `15_000`,
+which has to cover Vector's own delivery latency, measured at about 10 s on Kubernetes)
 and `shutdown_limit:` (seconds; default `20`) is stopped differently:
 
 - **Compose** — `release/1` waits the longest `drain` once, so the file source reaches EOF, then
@@ -512,7 +513,10 @@ and `shutdown_limit:` (seconds; default `20`) is stopped differently:
 - **Kubernetes** — the drained sidecar carries a `preStop` `sleep` of the drain (rounded up to
   seconds; Kubernetes 1.30), and `destroy/1` deletes the Pod with a grace period of
   `drain + shutdown_limit + 5` seconds instead of 0, so Vector gets SIGTERM after EOF and its own
-  graceful-shutdown limit before SIGKILL.
+  graceful-shutdown limit before SIGKILL. The CLI gets the `SIGTERM` too. The Pod keeps running
+  through that grace, so `destroy/1` waits for it to be gone (grace plus 10 s) before deleting its
+  NetworkPolicies, and blocks that long: with the preset's defaults a drained destroy takes about
+  17 s, which is why `Session.stop/1` and `CrowdControl.stop_all/1` do not time out.
 
 Redaction (gitleaks-derived filters plus CrowdControl's `ccst_` and `ccpw_` tokens) runs on the
 raw line before parsing, and is best-effort — see [SECURITY.md](../SECURITY.md).

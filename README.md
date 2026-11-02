@@ -568,6 +568,14 @@ CrowdControl.run("Where is order 42?", sdk_mcp_servers: %{"app" => server})
 # the model sees the tool as mcp__app__lookup_order
 ```
 
+Control requests arrive on a stream the sandbox can write to, so a hook's or a
+tool's arguments may be forged: each must authorize its own input. With
+`:can_use_tool` set, an SDK `tools/call` runs only after a matching allow in
+the same turn or when the tool is pre-approved (`:allowed_tools`,
+`bypassPermissions`, an `addRules` grant); anything else gets JSON-RPC
+`-32001`. `:max_pending_control` (default 64) bounds requests awaiting an
+answer. `SECURITY.md` has the details.
+
 See `CrowdControl.Session` for `:hooks`, `:on_control_request`,
 `:interrupt_grace`, `set_model/2` and `set_permission_mode/2`.
 
@@ -1250,10 +1258,14 @@ RBAC the backend's identity needs, in `:namespace`:
                                               # a placement: :separate service
     services        create, get, list, delete # :separate services, :sandbox_ports
     configmaps      create, get, list, delete # services with :files
+    secrets         create, get, list, delete # services with env
 
-`list` on `services`, `configmaps` and `networkpolicies` is the reaper's orphan
-sweep (`CrowdControl.Backend.Kubernetes.sweep_orphans/1`); grant it wherever the
-reaper runs this backend, even before any session uses `:services`.
+`list` on `services`, `configmaps`, `secrets` and `networkpolicies` is the
+reaper's orphan sweep (`CrowdControl.Backend.Kubernetes.sweep_orphans/1`);
+grant it wherever the reaper runs this backend, even before any session uses
+`:services`. A service's `env` lives in a per-session Secret
+(`cc-<session_key>-<service>-env`) its container reads through
+`secretKeyRef`, so no literal value is in any Pod spec.
 
 **Namespace isolation is yours to provision, deliberately.** The backend runs
 every sandbox in `:namespace` and never creates, labels or deletes one: that

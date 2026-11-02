@@ -69,6 +69,13 @@ defmodule CrowdControl.Session do
   options may be given at top level or inside a `backend: {module, config}`
   tuple; either way a reattached session keeps them.
 
+  Control requests arrive on the CLI's output, a stream the sandbox can write
+  to (on a remote backend, the capture file), so any of them may be forged.
+  Hooks, `:on_control_request` and SDK tools therefore receive
+  sandbox-controllable input and must authorize their own arguments. The
+  output capture is only partly trusted while model code runs under the CLI's
+  uid: a captured line is the sandbox's word, not the CLI's. See `SECURITY.md`.
+
     * `:can_use_tool` - answers the CLI's tool-permission requests. `request` is
       the `can_use_tool` request map (`"tool_name"`, `"input"`,
       `"tool_use_id"`, ...). Returns `{:allow, input}`, `{:allow, input,
@@ -76,18 +83,24 @@ defmodule CrowdControl.Session do
       true}` or `:defer`. The input is always sent back as `updatedInput`, so
       pass the original to allow it unchanged.
     * `:hooks` - hook callbacks, see `CrowdControl.Agent.ClaudeCode`. Each
-      returns `{:ok, hook_output}`, `{:error, message}` or `:defer`.
+      returns `{:ok, hook_output}`, `{:error, message}` or `:defer`. Hooks are
+      not gated: there is no approval to pair them with, so treat their input
+      as untrusted.
     * `:sdk_mcp_servers` - a map of name to `CrowdControl.SdkMcp.tool_server/2`
       spec, answered in-BEAM. With `:can_use_tool` configured, a `tools/call`
       runs only if the tool is pre-approved (it matches an `:allowed_tools`
       entry -- `"mcp__<server>__<tool>"`, `"mcp__<server>"` or
-      `"mcp__<server>__*"` --, `:permission_mode` is `"bypassPermissions"`, or a
+      `"mcp__<server>__*"` --, the permission mode is `"bypassPermissions"`
+      (from `:permission_mode`, a `setMode` update in an allow's permission
+      updates, or a `set_permission_mode/2` the CLI acknowledged), or a
       `{:allow, input, updates}` granted it an `addRules` allow rule this
       session), or if a `can_use_tool` allow for `"mcp__<server>__<tool>"` was
       answered earlier in the turn with exactly the call's arguments as its
-      input; each such allow covers one call. Any other call is refused with
-      the JSON-RPC error `-32001` `"tool call not approved"` and a decision
-      event with `source: :gate`.
+      input; each such allow covers one call, and unused ones are cleared at
+      the turn's result. Any other call is refused with the JSON-RPC error
+      `-32001` `"tool call not approved"` and a decision event with
+      `source: :gate`. The gate's state is persisted, so a reattached session
+      keeps what it learnt. Without `:can_use_tool` nothing is gated.
     * `:on_control_request` - any other CLI request subtype; returns
       `{:ok, response}`, `{:error, message}` or `:defer`. Without it such a
       request is answered with an error, so the CLI never waits.
@@ -99,8 +112,11 @@ defmodule CrowdControl.Session do
       a control feature and to `0` (destroy at the deadline) otherwise.
     * `:max_pending_control` - how many CLI control requests may wait on an
       answer at once. Past it a new request is answered at once with an error
-      (a deny for a permission request, a JSON-RPC error for an MCP message)
-      and is not persisted. Defaults to `64`.
+      (a deny for a permission request, with a decision event
+      `source: :cap`; a JSON-RPC error for an MCP message; an error response
+      for the rest) and is not persisted, so a flood of forged requests bounds
+      memory and Store writes. The first refusal in a turn is logged.
+      Defaults to `64`.
     * `:reattach_reply_timeout` - test-only. ms a reattached session waits for
       its `initialize` reply before it falls back to the permission requests it
       persisted. Defaults to `60_000`.

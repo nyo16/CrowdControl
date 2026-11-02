@@ -167,15 +167,17 @@ Two mechanisms, applied on the way to the store, both in `Session.persist/1`:
 
 * `CrowdControl.Store.scrub_opts/1` drops every key in
   `CrowdControl.Store.secret_keys/0` — `:api_key`, `:session_token`, `:env`,
-  `:proxy_token`, `:auth_token`, `:sandboxd_secret`, `:gce_config` — from the opts.
-  Nothing about reattaching a session needs its API key: the sandbox already holds
-  whatever environment it was started with.
+  `:proxy_token`, `:auth_token`, `:sandboxd_secret`, `:gce_config` — from the opts,
+  at every level: inside a `backend: {module, config}` tuple and a nested
+  `provider: {module, config}` too, and every `:services` spec keeps its shape
+  without `:env` and `:files`, which is exactly where a proxy's upstream key or a
+  database password lives. Nothing about reattaching a session needs any of it:
+  the sandbox already holds whatever environment it was started with.
 * `CrowdControl.Backend.scrub/2` delegates to the backend's (and then the
   provider's) `scrub/1` for the handle. `Backend.Sandboxd` drops the endpoint
   wholesale; `Provider.Gce` rebuilds its handle from five fields;
-  `Provider.Compose` additionally strips each service spec's `:env`, because
-  `scrub_opts/1` cannot see into `:services` and a service spec's `:env` is exactly
-  where a proxy's upstream key or a database password lives.
+  `Provider.Compose` and `Backend.Kubernetes` run their handle's config through
+  `scrub_opts/1`.
 
 Two entries in `secret_keys/0` are there for reasons worth naming.
 `:sandboxd_secret` is normally read from application config rather than passed in

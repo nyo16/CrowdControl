@@ -59,6 +59,32 @@ defmodule CrowdControl.SdkMcp do
   `handle/2` is the whole protocol: `initialize`, `ping`, `tools/list`,
   `tools/call`, and an empty acknowledgement for notifications. It touches no
   process state, so a session can run it wherever it likes.
+
+  ## Arguments are untrusted
+
+  `mcp_message` requests arrive on the CLI's output, a stream the sandbox can
+  write to, so a `tools/call` may be forged and its arguments are
+  sandbox-controllable. A tool must authorize its own arguments — that the
+  order, the path, the account is one this session may touch — exactly as it
+  would for any untrusted request.
+
+  With `:can_use_tool` set on the session, a `tools/call` runs only if the CLI
+  would have let the model make it: a `can_use_tool` allow for
+  `mcp__<server>__<tool>` was answered earlier in the same turn and the call's
+  arguments equal the `updatedInput` it sent back (one call per allow, and
+  unused allows are cleared at the turn's result), or the tool is
+  pre-approved, because the CLI never asks about it — it matches an
+  `:allowed_tools` entry (`"mcp__<server>__<tool>"`, `"mcp__<server>"` or
+  `"mcp__<server>__*"`), the permission mode is `"bypassPermissions"` (from
+  `:permission_mode`, a `setMode` permission update in an allow, or an
+  acknowledged `CrowdControl.Session.set_permission_mode/2`), or an allow's
+  `addRules` update granted a bare rule for it. Any other call is answered
+  with the JSON-RPC error `-32001` `"tool call not approved"`, runs nothing,
+  and emits a `[:crowd_control, :control, :decision]` event with
+  `source: :gate`. What the gate has learnt is persisted with the session and
+  survives reattach. Without `:can_use_tool` no call is gated, and the tool's
+  own checks are all there is. See `CrowdControl.Session`'s control options,
+  including `:max_pending_control`, and `SECURITY.md`.
   """
 
   require Logger

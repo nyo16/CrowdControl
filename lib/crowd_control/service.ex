@@ -60,10 +60,12 @@ defmodule CrowdControl.Service do
 
   Files are staged into the container before it starts (a tar upload on
   Compose, a per-session ConfigMap on Kubernetes). A ConfigMap is readable by
-  anyone with `get` on the namespace, so credentials go through `:env`
-  (Compose) or an operator-managed Secret (Kubernetes) instead. Nothing scans
-  the content: pattern matching would give false confidence, so the rule is
-  documented rather than enforced.
+  anyone with `get` on the namespace, so credentials go through `:env` on
+  both substrates: set on the container on Compose, and on Kubernetes kept in
+  a per-session Secret the container reads by `secretKeyRef`
+  (`CrowdControl.Backend.Kubernetes.Secrets`). Nothing scans the content:
+  pattern matching would give false confidence, so the rule is documented
+  rather than enforced.
 
   Each file is `%{path: abs_path, content: binary}` plus optional `:mode`
   (`0..0o777`, default `0o644`; no setuid, setgid or sticky bits), `:uid` and

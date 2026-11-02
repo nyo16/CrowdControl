@@ -6,34 +6,60 @@
 
 - **Control protocol for Claude Code sessions.** New session options
   `:can_use_tool`, `:hooks`, `:sdk_mcp_servers`, `:on_control_request`,
-  `:permission_timeout` (default `:infinity`) and `:interrupt_grace` (default
-  30 s with a control feature on, else 0), and new `CrowdControl.Session`
-  functions `respond/3`, `interrupt/1`, `set_model/2`, `set_permission_mode/2`,
-  `control/3` and `pending_requests/1` (`{:error, :unsupported}` on agents
-  without the capability, i.e. omp). Callbacks are MFA tuples run under the new
-  `CrowdControl.CallbackSupervisor`; a fun raises `ArgumentError` at start,
-  because session options are persisted. A callback returning `:defer` leaves
-  the request to `respond/3` and broadcasts
+  `:permission_timeout` (default `:infinity`), `:interrupt_grace` (default
+  30 s with a control feature on, else 0) and `:max_pending_control` (default
+  64), and new `CrowdControl.Session` functions `respond/3`, `interrupt/1`,
+  `set_model/2`, `set_permission_mode/2`, `control/3` and
+  `pending_requests/1` (`{:error, :unsupported}` on agents without the
+  capability, i.e. omp). Callbacks are MFA tuples run under the new
+  `CrowdControl.CallbackSupervisor`, killed with their session however it
+  dies; a fun raises `ArgumentError` at start, because session options are
+  persisted, and so does a fun, pid, reference or port anywhere in
+  `extra_args` — persisted arguments must be plain data, so
+  `{M, :f, [self()]}` raises. The options may also be given inside
+  `backend: {module, config}` and survive reattach either way. A callback
+  returning `:defer` leaves the request to `respond/3` and broadcasts
   `{:control_request, id, subtype, request}`; a withdrawn one broadcasts
-  `{:control_cancelled, id}`. Pending requests survive a host restart:
-  callbacks are at-least-once, responses idempotent. Requires Claude Code
-  2.1.268 or newer (`CrowdControl.CLI.min_version/0`); an older CLI gets
-  `{:error, {:cli_version, have, need}}`.
+  `{:control_cancelled, id}`. A crashing, malformed or unencodable decision
+  is answered as a failure (a deny) and never raises inside the session;
+  `respond/3` with such a decision returns
+  `{:error, {:invalid_decision, decision}}`, and `control/3` with a request
+  that cannot be encoded returns `{:error, {:invalid_request, request}}`.
+  Pending requests survive a host restart: callbacks are at-least-once,
+  responses idempotent. Control requests come from a stream the sandbox can
+  write to, so hooks and SDK tools get sandbox-controllable input and must
+  authorize their own arguments; past `:max_pending_control` a new request is
+  answered at once with an error, never persisted, and logged once per turn.
+  Requires Claude Code 2.1.268 or newer (`CrowdControl.CLI.min_version/0`); an
+  older CLI gets `{:error, {:cli_version, have, need}}`, and an unparsable
+  version banner passes the gate with a logged warning.
 - **`CrowdControl.SdkMcp`** — in-BEAM MCP tool servers
   (`tool_server/2`), reached over the control channel. A tool call in flight at
-  a host restart is re-run only when the tool is `idempotent: true`.
+  a host restart is re-run only when the tool is `idempotent: true`. With
+  `:can_use_tool` set, a `tools/call` runs only after a `can_use_tool` allow
+  for `mcp__<server>__<tool>` in the same turn with equal arguments (one call
+  per allow, cleared at the turn's result), or when the tool is pre-approved
+  (`:allowed_tools` exact, `mcp__<server>` or `mcp__<server>__*`;
+  `bypassPermissions`, also via a `setMode` update or an acknowledged
+  `set_permission_mode/2`; an `addRules` grant). Anything else gets JSON-RPC
+  `-32001` `"tool call not approved"`. The gate's state persists across
+  reattach.
 - **Typed errors.** `CrowdControl.Error` (closed set of kinds,
   `Error.kinds/0`), `CrowdControl.Result.classify/1` and its accessors
   `cost_usd/1`, `session_id/1`, `num_turns/1`, `permission_denials/1`, and
-  `CrowdControl.run!/2` / `CrowdControl.classify/1`. Subscribers still receive
-  the untyped `{:result, subtype, map}`.
+  `CrowdControl.run!/2` (returns the bare result map, or raises) /
+  `CrowdControl.classify/1`. Subscribers still receive the untyped
+  `{:result, subtype, map}`.
 - **Telemetry events** for sessions, turns (with `turn_cost_usd` and
   `error_kind`), backend provisioning and control decisions, listed in the
   `CrowdControl.Telemetry` moduledoc. The decision event is the only audit
-  trail of permission answers.
+  trail of permission answers; its `source` includes `:gate` (an SDK tool call
+  refused) and `:cap` (refused past `:max_pending_control`).
 - **`:mcp_config` accepts inline maps** (`%{"mcpServers" => ...}`, every server
   with a `"type"`), alone or mixed with paths in a list. Also
-  `:permission_prompt_tool` and `:permission_prompts`.
+  `:permission_prompt_tool` and `:permission_prompts`. An inline map is argv,
+  and on Kubernetes part of the exec request the API server can audit-log:
+  keep credentials out of it.
 - **`mix crowd_control.contract`** checks a Claude Code binary's flags and
   control frames against what the library assumes, without a model call; CI
   runs it against a pinned release.
@@ -42,45 +68,93 @@
 - **`:write_timeout`** on `Backend.Docker` (default 10 s).
 - **`CrowdControl.Service`** — one sidecar spec for Compose and Kubernetes,
   with new fields `networks`, `host_config`, `weaken`, `files`, `placement`,
-  `drain` (ms) and `shutdown_limit` (s, default 20).
+  `drain` (ms) and `shutdown_limit` (s, default 20). Env keys must match
+  `[A-Za-z_][A-Za-z0-9_]*` (`{:bad_service, {name, :env}}`), and `user:` is a
+  uid or name, optionally `:group`.
 - **Compose per-service networks and overrides.** `:networks` declares extra
   internal networks a service joins through `networks:`; once in use, the
   sandbox may share no network with an `egress: :allow` service other than
-  `:proxy_service` (`{:compose, {:sandbox_shares_network_with_egress, {svc, net}}}`).
+  `:proxy_service` (`{:compose, {:sandbox_shares_network_with_egress, {service, network}}}`).
+  A stack using neither keeps the single-network `sbx` model, where an
+  `:allow` sidecar on `sbx` is the declared relay.
   `host_config:` overrides the stack's hardening per service: resource keys
-  freely, weakening keys only when named in `weaken:`, `privileged` never.
+  freely, weakening keys only when named in `weaken:`
+  (`{:weakening_not_declared, {name, key}}`), `privileged` never. The
+  weakening keys are `:cap_add`, `:no_new_privileges`, `:readonly_rootfs`,
+  `:user` (a root uid, decided numerically: `"0"`, `"00"` and `"root"` all
+  need it), `:host_path` (a host-path mount on a sidecar, read-only or not)
+  and `:tmpfs_exec` (a tmpfs without `noexec` or `nosuid`). A sidecar must
+  mount the sandbox's capture volume `read_only: true`, and no service may
+  stage `:files` under it (`{:compose, {:capture_mount_writable, service}}`).
 - **`:files` on a service** — config files staged with
-  `PUT /containers/{id}/archive` on Compose, a ConfigMap on Kubernetes. For
-  configuration, never secrets.
+  `PUT /containers/{id}/archive` on Compose, a ConfigMap on Kubernetes, modes
+  `0..0o777`. For configuration, never secrets. On Kubernetes the 1 MiB budget
+  is counted on the base64-encoded payload
+  (`{:k8s, {:files_too_large, {name, size}}}`).
 - **Drain for log sidecars.** A service with `drain:` is stopped gracefully
   after a wait (Compose `stop?t=shutdown_limit + 5`; Kubernetes `preStop` sleep
   and a matching delete grace period).
 - **Kubernetes `:services`** with a required `placement` — `:pod` (native
   sidecar), `:separate` (own Pod, Service and NetworkPolicy) or
   `{:external, target}` — NetworkPolicy edges from `networks:`, DNS-free peer
-  discovery through `hostAliases`, and `:sandbox_ports`.
+  discovery through `hostAliases`, and `:sandbox_ports`. A service's `env`
+  lives in a per-session Secret, `cc-<key>-<service>-env`, read through
+  `secretKeyRef`, so no literal value is in any Pod spec. An external the
+  sandbox reaches must be private or narrow
+  (`{:k8s, {:external_too_broad, {name, cidr}}}`), may not be
+  `egress: :allow` (`{:k8s, {:external_egress_forbidden, name}}`), and reaches
+  port 53 or `kube-system` only with `allow_dns: true`
+  (`{:k8s, {:external_dns_not_declared, {name, detail}}}`). A service with no
+  `user:` runs with `runAsNonRoot: true`. A service that never becomes ready
+  is `{:k8s, {:service_not_ready, {name, reason}}}`. Under
+  `network: :deny_all`, `<pod>-deny-all` is re-checked just before the
+  sandbox Pod (`{:k8s, {:policy_missing, name}}`). `destroy/1` waits for a
+  drained Pod to be gone before deleting its NetworkPolicies.
   `Kubernetes.sweep_orphans/1`, called by the reaper (reported as `swept`),
-  removes service objects, and the sandbox's own `<pod>-deny-all` policy, that
-  a crash before the sandbox Pod left behind.
+  removes service objects, Secrets, and the sandbox's own `<pod>-deny-all`
+  policy, that a crash before the sandbox Pod left behind, once they are past
+  their `crowd_control.sweep_after_ms` annotation; `:orphan_margin_ms`
+  (default a minute) sets the margin.
 - **`CrowdControl.VersionGate`** — version floors checked before anything is
   created: Kubernetes 1.29 for `:pod` sidecars, 1.30 for `preStop` sleep,
   Docker Engine 25.0.5 for per-service networks and `egress: :allow` sidecars
   (`{:error, {:version, component, have, need}}`).
 - **Presets** — `CrowdControl.Preset.browser_stack/1`, `Preset.Browser`
   (Playwright), `Preset.EgressProxy` (Smokescreen) and `Preset.LogShipper`
-  (Vector, redacting by default), returning plain service specs. The
-  `{:vector, address:}` sink is plain-text gRPC (`http://`); an `https://`
-  address is refused rather than downgraded.
-- **Images and examples** — a `sandbox-browser` Dockerfile stage, example
-  `examples/images/browser` and `examples/images/smokescreen` images, and
+  (Vector, redacting by default, drain 15 s, digest-pinned default image),
+  returning plain service specs. The `{:vector, address:}` sink is plain-text
+  gRPC (`http://`); an `https://` address is refused rather than downgraded.
+- **Images and examples** — a `sandbox-browser` Dockerfile stage (with
+  `NODE_PATH` set so a bare `require('playwright')` works, and
+  `HEALTHCHECK NONE`), example `examples/images/browser` and
+  `examples/images/smokescreen` images, and
   `examples/compose_browser_stack.exs` / `examples/kubernetes_browser_stack.exs`.
+  The `PLAYWRIGHT_VERSION` file is the single Playwright version; the example
+  browser image needs `--build-arg PLAYWRIGHT_VERSION=$(cat PLAYWRIGHT_VERSION)`.
+  The example images' bases are pinned by digest. The browser sidecar takes
+  `MCP_ALLOWED_HOSTS` (default `browser:8931`, validated, exit 2 if
+  malformed); Chromium runs with Playwright's default `--no-sandbox`, with the
+  container as the boundary.
 
 ### Changed
 
+- **`CrowdControl.run/2` follows the session's own clock.** It waits for the
+  result or `{:timeout, :session_expired}`, with only a wall-clock backstop of
+  `:timeout` plus `:interrupt_grace` (30 s when unset) plus 30 s. Without
+  `:timeout` it therefore waits for the session default, 300 s, where it
+  previously gave up after 60 s.
+- **`Session.stop/1` and `CrowdControl.stop_all/1` no longer time out.** A
+  Kubernetes destroy waits for a drained sandbox Pod to be gone before
+  deleting its NetworkPolicies, which with the LogShipper preset takes about
+  17 s. `Reaper.sweep/2` defaults to `:infinity` for the same reason.
+- **The Store keeps no nested secrets.** `Store.scrub_opts/1` recurses into
+  `backend:` and `provider:` tuples and keeps every service spec without its
+  `env` and `:files`.
 - **`Backend.Local` always scrubs the release environment.** `RELEASE_*`,
   `BINDIR`, `ROOTDIR`, `EMU`, `PROGNAME` and the release's `PATH` entries no
-  longer reach the CLI; an explicit `:env` still wins. Pass
-  `release_env: :inherit` for the old behaviour. `sandboxd` scrubs the same way.
+  longer reach the CLI, nor its `--version` probe; an explicit `:env` still
+  wins. Pass `release_env: :inherit` for the old behaviour. `sandboxd` scrubs
+  the same way.
 - **`Backend.Docker` writes are synchronous.** `write/2` waits for its exec to
   exit, so frames arrive in order; past `:write_timeout` it returns
   `{:error, {:docker, :write_indeterminate}}`, a non-zero exit
@@ -95,14 +169,16 @@
 - **`:telemetry` is declared as an optional dependency** (it previously
   arrived only transitively); without it every event is a no-op.
 - **Compose session tokens carry a `ccst_` prefix**, so log redaction can
-  match them.
+  match them, and a caller-supplied `:session_token` without it is refused
+  with `{:compose, {:bad_session_token, :prefix}}`.
 - **Kubernetes `list_live/1` selects `crowd_control.role!=service`**, so a
   service Pod is never reattached to or destroyed as a sandbox.
 - **`placement` is required for Kubernetes `:services`**
   (`{:k8s, {:placement_required, name}}`); Compose ignores it with a warning.
-- **New Kubernetes RBAC verbs:** `create, get, list, delete` on `services` and
-  `configmaps`, `list` on `networkpolicies`, and `get` on `pods/log`. Grant the
-  `list`s wherever the reaper runs, for the orphan sweep.
+- **New Kubernetes RBAC verbs:** `create, get, list, delete` on `services`,
+  `configmaps` and `secrets`, `list` on `networkpolicies`, and `get` on
+  `pods/log`. Grant the `list`s wherever the reaper runs, for the orphan
+  sweep.
 - **The Dockerfile's runtime stage is named `runtime`**, with a trailing
   `FROM runtime` keeping it the default target.
 - **Compose hardening is a per-service default** rather than one posture per
