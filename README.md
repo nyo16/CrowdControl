@@ -426,9 +426,12 @@ CrowdControl.run("Search the GitHub repo for issues",
   permission_mode: "bypassPermissions"
 )
 
-# Load multiple MCP configs
+# Load multiple MCP configs, or pass one inline (every server needs a "type")
 CrowdControl.run("Analyze the project",
-  mcp_config: ["/config/mcp_filesystem.json", "/config/mcp_github.json"],
+  mcp_config: [
+    "/config/mcp_filesystem.json",
+    %{"mcpServers" => %{"docs" => %{"type" => "http", "url" => "http://localhost:4000/mcp"}}}
+  ],
   permission_mode: "bypassPermissions"
 )
 
@@ -484,6 +487,88 @@ CrowdControl.run_many("Refactor this module for clarity", [
   [add_dir: "/path/to/project", model: "opus", max_budget_usd: 2.00]
 ])
 ```
+
+### Typed errors
+
+`run!/2` returns `{:ok, map}` or raises `CrowdControl.Error`; `classify/1`
+does the same without raising, for a result you already have:
+
+```elixir
+try do
+  {:ok, %{"result" => text}} = CrowdControl.run!("Summarize this repo")
+  text
+rescue
+  e in CrowdControl.Error ->
+    case e.kind do
+      :api_error -> {:retry, e.reason.category}   # :rate_limit, :overloaded, ...
+      :max_budget_exceeded -> {:stop, e.reason.cost_usd}
+      _ -> reraise e, __STACKTRACE__
+    end
+end
+
+# Inside a receive loop: {:result, _, _} = result
+case CrowdControl.classify(result) do
+  {:ok, map} -> map["result"]
+  {:error, %CrowdControl.Error{kind: kind}} -> {:failed, kind}
+end
+```
+
+`CrowdControl.Error.kinds/0` lists every kind. Subscribers still receive the
+untyped `{:result, subtype, map}`.
+
+### Tool approval, interrupts and in-BEAM tools
+
+Claude Code only (CLI 2.1.268 or newer). Callbacks are `{module, function,
+extra_args}` tuples, never funs — session options are persisted, and a closure
+cannot be. Each is called as `apply(module, function, [request, context | extra_args])`.
+
+```elixir
+defmodule MyApp.Approver do
+  def can_use_tool(%{"tool_name" => "Bash"}, _ctx), do: :defer   # ask a human
+  def can_use_tool(%{"input" => input}, _ctx), do: {:allow, input}
+end
+
+{:ok, session} =
+  CrowdControl.start_session(
+    prompt: "Clean up the build directory",
+    can_use_tool: {MyApp.Approver, :can_use_tool, []},
+    permission_timeout: 600_000
+  )
+
+CrowdControl.Session.subscribe(session)
+
+receive do
+  {:crowd_control, ^session, {:control_request, id, "can_use_tool", _request}} ->
+    CrowdControl.Session.respond(session, id, {:deny, "not today"})
+end
+
+# Stop the turn in progress without killing the CLI
+{:ok, _} = CrowdControl.Session.interrupt(session)
+```
+
+A deferred request is re-sent to every new subscriber until answered. Callbacks
+can run more than once across a host restart, so make them idempotent by
+`context.request_id`.
+
+Tools served from the BEAM, without an MCP subprocess:
+
+```elixir
+server =
+  CrowdControl.SdkMcp.tool_server("app", [
+    %{
+      name: "lookup_order",
+      description: "Look up an order by id",
+      input_schema: %{"type" => "object", "properties" => %{"id" => %{"type" => "string"}}},
+      call: {MyApp.Tools, :lookup_order, []}   # returns {:ok, text} | {:error, text}
+    }
+  ])
+
+CrowdControl.run("Where is order 42?", sdk_mcp_servers: %{"app" => server})
+# the model sees the tool as mcp__app__lookup_order
+```
+
+See `CrowdControl.Session` for `:hooks`, `:on_control_request`,
+`:interrupt_grace`, `set_model/2` and `set_permission_mode/2`.
 
 ### Resource limits
 
@@ -1580,7 +1665,7 @@ options — see `CrowdControl.Agent.Omp`.
 | `:no_session_persistence` | `true` to skip saving to disk |
 | `:settings` | Path to settings JSON file or inline JSON string |
 | `:setting_sources` | List of setting sources to load (`["user", "project", "local"]`) |
-| `:mcp_config` | Path to MCP config JSON file(s) (string or list) |
+| `:mcp_config` | MCP config file path(s) and/or inline `%{"mcpServers" => ...}` maps (one or a list); inline maps land in argv, so keep credentials out of them |
 | `:strict_mcp_config` | `true` to only use MCP servers from `:mcp_config` |
 | `:agents` | JSON string or map defining custom agents |
 | `:plugin_dir` | Path to a plugin directory |
@@ -1601,6 +1686,8 @@ options — see `CrowdControl.Agent.Omp`.
 | Function | Description |
 |----------|-------------|
 | `run(prompt, opts)` | Single-shot: start session, send prompt, collect result, stop |
+| `run!(prompt, opts)` | As `run/2`, returning `{:ok, map}` or raising `CrowdControl.Error` |
+| `classify(result)` | `{:ok, map}` or `{:error, %CrowdControl.Error{}}` for a `{:result, subtype, map}` |
 | `run_many(prompt, opts_list)` | Same prompt across N sessions with different options |
 | `start_session(opts)` | Start one supervised session (returns `{:error, :max_sessions_reached}` at limit) |
 | `start_sessions(opts_list)` | Start N sessions in parallel |
@@ -1619,6 +1706,11 @@ options — see `CrowdControl.Agent.Omp`.
 | `get_session_id(session)` | CLI-assigned session ID |
 | `get_messages(session)` | All accumulated messages |
 | `current_turn(session)` | Turn currently in flight (prompts written so far) |
+| `respond(session, request_id, decision)` | Answer a deferred control request |
+| `interrupt(session)` | End the turn in progress without killing the CLI |
+| `set_model(session, model)` / `set_permission_mode(session, mode)` | Change them for later turns |
+| `control(session, request, timeout)` | Send any control request (default timeout 60 s) |
+| `pending_requests(session)` | Control requests still awaiting an answer |
 | `stop(session)` | Graceful shutdown |
 
 ### Message types
@@ -1635,6 +1727,9 @@ the same shape for every agent adapter:
 | `{:stream_event, map}` | Partial message delta (Claude Code: requires `:include_partial_messages`; omp: always) |
 | `{:timeout, :session_expired}` | Session timed out (requires `:timeout` option) |
 | `{:exit, status}` | CLI process exited with OS status code |
+| `{:control_request, id, subtype, request}` | A control callback deferred; answer with `respond/3` (re-sent on every `subscribe/1`) |
+| `{:control_cancelled, id}` | The CLI withdrew a pending control request |
+| `{:error, {:cli_version, have, need}}` | Claude Code is older than `CrowdControl.CLI.min_version/0`; the session stops |
 
 ## Architecture
 

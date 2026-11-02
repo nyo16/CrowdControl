@@ -59,6 +59,49 @@ current set of hardening measures (API-key env file with `0600`
 permissions in a per-session `0700` subdir, non-root Docker user, dropped
 Linux capabilities, read-only root filesystem with tmpfs).
 
+## Local subprocess environment
+
+`CrowdControl.Backend.Local` starts the CLI from the BEAM's own environment,
+and inside a `mix release` that environment describes the release: `RELEASE_*`
+variables (including `RELEASE_COOKIE`), `BINDIR`, `ROOTDIR`, `EMU`,
+`PROGNAME`, and `PATH` entries for the release's `bin` and `erts-*/bin`. The
+backend always removes these before the CLI starts, so model-driven code can
+neither read the distribution cookie nor resolve `erl` to the release's own
+runtime. An explicit `:env` entry is applied after the scrub and wins.
+
+`release_env: :inherit` turns the scrub off and passes the release's
+environment through unchanged. Use it only when the CLI genuinely needs it;
+any other value fails `provision/1` with
+`{:invalid_option, {:release_env, value}}`. `sandboxd` applies the same scrub
+to the processes it execs.
+
+## Control protocol
+
+With `:can_use_tool`, `:hooks`, `:sdk_mcp_servers` or `:on_control_request`
+set, a Claude Code session answers the CLI's control requests from the host.
+Three properties matter for an audit.
+
+**Requests are captured; answers are not.** A `can_use_tool` request,
+including its `input` (the full command or file content the model wants to
+use), is CLI output and lands in the session's output capture like any other
+line — a remote sandbox's tee file included. The decision is written to the
+CLI's stdin and is never captured. The `[:crowd_control, :control, :decision]`
+telemetry event (`behavior`, `source`, `tool_name`, `request_id`) is the only
+record of who allowed or denied what; attach a handler if you need that
+trail. See `CrowdControl.Telemetry`.
+
+**Callbacks are MFA tuples, never funs.** Session options are written to
+`CrowdControl.Store` so a reattached session can keep answering, and with
+`Store.DETS` that means to disk. A closure cannot be persisted faithfully, so
+a fun is refused at start with `ArgumentError`. Keep secrets out of the
+`extra_args` for the same reason: they are persisted with the rest of the
+options.
+
+**Callbacks are at-least-once.** A request persisted but unanswered when the
+host dies is dispatched again on reattach. A callback with side effects must
+be idempotent by `request_id`. An in-BEAM MCP tool is re-run only when
+declared `idempotent: true`.
+
 ## Remote sandbox backends
 
 `CrowdControl.Backend.Docker` runs a CLI inside a container. Two properties
@@ -78,6 +121,18 @@ the container's FIFO via `printf %s <escaped> >> <fifo>`, quoted with the
 same `CrowdControl.Backend.Shell.escape/1` used for local env values. There
 is deliberately one escaper, not two. A test fires `$(touch /tmp/pwned)`
 through a prompt and asserts the file is never created.
+
+**Writes are size-bounded and ordered.** Each `write/2` is its own exec, and
+it now waits for that exec to exit, so frames reach the FIFO in order. A frame
+whose escaped script exceeds 120 KiB is refused with
+`{:error, :frame_too_large}`: the frame travels in the `sh -c` argv, and Linux
+caps one argv string at 128 KiB, so a larger one would fail inside the daemon
+with an error that names none of this. An in-BEAM MCP response that large is
+answered to the CLI as JSON-RPC
+`-32603` instead. A write that does not finish within `:write_timeout`
+(default 10 s) is `{:error, {:docker, :write_indeterminate}}`: the frame may or
+may not have arrived. The Kubernetes backend writes frames on stdin and has no
+such limit.
 
 **The reaper only destroys what it owns.** Every container carries a
 `crowd_control.owner` label (`config :crowd_control, :owner_id`, or `:owner` in
