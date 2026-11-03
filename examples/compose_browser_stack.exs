@@ -35,10 +35,10 @@
 #   * **Claude Code.** Set ANTHROPIC_API_KEY *and* CC_API_PROXY_IMAGE. The
 #     sandbox has no route to the API, so the CLI needs an API proxy named by
 #     `:proxy_service`; none ships with this library (SECURITY.md, "Egress
-#     proxy contract"). It must serve HTTP on 8080 and default to a non-root
-#     user (or the `api-proxy` spec below needs a `user:`). That proxy is the one
-#     egress service allowed on the sandbox's network; the browser's proxy
-#     never is.
+#     proxy contract"). It must serve HTTP on 8080 and default to a numeric
+#     non-root uid (or the `api-proxy` spec below needs a `user:`). That proxy
+#     is the one egress service allowed on the sandbox's network; the
+#     browser's proxy never is.
 #
 # While it runs, `docker logs -f <project>-vector` shows the shipped events:
 # the transcript with secrets (and the `ccpw_` browser token the init line

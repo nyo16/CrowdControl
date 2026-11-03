@@ -23,10 +23,11 @@
 # "Egress proxy contract" specifies what one must do (inject the real key
 # server-side, enforce a per-session budget, restrict destinations). Point
 # CC_EGRESS_PROXY_IMAGE at yours; it must serve HTTP on 8080 and answer
-# /healthz, or adjust `:port` and `:ready` below to match it. It must also run
-# as non-root: an image whose default user is root is refused with
+# /healthz, or adjust `:port` and `:ready` below to match it. It must also
+# default to a numeric non-root uid (`USER 1000`, not `USER proxy`): any other
+# default user is refused with
 # {:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}} unless the
-# spec below sets `user:` (or, deliberately, `weaken: [:user]`).
+# spec below sets a numeric `user:` (or, deliberately, `weaken: [:user]`).
 
 Application.put_env(
   :crowd_control,

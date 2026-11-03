@@ -386,9 +386,11 @@ The **forwarder** sidecar is dual-homed on 1 and 2 and publishes the agent port 
 `127.0.0.1:0`, running
 `socat TCP-LISTEN:<port>,fork,reuseaddr TCP:<sandbox>:<port>` and addressing the
 sandbox by its network alias. It runs as `nobody` (`65534:65534`), so a custom
-`:forwarder_image` must let uid 65534 run `socat`, and `:agent_port` must be
-1024–65535 (`{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`, before
-any request). `fork` is not decorative: a single-slot forwarder
+`:forwarder_image` must let uid 65534 run `socat`. `:agent_port` may be any TCP
+port, `1..65535`: Docker sets `net.ipv4.ip_unprivileged_port_start=0` in each
+container's network namespace, so `nobody` can bind a privileged one; anything
+else is `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`, before any
+request. `fork` is not decorative: a single-slot forwarder
 (`busybox nc -e`) dropped two of three concurrent requests in testing, and
 `Backend.Sandboxd` holds a long-lived chunked stream open for the whole session.
 
@@ -468,15 +470,24 @@ stack's HostConfig with `host_config:`:
   uid or a lowercase name, optionally `:group`; root is decided numerically, so
   `"0"`, `"00"`, `"0:1000"` and `"root"` all need `weaken: [:user]`, and `"+0"` or
   `" 0"` is not a valid user at all. Env keys must match `[A-Za-z_][A-Za-z0-9_]*`.
-* **A sidecar's image default user** counts as its `user:` when it sets none.
-  Before anything is created, `acquire/1` reads it with `GET /images/{image}/json`
-  and holds a root default (no `USER`, `root` or uid 0) to the same
-  `weaken: [:user]` rule, `{:error, {:compose, {:weakening_not_declared,
-  {service, :user}}}}`. This is Kubernetes' `runAsNonRoot` done by the provider.
-  The presets all set `user:`, so they skip the read. The providers never pull,
-  so an image the daemon lacks is `{:error, {:compose, {:image_not_found,
-  {service, image}}}}` at the same point. The sandbox is exempt, as on
-  Kubernetes, and the forwarder runs as `nobody`.
+* **Every image** is a distribution reference (`[domain[:port]/]path[:tag][@digest]`,
+  or a bare `sha256:<64 hex>` Id), or `{:error, {:compose, {:bad_service,
+  {service, :image}}}}` before any request (on Kubernetes, `{:k8s, …}` for a
+  service's `image:`). Before anything is created, `acquire/1` inspects every
+  distinct image once — sandbox, forwarder and sidecars — with
+  `GET /images/{image}/json`. The providers never pull, so an image the daemon
+  lacks is `{:error, {:compose, {:image_not_found, {service, image}}}}`, naming
+  the first service that uses it.
+* **A sidecar's image default user** counts as its `user:` when it sets none, and
+  passes only as a numeric, non-zero uid (`1000`, `1000:1000`). No `USER`, a name
+  (`node`, `nginx`), or a spelling Docker runs as uid 0 (`00`, `+0`, `:1000`) is
+  held to the `weaken: [:user]` rule, `{:error, {:compose,
+  {:weakening_not_declared, {service, :user}}}}`; set a numeric `user:` or declare
+  the weakening. This is Kubernetes' `runAsNonRoot`, which also refuses a
+  non-numeric user, done by the provider. Such a sidecar is created from the
+  inspected image Id, so the image that was checked is the image that runs. The
+  presets all set `user:`, so they skip the user check. The sandbox is exempt, as
+  on Kubernetes, and the forwarder runs as `nobody`.
 * **`privileged`** is refused outright, `{:error, {:compose, {:privileged_refused,
   service}}}`, declared or not.
 

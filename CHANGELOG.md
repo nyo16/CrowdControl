@@ -13,10 +13,10 @@
   `pending_requests/1` (`{:error, :unsupported}` on agents without the
   capability, i.e. omp). Callbacks are MFA tuples run under the new
   `CrowdControl.CallbackSupervisor`, with the session in their `$callers` (so
-  Mox and Ecto sandbox allowances reach them), killed with their session however it
-  dies; a fun raises `ArgumentError` at start, because session options are
-  persisted, and so does a fun, pid, reference or port anywhere in
-  `extra_args` — persisted arguments must be plain data, so
+  Mox and Ecto sandbox allowances granted to the session reach them), killed
+  with their session however it dies; a fun raises `ArgumentError` at start,
+  because session options are persisted, and so does a fun, pid, reference or
+  port anywhere in `extra_args` — persisted arguments must be plain data, so
   `{M, :f, [self()]}` raises. The options may also be given inside
   `backend: {module, config}` and survive reattach either way. A callback
   returning `:defer` leaves the request to `respond/3` and broadcasts
@@ -189,19 +189,38 @@
   `FROM runtime` keeping it the default target.
 - **Compose hardening is a per-service default** rather than one posture per
   stack.
-- **Compose refuses a sidecar whose image defaults to root.** A sidecar with
-  no `user:` runs as its image's default user, so `acquire/1` reads it
-  (`GET /images/{image}/json`) before creating anything. A root default needs
-  `weaken: [:user]`, as an explicit root `user:` does, or
-  `{:compose, {:weakening_not_declared, {name, :user}}}`. This is the Compose
-  form of Kubernetes' `runAsNonRoot`, and it can refuse a stack that worked
-  before: set a non-root `user:` on the sidecar, or declare the weakening. An
-  image the daemon does not have is now `{:compose, {:image_not_found,
-  {name, image}}}` before any create, rather than a create failure after the
-  networks exist. The sandbox is exempt, and the presets set `user:`.
-- **The Compose forwarder runs as `nobody`** (`65534:65534`). `:agent_port`
-  must therefore be 1024–65535 (`{:compose, {:bad_agent_port, {forwarder,
-  port}}}`), and a custom `:forwarder_image` must let uid 65534 run `socat`.
+- **Image references are validated** on Compose and Kubernetes. A service's
+  `image:`, and on Compose the top-level `:image` and `:forwarder_image`, must
+  be a distribution reference (`[domain[:port]/]path[:tag][@digest]`, lowercase
+  path, name at most 255 characters) or a bare `sha256:<64 hex>` Id; anything
+  else, including `?`, `#`, whitespace or `..`, is
+  `{:compose | :k8s, {:bad_service, {name, :image}}}` before any request.
+- **Compose checks every image before creating anything.** `acquire/1`
+  inspects each distinct image once — the sandbox's, the forwarder's and every
+  sidecar's (`GET /images/{image}/json`). The providers never pull, so an
+  image the daemon does not have is `{:compose, {:image_not_found, {name,
+  image}}}`, naming the first service that uses it, rather than a create
+  failure after the networks exist.
+- **Compose refuses a sidecar whose image default user isn't a numeric
+  non-root uid.** A sidecar with no `user:` runs as its image's default user,
+  which passes only as `uid` or `uid:gid` with a non-zero uid. No `USER`,
+  `root`, any name (`node`, `nginx`), and spellings Docker runs as uid 0
+  (`00`, `+0`, `-0`, `:1000`) need `weaken: [:user]`, as an explicit root
+  `user:` does, or `{:compose, {:weakening_not_declared, {name, :user}}}`.
+  This is Kubernetes' `runAsNonRoot` rule, which refuses a non-numeric user
+  too, and it can refuse a stack that worked before, including one whose
+  image runs as a named non-root user: set a numeric `user:` on the sidecar,
+  or declare the weakening. Such a sidecar is created from the inspected
+  image Id, so `docker ps` shows an Id for it. The sandbox is exempt, and the
+  presets set `user:`.
+- **The Compose forwarder runs as `nobody`** (`65534:65534`), so a custom
+  `:forwarder_image` must let uid 65534 run `socat`. `:agent_port` may be any
+  port in `1..65535`: Docker lets an unprivileged process bind below 1024
+  inside a container. Anything else is `{:compose, {:bad_agent_port,
+  {forwarder, port}}}`.
+- **Kubernetes `destroy/1` takes `:destroy_margin_ms`** (default 10 s), how
+  long past a drained Pod's grace it waits to see the Pod gone before keeping
+  its NetworkPolicy. Mainly for tests.
 
 ### Fixed
 

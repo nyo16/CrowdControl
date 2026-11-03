@@ -665,18 +665,30 @@ such stack without making it safer. To opt into the strict model, declare
 the sandbox is not on — the two-tier browser layout is the sandbox on `sbx`,
 the browser on `sbx` and `brw`, and the forward proxy on `brw` only.
 
+**Every image is checked before anything is created.** An image is a
+distribution reference (`[domain[:port]/]path[:tag][@digest]`, or a bare
+`sha256:<64 hex>` Id), or `acquire/1` refuses with
+`{:error, {:compose, {:bad_service, {name, :image}}}}` before any request. A
+Kubernetes service's `image:` meets the same rule, as `{:error, {:k8s,
+{:bad_service, {name, :image}}}}`. Compose then inspects every distinct image
+once — the sandbox's, the forwarder's and each sidecar's
+(`GET /images/{image}/json`, read-only). The
+providers never pull, so an image the daemon does not have is
+`{:error, {:compose, {:image_not_found, {name, image}}}}`, naming the first
+service that uses it, rather than a create failure after the networks exist.
+
 **A sidecar's image default user is part of its posture.** A sidecar with no
-`user:` runs as whatever its image declares. So before anything is created,
-`acquire/1` reads that user (`GET /images/{image}/json`, read-only). A root
-default (no `USER`, `root`, or uid 0) is refused with
+`user:` runs as whatever its image declares, so that inspect also reads the
+image's user. It passes only as a numeric, non-zero uid (`1000`,
+`1000:1000`). Anything else — no `USER`, a name such as `node` or `nginx`, or
+a spelling Docker still runs as uid 0 (`00`, `+0`, `:1000`) — is refused with
 `{:error, {:compose, {:weakening_not_declared, {name, :user}}}}` unless the
-service names `:user` in `weaken:`. Setting a non-root `user:` skips the check.
-This is the Compose form of Kubernetes' `runAsNonRoot`. The providers never
-pull, so an image the daemon does not have is
-`{:error, {:compose, {:image_not_found, {name, image}}}}` at the same point,
-rather than a create failure after the networks exist. The check reads the
-image as the daemon has it at `acquire/1`. A tag that is re-pointed before the
-create is not checked again, which can't happen to an image pinned by digest.
+service sets `user:` or names `:user` in `weaken:`. A name is refused because
+Docker resolves it against the image's own `/etc/passwd`, which proves nothing
+from outside; Kubernetes' `runAsNonRoot` refuses a non-numeric user for the
+same reason, so this is the same rule on both substrates. A sidecar checked
+this way is created from the inspected image Id rather than its name, so a tag
+re-pointed between the check and the create can't swap in an unchecked image.
 The sandbox is exempt, as on Kubernetes, where its `runAsNonRoot` is opt-in
 through `:run_as_user`.
 
@@ -708,9 +720,10 @@ strong. The documented limits of `enable_ip_masquerade=false` apply to the
 forwarder and to nothing else in the stack: it is "no NAT", not "dropped". The
 forwarder runs `socat` and no attacker-controlled code, which is why that weaker
 posture is acceptable there and would not be for the sandbox.
-The forwarder runs as `nobody` (`65534:65534`), whatever its image's default. A process
-that isn't root cannot bind a privileged port, so `:agent_port` must be
-1024–65535, or `acquire/1` refuses with
+The forwarder runs as `nobody` (`65534:65534`), whatever its image's default.
+`:agent_port` may be any TCP port, `1..65535`: Docker sets
+`net.ipv4.ip_unprivileged_port_start=0` in each container's network namespace,
+so `nobody` can bind a privileged port too. Anything else is
 `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}` before any request.
 
 **Credentials.** With `:proxy_service` named, the provider mints a per-session
