@@ -271,9 +271,10 @@ defmodule CrowdControl.Backend.Kubernetes do
   sandbox Pod can reach — a drained sidecar may be shipping to it — so its
   Pod is deleted only once the sandbox Pod's wait is over; every other
   `:separate` Pod is deleted with the sandbox Pod, and the waits overlap.
-  `destroy/1` therefore blocks for up to the sandbox's wait plus the
-  longest wait of a drained service on `sbx`. A Pod whose DELETE fails
-  (anything but a 404) keeps its policy too, whatever its grace.
+  `destroy/1` therefore blocks for up to whichever is longest: the sandbox's
+  wait plus the longest wait of a drained service on `sbx`, or the wait of
+  any drained service off `sbx`. A Pod whose DELETE fails (anything but a
+  404) keeps its policy too, whatever its grace.
 
   A service's `env` goes in a per-session Secret, `cc-<key>-<name>-env`
   (`crowd_control.role=service-secret`), which its container reads by
