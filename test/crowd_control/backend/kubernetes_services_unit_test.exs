@@ -1305,6 +1305,63 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       end
     end
 
+    test "a sandbox Pod still there at its deadline keeps its deny-all; its services go on" do
+      {:ok, seen} = Agent.start_link(fn -> MapSet.new() end)
+      sandbox = "cc-#{@key}"
+
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: "/api/v1/namespaces/ns1/pods/" <> ^sandbox <> "/"} ->
+            {200, terminating_pod(sandbox)}
+
+          %{method: :get, path: "/api/v1/namespaces/ns1/pods/" <> pod} ->
+            if Agent.get_and_update(seen, &{pod in &1, MapSet.put(&1, pod)}),
+              do: {404, %{"message" => "not found"}},
+              else: {200, terminating_pod(pod)}
+
+          %{method: :delete} ->
+            {200, %{}}
+        end)
+
+      # Grace 1 and no margin: the sandbox's deadline is a second after its
+      # DELETE, not the 10 s past the grace a real teardown waits.
+      config = [{:destroy_margin_ms, 0} | config]
+
+      refs = [
+        %{name: "vector", placement: :pod, grace: 1, sbx: true},
+        %{name: "proxy", placement: :separate, grace: 45, sbx: false},
+        %{name: "aggregator", placement: :separate, grace: 30, sbx: true}
+      ]
+
+      before = System.monotonic_time(:millisecond)
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+
+      assert System.monotonic_time(:millisecond) - before >= 1_000,
+             "the sandbox's deadline was not waited out"
+
+      at = indexes(log.())
+
+      assert [first_sandbox_poll | _] = sandbox_polls = at.({:get, :pods, sandbox})
+      last_sandbox_poll = List.last(sandbox_polls)
+
+      assert at.({:delete, :networkpolicies, "#{sandbox}-deny-all"}) == [],
+             "a sandbox Pod that may still run must keep its only NetworkPolicy"
+
+      assert [proxy_delete] = at.({:delete, :pods, "#{sandbox}-proxy"})
+      assert proxy_delete < first_sandbox_poll, "the sandbox Pod cannot reach the proxy"
+
+      assert [aggregator_delete] = at.({:delete, :pods, "#{sandbox}-aggregator"})
+
+      assert last_sandbox_poll < aggregator_delete,
+             "the sandbox's drained shipper may still be sending to the aggregator"
+
+      for name <- ["proxy", "aggregator"] do
+        assert [_terminating, gone] = at.({:get, :pods, "#{sandbox}-#{name}"})
+        assert [policy_delete] = at.({:delete, :networkpolicies, "#{sandbox}-#{name}"})
+        assert gone < policy_delete, "#{name}'s policy was deleted before its Pod was gone"
+      end
+    end
+
     test "a sandbox Pod whose delete failed keeps its deny-all" do
       {config, log} =
         recorder(fn

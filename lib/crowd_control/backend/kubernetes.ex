@@ -182,6 +182,9 @@ defmodule CrowdControl.Backend.Kubernetes do
       before a session's objects count as abandoned, default 60s; read both
       when provisioning (the `crowd_control.sweep_after_ms` stamp) and by
       `sweep_orphans/1`. Mainly for tests, which cannot wait out a minute
+    * `:destroy_margin_ms` — how long past a drained Pod's grace `destroy/1`
+      waits to see it gone before keeping its NetworkPolicy, default 10s.
+      Mainly for tests, which cannot wait out a Pod that never goes
     * `:pod_poll_ms` — reader's idle Pod-liveness poll, default 60s
     * `:max_inflight_bytes` — reader backpressure watermark, default 4 MiB
     * `:proxy_url`, `:session_token` — see the egress proxy contract in
@@ -341,6 +344,7 @@ defmodule CrowdControl.Backend.Kubernetes do
 
   # How long past a drained Pod's grace `destroy/1` waits to see it gone
   # before giving up on deleting its NetworkPolicy, and the GET backoff.
+  # `:destroy_margin_ms` overrides the margin (mainly for tests).
   @destroy_margin_ms 10_000
   @gone_poll_first_ms 100
   @gone_poll_max_ms 1_000
@@ -1996,7 +2000,7 @@ defmodule CrowdControl.Backend.Kubernetes do
     started = System.monotonic_time(:millisecond)
     state = start_pod_delete(config, name, grace)
     unreached = start_pod_deletes(config, unreached)
-    running? = still_running?(config, name, state, gone_deadline(started, grace))
+    running? = still_running?(config, name, state, gone_deadline(config, started, grace))
 
     reached = start_pod_deletes(config, reached)
 
@@ -2020,7 +2024,7 @@ defmodule CrowdControl.Backend.Kubernetes do
   defp start_pod_deletes(config, pods) do
     for {:pod, name, grace, _reach} <- pods do
       started = System.monotonic_time(:millisecond)
-      {name, start_pod_delete(config, name, grace), gone_deadline(started, grace)}
+      {name, start_pod_delete(config, name, grace), gone_deadline(config, started, grace)}
     end
   end
 
@@ -2046,7 +2050,8 @@ defmodule CrowdControl.Backend.Kubernetes do
     end
   end
 
-  defp gone_deadline(started, grace), do: started + grace * 1_000 + @destroy_margin_ms
+  defp gone_deadline(config, started, grace),
+    do: started + grace * 1_000 + (config[:destroy_margin_ms] || @destroy_margin_ms)
 
   defp still_running?(_config, _name, :gone, _deadline), do: false
   defp still_running?(_config, _name, :running, _deadline), do: true
