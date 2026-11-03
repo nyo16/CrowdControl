@@ -523,14 +523,17 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
   Parse a `crowd_control.services` annotation back into refs. Lenient: an
   unreadable annotation is `[]` (the orphan sweep is the backstop), an entry
   with an illegal name is dropped rather than turned into a DELETE path, and
-  placements map through a closed set — never `String.to_atom/1`. An entry
-  without `sbx` (written before it existed) is on `sbx`, which keeps the
-  order it was deleted in then: after the sandbox Pod.
+  placements map through a closed set — never `String.to_atom/1`. `sbx` is
+  `false` only when the entry says exactly `false`; any other value, or none
+  (an entry written before it existed), is `true`, which deletes the service
+  only after the sandbox Pod. `sbx` never drops an entry.
 
       iex> alias CrowdControl.Backend.Kubernetes.Services
       iex> Services.decode_refs(~s([{"name":"proxy","placement":"separate","grace":0,"sbx":false}]))
       [%{name: "proxy", placement: :separate, grace: 0, sbx: false}]
       iex> Services.decode_refs(~s([{"name":"browser","placement":"separate","grace":0}]))
+      [%{name: "browser", placement: :separate, grace: 0, sbx: true}]
+      iex> Services.decode_refs(~s([{"name":"browser","placement":"separate","grace":0,"sbx":"yes"}]))
       [%{name: "browser", placement: :separate, grace: 0, sbx: true}]
       iex> Services.decode_refs("not json")
       []
@@ -547,12 +550,11 @@ defmodule CrowdControl.Backend.Kubernetes.Services do
 
   defp decode_ref(%{"name" => name, "placement" => placement} = ref) when is_binary(name) do
     grace = Map.get(ref, "grace", 0)
-    sbx = Map.get(ref, "sbx", true)
+    sbx = Map.get(ref, "sbx") != false
 
     with true <- Regex.match?(@dns_label, name),
          {:ok, placement} <- decode_placement(placement),
-         true <- is_integer(grace) and grace >= 0,
-         true <- is_boolean(sbx) do
+         true <- is_integer(grace) and grace >= 0 do
       [%{name: name, placement: placement, grace: grace, sbx: sbx}]
     else
       _ -> []
