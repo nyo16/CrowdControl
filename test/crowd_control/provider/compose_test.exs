@@ -327,6 +327,36 @@ defmodule CrowdControl.Provider.ComposeTest do
     end
   end
 
+  describe "images (blocker: a root sidecar nobody declared, or an image that isn't there)" do
+    test "a sidecar whose image defaults to root is refused, and nothing is created", context do
+      # alpine/socat sets no USER, so with no `user:` it would run as root.
+      sidecar = %{
+        name: "sidecar",
+        image: @forwarder_image,
+        egress: :none,
+        entrypoint: ["socat"],
+        command: ["TCP-LISTEN:8080,fork,reuseaddr", "SYSTEM:echo ok"]
+      }
+
+      opts = with_sidecar(context.opts, sidecar)
+
+      assert {:error, {:compose, {:weakening_not_declared, {"sidecar", :user}}}} =
+               Compose.acquire(opts)
+
+      assert leftovers(opts, context.session) == {[], [], []}
+    end
+
+    test "a missing image is image_not_found, and nothing is created", context do
+      sidecar = %{name: "sidecar", image: "cc-missing/none:0", egress: :none, user: "65534"}
+      opts = with_sidecar(context.opts, sidecar)
+
+      assert {:error, {:compose, {:image_not_found, {"sidecar", "cc-missing/none:0"}}}} =
+               Compose.acquire(opts)
+
+      assert leftovers(opts, context.session) == {[], [], []}
+    end
+  end
+
   # --- Helpers ---
 
   defp base_opts(owner, session) do
@@ -367,6 +397,28 @@ defmodule CrowdControl.Provider.ComposeTest do
         }
       ]
     ]
+  end
+
+  defp with_sidecar(opts, sidecar) do
+    Keyword.update!(opts, :services, fn services ->
+      Enum.map(services, &if(&1.name == "sidecar", do: sidecar, else: &1))
+    end)
+  end
+
+  # Everything the daemon holds for this session, by the label every stack
+  # resource carries.
+  defp leftovers(config, session) do
+    filters = JSON.encode!(%{"label" => ["crowd_control.session=#{session}"]})
+
+    {:ok, containers} =
+      API.request(config, :get, "/containers/json", params: [all: true, filters: filters])
+
+    {:ok, networks} = API.request(config, :get, "/networks", params: [filters: filters])
+
+    {:ok, %{"Volumes" => volumes}} =
+      API.request(config, :get, "/volumes", params: [filters: filters])
+
+    {containers, networks, volumes || []}
   end
 
   defp container(handle, service) do

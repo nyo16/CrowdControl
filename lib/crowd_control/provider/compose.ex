@@ -83,9 +83,10 @@ defmodule CrowdControl.Provider.Compose do
 
   Agent, exactly as `CrowdControl.Provider.Docker` takes them: `:image`,
   `:agent_port`, `:capture_path`, `:ready_timeout`, `:req_adapter`,
-  `:docker_host`, `:timeout`. `:agent_port` must be at least 1024: the
-  forwarder listens on it as `nobody`, which cannot bind a privileged port, so
-  a lower one is `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`.
+  `:docker_host`, `:timeout`. `:agent_port` is an integer in `1..65_535`;
+  anything else is `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`.
+  `:image` and `:forwarder_image` must be image references (see
+  "Posture is never inferred"), as every service's `image:` must.
 
   Hardening (`:cpus`, `:memory`, `:cap_drop`, `:security_opt`, `:pids_limit`,
   `:user`, `:readonly_rootfs`, `:tmpfs`, `:shm_size`, `:init`) comes from
@@ -100,9 +101,9 @@ defmodule CrowdControl.Provider.Compose do
   neither weakens anything. A key that *weakens* the hardened default —
   `:cap_add`, `no_new_privileges: false`, `readonly_rootfs: false`, a root
   `user:` (or, on a sidecar with no `user:`, an image whose default user is
-  root — see "Posture is never inferred"), a `host_path` mount on a sidecar
-  (`:host_path`), or a `tmpfs` without `noexec,nosuid` (`:tmpfs_exec`) — must
-  also be named in the
+  not a numeric non-zero uid — see "Posture is never inferred"), a
+  `host_path` mount on a sidecar (`:host_path`), or a `tmpfs` without
+  `noexec,nosuid` (`:tmpfs_exec`) — must also be named in the
   service's `weaken: [...]` list (see `CrowdControl.Service`), or
   `acquire/1` refuses with
   `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`. `privileged`
@@ -213,19 +214,29 @@ defmodule CrowdControl.Provider.Compose do
       bridge and full internet. It is the one option here that throws away the
       module's reason to exist, so it exists only as an explicit, typed-out
       act.
+    * Every image is a reference in the distribution/reference grammar
+      (`[domain[:port]/]path[:tag][@digest]`, or a bare `sha256:<64 hex>`
+      Id); anything else is `{:error, {:compose, {:bad_service, {name,
+      :image}}}}`, naming the service, the sandbox or the forwarder.
+    * Every distinct image — the sandbox's, the forwarder's and each
+      sidecar's — is inspected once (`GET /images/{image}/json`, read-only,
+      after every other option check and before anything is created). The
+      providers never pull, so an image the daemon does not have is
+      `{:error, {:compose, {:image_not_found, {name, image}}}}`, naming the
+      first service that uses it, rather than a create failure after the
+      networks exist.
     * A sidecar with no `user:` runs as its image's default user, so that
-      default is part of its posture. `acquire/1` reads it
-      (`GET /images/{image}/json`, read-only, after every other option check
-      and before anything is created), and a root default — `""` (no `USER`),
-      `root`, or uid 0, as `CrowdControl.Service.root_user?/1` reads it — is
-      refused with `{:error, {:compose, {:weakening_not_declared, {name,
-      :user}}}}` unless the service sets a non-root `user:` or names `:user`
-      in `weaken:`, exactly as Kubernetes refuses it through `runAsNonRoot`.
-      The providers never pull, so an image the daemon does not have is
-      `{:error, {:compose, {:image_not_found, {name, image}}}}` here rather
-      than a create failure after the networks exist. The sandbox is exempt,
-      as on Kubernetes, where its `runAsNonRoot` is opt-in (`:run_as_user`);
-      the forwarder always runs as `nobody`.
+      default is part of its posture. Unless the service names `:user` in
+      `weaken:`, the default passes only when it is a numeric, non-zero uid
+      (`"1000"`, `"1000:1000"`); anything else — `""` (no `USER`), a name
+      such as `node`, or a spelling Docker still runs as uid 0 (`"00"`,
+      `"+0"`, `":1000"`) — is refused with `{:error, {:compose,
+      {:weakening_not_declared, {name, :user}}}}`. That is Kubernetes'
+      `runAsNonRoot` rule, which refuses a non-numeric user too. Such a sidecar
+      is then created from the inspected image Id rather than its name, so the
+      image whose user was checked is the image that runs. The sandbox is
+      exempt, as on Kubernetes, where its `runAsNonRoot` is opt-in
+      (`:run_as_user`); the forwarder always runs as `nobody`.
 
   ## Egress proxy
 
@@ -306,8 +317,9 @@ defmodule CrowdControl.Provider.Compose do
   @default_forwarder_service "forwarder"
   @default_proxy_port 8080
 
-  # `nobody`: the forwarder holds nothing and needs no privilege. That is also
-  # why `:agent_port` must be unprivileged — see `validate_agent_port/1`.
+  # `nobody`: the forwarder holds nothing and needs no privilege. It can still
+  # listen on any `:agent_port`: Docker sets `net.ipv4.ip_unprivileged_port_start`
+  # to 0 in each container's network namespace.
   @forwarder_user "65534:65534"
 
   # Pinned, and only the *command* is load-bearing: any image with socat on
@@ -387,7 +399,7 @@ defmodule CrowdControl.Provider.Compose do
     # Every gate runs before a single byte reaches the daemon, k8s-style. A
     # stack is N resources, and discovering an invalid service spec after four
     # of them exist means rolling back four resources to report a typo. The
-    # image-user and version gates come last: they are the only gates that make
+    # image and version gates come last: they are the only gates that make
     # requests, and both are read-only.
     with :ok <- ensure_req!(),
          :ok <- validate_session_token(opts),
@@ -405,7 +417,7 @@ defmodule CrowdControl.Provider.Compose do
          :ok <- validate_ready(opts, services),
          :ok <- validate_proxy(opts, services),
          {:ok, ordered} <- order_services(services),
-         :ok <- validate_image_users(opts, services),
+         {:ok, image_ids} <- validate_images(opts, services),
          :ok <- ensure_versions(opts, services, networks) do
       warn_placement(services)
 
@@ -427,21 +439,29 @@ defmodule CrowdControl.Provider.Compose do
         config: opts
       }
 
-      start_stack(handle, ordered, network, volumes, networks, credentials(opts, services))
+      start_stack(
+        handle,
+        ordered,
+        network,
+        volumes,
+        networks,
+        credentials(opts, services),
+        image_ids
+      )
     end
   end
 
   # Every resource name is derived from the project *before* any HTTP happens,
   # so `handle` is already complete when the first call is made and rollback can
   # never be looking at a half-populated struct. Only container ids accumulate,
-  # and `launch/3` is shaped around that.
-  defp start_stack(handle, services, network, volumes, networks, creds) do
+  # and `launch/4` is shaped around that.
+  defp start_stack(handle, services, network, volumes, networks, creds, image_ids) do
     with {:ok, _} <- create_sandbox_network(handle, network),
          {:ok, _} <- create_publish_network(handle),
          :ok <- create_egress_network(handle, services),
          :ok <- create_service_networks(handle, networks),
          :ok <- create_volumes(handle, volumes) do
-      launch(handle, services, creds)
+      launch(handle, services, creds, image_ids)
     else
       # An `else` is safe here only because nothing above it rebinds `handle` —
       # see the comment on `bring_up/3`.
@@ -449,15 +469,15 @@ defmodule CrowdControl.Provider.Compose do
     end
   end
 
-  defp launch(handle, services, creds) do
-    case Enum.reduce_while(services, {:ok, handle}, &launch_one(&1, &2, creds)) do
+  defp launch(handle, services, creds, image_ids) do
+    case Enum.reduce_while(services, {:ok, handle}, &launch_one(&1, &2, creds, image_ids)) do
       {:ok, handle} -> finish(handle)
       {:error, handle, reason} -> rollback(handle, reason)
     end
   end
 
-  defp launch_one(service, {:ok, handle}, creds) do
-    case create_container(handle, service, creds) do
+  defp launch_one(service, {:ok, handle}, creds, image_ids) do
+    case create_container(handle, service, creds, image_ids) do
       {:ok, id} -> bring_up(add_container(handle, service.name, id), service, id)
       {:error, reason} -> {:halt, {:error, handle, reason}}
     end
@@ -630,12 +650,12 @@ defmodule CrowdControl.Provider.Compose do
 
   # --- containers ---
 
-  defp create_container(handle, service, creds) do
+  defp create_container(handle, service, creds, image_ids) do
     name = container_name(handle, service)
 
     case API.request(handle.config, :post, "/containers/create",
            params: [name: name],
-           json: container_body(handle, service, creds)
+           json: container_body(handle, service, creds, image_ids)
          ) do
       {:ok, %{"Id" => id}} ->
         {:ok, id}
@@ -655,9 +675,11 @@ defmodule CrowdControl.Provider.Compose do
     end
   end
 
-  defp container_body(handle, service, creds) do
+  # A sidecar whose image default user was checked is created from that image's
+  # Id (see `validate_images/2`); every other container from its name.
+  defp container_body(handle, service, creds, image_ids) do
     %{
-      "Image" => service.image,
+      "Image" => Map.get(image_ids, service.name, service.image),
       "Labels" => container_labels(handle, service),
       "Env" => env(handle, service, creds),
       "HostConfig" => host_config(handle, service),
@@ -1383,9 +1405,12 @@ defmodule CrowdControl.Provider.Compose do
     with {:ok, specs} <- fetch_list(opts, :services),
          :ok <- validate_names(specs, sandbox, forwarder),
          {:ok, declared} <- normalize_specs(specs, sandbox),
-         {:ok, sandbox_spec} <- build_sandbox(opts, declared, sandbox) do
+         {:ok, sandbox_spec} <- build_sandbox(opts, declared, sandbox),
+         {:ok, forwarder_image} <-
+           checked_image(opts[:forwarder_image] || @default_forwarder_image, forwarder) do
       sidecars = Enum.reject(declared, &(&1.name == sandbox))
-      {:ok, [sandbox_spec | sidecars] ++ [build_forwarder(opts, sandbox, forwarder)]}
+      forwarder_spec = build_forwarder(opts, sandbox, forwarder, forwarder_image)
+      {:ok, [sandbox_spec | sidecars] ++ [forwarder_spec]}
     end
   end
 
@@ -1397,7 +1422,7 @@ defmodule CrowdControl.Provider.Compose do
         {:error, {:compose, {:duplicate_service, sandbox}}}
 
       # The forwarder is always synthesised, so a declared service of that name
-      # is a collision rather than an override — see `build_forwarder/3`.
+      # is a collision rather than an override — see `build_forwarder/4`.
       forwarder in names ->
         {:error, {:compose, {:duplicate_service, forwarder}}}
 
@@ -1445,23 +1470,31 @@ defmodule CrowdControl.Provider.Compose do
   defp build_sandbox(opts, declared, sandbox) do
     case Enum.find(declared, &(&1.name == sandbox)) do
       nil ->
-        with {:ok, image} <- fetch_image(opts) do
+        with {:ok, image} <- fetch_image(opts, sandbox) do
           {:ok, %Service{name: sandbox, image: image, role: :sandbox, user: opts[:user]}}
         end
 
       %{image: nil} = spec ->
-        with {:ok, image} <- fetch_image(opts), do: {:ok, %{spec | image: image}}
+        with {:ok, image} <- fetch_image(opts, sandbox), do: {:ok, %{spec | image: image}}
 
       spec ->
         {:ok, spec}
     end
   end
 
-  defp fetch_image(opts) do
+  defp fetch_image(opts, sandbox) do
     case opts[:image] do
-      image when is_binary(image) and image != "" -> {:ok, image}
+      image when is_binary(image) and image != "" -> checked_image(image, sandbox)
       _ -> {:error, {:compose, :image_required}}
     end
+  end
+
+  # The same reference rule a service's `image:` meets in `Service.normalize/2`,
+  # for the two images that come from top-level options instead.
+  defp checked_image(image, name) do
+    if Service.image_reference?(image),
+      do: {:ok, image},
+      else: {:error, {:compose, {:bad_service, {name, :image}}}}
   end
 
   # Always synthesised, image aside. A caller-supplied forwarder command is
@@ -1474,12 +1507,12 @@ defmodule CrowdControl.Provider.Compose do
   # The sandbox is addressed by alias, never by IP: IPs are reassigned on every
   # start, and the alias is what Docker's embedded DNS resolves on the internal
   # network.
-  defp build_forwarder(opts, sandbox, forwarder) do
+  defp build_forwarder(opts, sandbox, forwarder, image) do
     port = opts[:agent_port] || @default_agent_port
 
     %Service{
       name: forwarder,
-      image: opts[:forwarder_image] || @default_forwarder_image,
+      image: image,
       role: :forwarder,
       user: @forwarder_user,
       entrypoint: ["socat"],
@@ -1488,12 +1521,13 @@ defmodule CrowdControl.Provider.Compose do
     }
   end
 
-  # The forwarder listens on `:agent_port` as `nobody`, and a non-root process
-  # cannot bind below 1024. Refused here rather than discovered as a forwarder
+  # Any TCP port: the forwarder runs as `nobody`, but Docker lets an
+  # unprivileged process bind below 1024 (see `@forwarder_user`). A non-integer
+  # or out-of-range port is refused here rather than discovered as a forwarder
   # that never comes up.
   defp validate_agent_port(opts) do
     case opts[:agent_port] || @default_agent_port do
-      port when is_integer(port) and port in 1024..65_535 ->
+      port when is_integer(port) and port in 1..65_535 ->
         :ok
 
       port ->
@@ -1768,32 +1802,77 @@ defmodule CrowdControl.Provider.Compose do
     end
   end
 
-  # A sidecar with no `user:` runs as its image's default user, so on Compose
-  # (unlike Kubernetes, where `runAsNonRoot` makes the kubelet check) that
-  # default is read here and held to the same `weaken: [:user]` rule as an
-  # explicit root `user:`. The sandbox is exempt, as on Kubernetes; the
-  # forwarder has an explicit user. Sequential: a stack has a handful of
-  # services, and each inspect is one local round trip.
-  defp validate_image_users(opts, services) do
-    services
-    |> Enum.filter(&(&1.role == :sidecar and &1.user == nil and :user not in &1.weaken))
-    |> each_ok(&validate_image_user(opts, &1))
+  # Every distinct image is inspected before anything is created: the providers
+  # never pull, so a missing one would otherwise fail its create after the
+  # networks, volumes and earlier containers exist. Sequential and in service
+  # order, one inspect per image, so a missing image is reported against the
+  # first service that uses it. Each inspect is one local round trip.
+  #
+  # The same inspect gives a sidecar with no `user:` its posture: it runs as
+  # its image's default user, so on Compose (unlike Kubernetes, where
+  # `runAsNonRoot` makes the kubelet check) that default is held here to the
+  # `weaken: [:user]` rule. Those sidecars are created from the inspected Id,
+  # returned as `%{name => id}`, so a tag re-pointed between this check and
+  # the create can't swap in an image nobody checked. The sandbox is exempt, as
+  # on Kubernetes; the forwarder has an explicit user.
+  defp validate_images(opts, services) do
+    result =
+      Enum.reduce_while(services, {%{}, %{}}, fn service, {inspected, ids} ->
+        with {:ok, image} <- inspect_image(opts, service, inspected),
+             :ok <- check_image_user(service, image) do
+          {:cont, {Map.put(inspected, service.image, image), put_image_id(ids, service, image)}}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+
+    case result do
+      {:error, _reason} = error -> error
+      {_inspected, ids} -> {:ok, ids}
+    end
   end
 
-  defp validate_image_user(opts, %Service{name: name, image: image}) do
-    case API.image_user(opts, image) do
-      {:ok, user} ->
-        if user == "" or Service.root_user?(user),
-          do: {:error, {:compose, {:weakening_not_declared, {name, :user}}}},
-          else: :ok
+  defp inspect_image(_opts, %Service{image: image}, inspected)
+       when is_map_key(inspected, image),
+       do: {:ok, Map.fetch!(inspected, image)}
 
-      # The providers never pull, so the create would fail the same way —
-      # after the networks and volumes already exist.
+  defp inspect_image(opts, %Service{name: name, image: image}, _inspected) do
+    case API.image_inspect(opts, image) do
+      {:ok, inspected} ->
+        {:ok, inspected}
+
       {:error, {:docker, {:not_found, _}}} ->
         {:error, {:compose, {:image_not_found, {name, image}}}}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp checked_user?(%Service{role: :sidecar, user: nil, weaken: weaken}), do: :user not in weaken
+  defp checked_user?(%Service{}), do: false
+
+  defp check_image_user(service, %{user: user}) do
+    if checked_user?(service) and not numeric_non_root?(user),
+      do: {:error, {:compose, {:weakening_not_declared, {service.name, :user}}}},
+      else: :ok
+  end
+
+  defp put_image_id(ids, service, %{id: id}) do
+    if checked_user?(service), do: Map.put(ids, service.name, id), else: ids
+  end
+
+  # Deliberately narrower than `Service.root_user?/1`, whose contract is a
+  # `user:` that already passed `Service.normalize/2`. An image's `Config.User`
+  # is raw: Docker resolves a name against the image's own `/etc/passwd`, so
+  # `node` or `nginx` proves nothing from out here, and it runs `"+0"`, `"-0"`
+  # and `":1000"` as uid 0. Kubernetes' `runAsNonRoot` refuses any non-numeric
+  # user for the same reason. So only `uid` or `uid:gid`, all digits, with a
+  # uid that is numerically non-zero (`"00"` is root), passes.
+  defp numeric_non_root?(user) do
+    case Regex.run(~r/\A(\d+)(?::\d+)?\z/, user, capture: :all_but_first) do
+      [uid] -> String.to_integer(uid) != 0
+      nil -> false
     end
   end
 

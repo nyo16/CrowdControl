@@ -138,6 +138,33 @@ defmodule CrowdControl.ServiceTest do
       end
     end
 
+    test "an image is a distribution reference, so nothing else reaches a request path" do
+      digest = "sha256:" <> String.duplicate("a", 64)
+
+      for image <- [
+            "pg:16",
+            "registry.test:5000/team/img:1.2",
+            "ghcr.io/a/b@" <> digest,
+            "name:tag@" <> digest,
+            digest,
+            "localhost/x",
+            String.duplicate("a", 255)
+          ] do
+        assert {:ok, %Service{image: ^image}} =
+                 Service.normalize(sidecar(image: image), :sidecar)
+      end
+
+      for image <- ["a?b", "a#b", "a b", "../x", "A/B", "pg:16\n", String.duplicate("a", 256)] do
+        assert {:error, {:bad_service, {"b", :image}}} =
+                 Service.normalize(sidecar(image: image), :sidecar)
+
+        assert {:error, {:bad_service, {"sandbox", :image}}} =
+                 Service.normalize(%{name: "sandbox", image: image}, :sandbox)
+      end
+
+      refute Service.image_reference?("")
+    end
+
     test "the legacy :port leads :ports" do
       assert {:ok, %Service{ports: [3128, 9000]}} =
                Service.normalize(sidecar(port: 3128, ports: [9000, 3128]), :sidecar)

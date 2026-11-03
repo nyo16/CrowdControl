@@ -130,27 +130,35 @@ defmodule CrowdControl.Backend.Docker.API do
   end
 
   @doc """
-  The default user an image runs as (`GET /images/{name}/json`, `Config.User`).
+  An image's Id and default user (`GET /images/{name}/json`: `Id`,
+  `Config.User`).
 
-  `""` — Docker's answer for an image that sets no `USER` — means root. An
-  image the daemon does not have is `{:error, {:docker, {:not_found, _}}}`.
+  `user: ""` — Docker's answer for an image that sets no `USER` — means root.
+  An image the daemon does not have is `{:error, {:docker, {:not_found, _}}}`.
 
   The name goes into the path unencoded: the Engine API routes
   `repo/name:tag`, `name@sha256:…` and `repo/name:tag@sha256:…` as raw path
-  segments (checked against a live daemon).
+  segments (checked against a live daemon). Callers pass a reference that
+  `CrowdControl.Service.image_reference?/1` accepted, so no `?`, `#` or `..`
+  can reach the path.
   """
-  @spec image_user(config(), String.t()) :: {:ok, String.t()} | {:error, term()}
-  def image_user(config, image) when is_binary(image) do
-    with {:ok, body} <- request(config, :get, "/images/#{image}/json") do
+  @spec image_inspect(config(), String.t()) ::
+          {:ok, %{id: String.t(), user: String.t()}} | {:error, term()}
+  def image_inspect(config, image) when is_binary(image) do
+    path = "/images/#{image}/json"
+
+    with {:ok, body} <- request(config, :get, path) do
       case body do
-        %{"Config" => %{"User" => user}} when is_binary(user) -> {:ok, user}
-        # No `Config`, or a null `User`: Docker sets neither for an image built
-        # without a `USER`, so this is the same root default as `""`.
-        %{} -> {:ok, ""}
-        _other -> {:error, {:docker, {:unexpected_body, "/images/#{image}/json"}}}
+        %{"Id" => id} when is_binary(id) -> {:ok, %{id: id, user: default_user(body)}}
+        _other -> {:error, {:docker, {:unexpected_body, path}}}
       end
     end
   end
+
+  # No `Config`, or a null `User`: Docker sets neither for an image built
+  # without a `USER`, so this is the same root default as `""`.
+  defp default_user(%{"Config" => %{"User" => user}}) when is_binary(user), do: user
+  defp default_user(_body), do: ""
 
   @doc false
   # Public so the table of real-world version strings is assertable without a

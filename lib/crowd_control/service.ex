@@ -77,6 +77,8 @@ defmodule CrowdControl.Service do
   alias CrowdControl.Volume
 
   @max_files_bytes 1_048_576
+  # Upstream's NameTotalLengthMax: the domain and path, tag and digest excluded.
+  @max_image_name 255
   @default_file_mode 0o644
   @default_shutdown_limit 20
 
@@ -294,6 +296,52 @@ defmodule CrowdControl.Service do
   @spec max_files_bytes() :: pos_integer()
   def max_files_bytes, do: @max_files_bytes
 
+  @doc false
+  # Public so Compose holds its top-level `:image` and `:forwarder_image` to the
+  # same rule as a service's `image:`.
+  #
+  # The distribution/reference grammar, transcribed from upstream's regexp.go
+  # (https://github.com/distribution/reference/blob/main/regexp.go):
+  # `[domain[:port]/]path(/path)*[:tag][@digest]`, lowercase path components, a
+  # name of at most 255 characters. A bare image ID (`sha256:<64 hex>`) is also
+  # a reference the Engine accepts. Anything else is refused before it reaches a
+  # request path, where `?`, `#` or `..` would change which endpoint is asked.
+  @spec image_reference?(term()) :: boolean()
+  def image_reference?(image) when is_binary(image) do
+    image =~ ~r/\Asha256:[a-f0-9]{64}\z/ or
+      case Regex.run(image_reference_regex(), image, capture: ["name"]) do
+        [name] -> byte_size(name) <= @max_image_name
+        nil -> false
+      end
+  end
+
+  def image_reference?(_image), do: false
+
+  # `x` mode: whitespace is layout only. Each line is one production of the
+  # upstream grammar, in its order: domain and port, path components, tag,
+  # digest.
+  defp image_reference_regex do
+    ~r/
+      \A
+      (?<name>
+        (?:
+          (?:
+            (?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])
+            (?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*
+            | \[[a-fA-F0-9:]+\]
+          )
+          (?::[0-9]+)?
+          \/
+        )?
+        [a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*
+        (?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*
+      )
+      (?::[\w][\w.-]{0,127})?
+      (?:@[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,})?
+      \z
+    /x
+  end
+
   # --- fields ---
 
   # A service name is a DNS alias on the sandbox network (Compose) and part of
@@ -318,10 +366,17 @@ defmodule CrowdControl.Service do
   # there is nothing to run and no image to name.
   defp fetch_image(spec, name, role) do
     case {Map.get(spec, :image), role} do
-      {image, _role} when is_binary(image) and image != "" -> {:ok, image}
-      {_missing, :sandbox} -> {:ok, nil}
-      {nil, _role} -> if external?(spec), do: {:ok, nil}, else: {:error, {:image_required, name}}
-      {_missing, _role} -> {:error, {:image_required, name}}
+      {image, _role} when is_binary(image) and image != "" ->
+        if image_reference?(image), do: {:ok, image}, else: bad(name, :image)
+
+      {_missing, :sandbox} ->
+        {:ok, nil}
+
+      {nil, _role} ->
+        if external?(spec), do: {:ok, nil}, else: {:error, {:image_required, name}}
+
+      {_missing, _role} ->
+        {:error, {:image_required, name}}
     end
   end
 

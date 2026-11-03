@@ -1133,73 +1133,106 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
     end
   end
 
-  describe "image default user (blocker: a root sidecar nobody declared)" do
-    test "a sidecar whose image defaults to root is refused before any create" do
+  describe "images (blocker: a root sidecar nobody declared, or an image that isn't there)" do
+    test "a sidecar image default user is refused unless it is a numeric non-zero uid" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
-      routes = %{{:get, "/images/proxy:1/json"} => {200, %{"Config" => %{"User" => ""}}}}
 
-      assert {{:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}}, requests} =
-               acquire(services: specs, routes: routes)
+      for user <- ["", "0", "00", "0:0", "0:1000", "+0", "-0", ":1000", "1000:", "root", "nginx"] do
+        routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", user)}}
 
-      assert Enum.map(requests, &{&1.method, &1.path}) == [{:get, "/images/proxy:1/json"}]
+        assert {{:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}}, requests} =
+                 acquire(services: specs, routes: routes),
+               "user #{inspect(user)}"
+
+        refute Enum.any?(requests, &(&1.method == :post))
+      end
     end
 
-    test "uid 0 with a group is root too" do
+    test "a numeric non-zero uid is accepted and left to the image" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
-      routes = %{{:get, "/images/proxy:1/json"} => {200, %{"Config" => %{"User" => "0:0"}}}}
 
-      assert {{:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}}, requests} =
+      for user <- ["1000", "1000:1000"] do
+        routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", user)}}
+
+        assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
+        refute Map.has_key?(container_body(requests, "proxy"), "User")
+      end
+    end
+
+    test "a null User or a missing Config is the root default" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
+      id = image_id("proxy:1")
+
+      for body <- [%{"Id" => id, "Config" => %{"User" => nil}}, %{"Id" => id}] do
+        routes = %{{:get, "/images/proxy:1/json"} => {200, body}}
+
+        assert {{:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}}, requests} =
+                 acquire(services: specs, routes: routes)
+
+        refute Enum.any?(requests, &(&1.method == :post))
+      end
+    end
+
+    test "an inspect answer with no Id is an error, with no create" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
+      routes = %{{:get, "/images/proxy:1/json"} => {200, %{}}}
+
+      assert {{:error, {:docker, {:unexpected_body, "/images/proxy:1/json"}}}, requests} =
                acquire(services: specs, routes: routes)
 
       refute Enum.any?(requests, &(&1.method == :post))
     end
 
-    test "weaken: [:user] accepts the root default, and nothing is inspected" do
+    test "weaken: [:user] accepts the root default; the image is still checked for existence" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :none, weaken: [:user]}]
-      routes = %{{:get, "/images/proxy:1/json"} => {200, %{"Config" => %{"User" => ""}}}}
+      routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", "")}}
 
       assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
-      refute find(requests, :get, "/images/proxy:1/json")
+      assert find(requests, :get, "/images/proxy:1/json")
       refute Map.has_key?(container_body(requests, "proxy"), "User")
     end
 
-    test "a non-root image default is accepted and left to the image" do
-      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
-      routes = %{{:get, "/images/proxy:1/json"} => {200, %{"Config" => %{"User" => "1000"}}}}
-
-      assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
-
-      assert index(requests, :get, "/images/proxy:1/json") <
-               index(requests, :post, "/networks/create")
-
-      refute Map.has_key?(container_body(requests, "proxy"), "User")
-    end
-
-    test "an explicit user: on the spec makes no inspect request" do
-      specs = [%{name: "proxy", image: "proxy:1", egress: :none, user: "1000:1000"}]
+    test "every distinct image is inspected once, in service order, before anything else" do
+      specs = [
+        %{name: "proxy", image: "registry.test:5000/team/proxy:1", egress: :none},
+        %{name: "db", image: "shared:1", egress: :none},
+        %{name: "cache", image: "shared:1", egress: :none, user: "1000:1000"}
+      ]
 
       {_handle, _endpoint, requests} = acquire!(services: specs)
 
-      refute Enum.any?(requests, &String.starts_with?(&1.path, "/images/"))
+      assert for(r <- requests, String.starts_with?(r.path, "/images/"), do: r.path) == [
+               "/images/sandbox:dev/json",
+               "/images/registry.test:5000/team/proxy:1/json",
+               "/images/shared:1/json",
+               "/images/alpine/socat:1.8.1.3/json"
+             ]
+
+      first_other = Enum.find_index(requests, &(not String.starts_with?(&1.path, "/images/")))
+      assert first_other == 4
     end
 
-    test "only sidecars are inspected: never the sandbox, never the forwarder" do
-      specs = [%{name: "proxy", image: "registry.test/team/proxy:1", egress: :none}]
+    test "a missing sandbox, forwarder or sidecar image is image_not_found, with no create" do
+      missing = {404, %{"message" => "No such image"}}
 
-      {_handle, _endpoint, requests} = acquire!(services: specs)
+      sidecars = [
+        %{name: "db", image: "shared:1", egress: :none},
+        %{name: "cache", image: "shared:1", egress: :none}
+      ]
 
-      assert for(r <- requests, String.starts_with?(r.path, "/images/"), do: r.path) ==
-               ["/images/registry.test/team/proxy:1/json"]
-    end
+      for {image, opts, name} <- [
+            {"sandbox:dev", [], "sandbox"},
+            {"alpine/socat:1.8.1.3", [], "forwarder"},
+            {"fwd:1", [forwarder_image: "fwd:1", forwarder_service: "fwd"], "fwd"},
+            {"shared:1", [services: sidecars], "db"}
+          ] do
+        routes = %{{:get, "/images/#{image}/json"} => missing}
 
-    test "an image the daemon does not have is image_not_found, with no create" do
-      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
-      routes = %{{:get, "/images/proxy:1/json"} => {404, %{"message" => "No such image"}}}
+        assert {{:error, {:compose, {:image_not_found, {^name, ^image}}}}, requests} =
+                 acquire([routes: routes] ++ opts)
 
-      assert {{:error, {:compose, {:image_not_found, {"proxy", "proxy:1"}}}}, requests} =
-               acquire(services: specs, routes: routes)
-
-      refute Enum.any?(requests, &(&1.method == :post))
+        refute Enum.any?(requests, &(&1.method == :post))
+      end
     end
 
     test "any other inspect failure is returned as-is, with no create" do
@@ -1212,17 +1245,52 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       refute Enum.any?(requests, &(&1.method == :post))
     end
 
+    test "a sidecar whose default user was checked is created from the inspected Id" do
+      specs = [
+        %{name: "proxy", image: "proxy:1", egress: :none},
+        %{name: "db", image: "db:1", egress: :none, user: "1000:1000"},
+        %{name: "cache", image: "cache:1", egress: :none, weaken: [:user]}
+      ]
+
+      {_handle, _endpoint, requests} = acquire!(services: specs)
+
+      assert container_body(requests, "proxy")["Image"] == image_id("proxy:1")
+      assert container_body(requests, "db")["Image"] == "db:1"
+      assert container_body(requests, "cache")["Image"] == "cache:1"
+      assert container_body(requests, "sandbox")["Image"] == "sandbox:dev"
+      assert container_body(requests, "forwarder")["Image"] == "alpine/socat:1.8.1.3"
+    end
+
+    test "an image that isn't a reference is refused before any HTTP" do
+      for image <- ["a?b", "a#b", "a b", "../x", "A/B"] do
+        assert {:error, {:compose, {:bad_service, {"db", :image}}}} =
+                 gate(services: [%{name: "db", image: image, egress: :none}])
+
+        assert {:error, {:compose, {:bad_service, {"sandbox", :image}}}} = gate(image: image)
+
+        assert {:error, {:compose, {:bad_service, {"forwarder", :image}}}} =
+                 gate(forwarder_image: image)
+      end
+
+      assert {:error, {:compose, {:bad_service, {"forwarder", :image}}}} =
+               gate(forwarder_image: "")
+    end
+
     test "the forwarder runs as nobody" do
       {_handle, _endpoint, requests} = acquire!([])
 
       assert container_body(requests, "forwarder")["User"] == "65534:65534"
     end
 
-    test "a privileged :agent_port is refused before any HTTP" do
-      assert {:error, {:compose, {:bad_agent_port, {"forwarder", 80}}}} = gate(agent_port: 80)
+    test "any TCP port is an :agent_port, privileged ones included" do
+      {_handle, _endpoint, requests} = acquire!(agent_port: 80)
 
-      assert {:error, {:compose, {:bad_agent_port, {"fwd", 1023}}}} =
-               gate(agent_port: 1023, forwarder_service: "fwd")
+      assert container_body(requests, "forwarder")["ExposedPorts"] == %{"80/tcp" => %{}}
+
+      for port <- [0, 65_536, "8080"] do
+        assert {:error, {:compose, {:bad_agent_port, {"fwd", ^port}}}} =
+                 gate(agent_port: port, forwarder_service: "fwd")
+      end
     end
   end
 
@@ -1253,10 +1321,9 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       assert {{:error, {:version, :docker, {25, 0, 4}, {25, 0, 5}}}, requests} =
                acquire(services: specs, docker_host: unique_host(), routes: routes)
 
-      assert Enum.map(requests, &{&1.method, &1.path}) == [
-               {:get, "/images/proxy:1/json"},
-               {:get, "/version"}
-             ]
+      assert [{:get, "/images/" <> _} | _] = Enum.map(requests, &{&1.method, &1.path})
+      assert List.last(requests).path == "/version"
+      refute Enum.any?(requests, &(&1.method == :post))
     end
 
     test "per-service networks are gated the same way" do
@@ -1947,10 +2014,19 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
   defp get_route("/containers/" <> rest, port), do: inspect_route(rest, port)
   defp get_route("/volumes", _port), do: {200, %{"Volumes" => []}}
   defp get_route("/networks", _port), do: {200, []}
-  defp get_route("/images/" <> _rest, _port), do: {200, %{"Config" => %{"User" => "1000"}}}
+
+  defp get_route("/images/" <> rest, _port),
+    do: {200, image_json(String.replace_suffix(rest, "/json", ""), "1000")}
+
   defp get_route("/version", _port), do: {200, %{"Version" => "27.3.1", "ApiVersion" => "1.47"}}
   defp get_route("/v1/health", _port), do: {200, %{"ok" => true}}
   defp get_route(path, _port), do: raise("unstubbed Docker API call: #{inspect({:get, path})}")
+
+  # A stable fake Id per image name, so a test can tell which image a create
+  # body names without stubbing the inspect.
+  defp image_id(image), do: "sha256:" <> Base.encode16(:crypto.hash(:sha256, image), case: :lower)
+
+  defp image_json(image, user), do: %{"Id" => image_id(image), "Config" => %{"User" => user}}
 
   defp post_route(path) do
     cond do
