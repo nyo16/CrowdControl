@@ -182,6 +182,9 @@ defmodule CrowdControl.Backend.Kubernetes do
       before a session's objects count as abandoned, default 60s; read both
       when provisioning (the `crowd_control.sweep_after_ms` stamp) and by
       `sweep_orphans/1`. Mainly for tests, which cannot wait out a minute
+    * `:destroy_margin_ms` — how long past a drained Pod's grace `destroy/1`
+      waits to see it gone before keeping its NetworkPolicy, default 10s.
+      Mainly for tests, which cannot wait out a Pod that never goes
     * `:pod_poll_ms` — reader's idle Pod-liveness poll, default 60s
     * `:max_inflight_bytes` — reader backpressure watermark, default 4 MiB
     * `:proxy_url`, `:session_token` — see the egress proxy contract in
@@ -271,9 +274,10 @@ defmodule CrowdControl.Backend.Kubernetes do
   sandbox Pod can reach — a drained sidecar may be shipping to it — so its
   Pod is deleted only once the sandbox Pod's wait is over; every other
   `:separate` Pod is deleted with the sandbox Pod, and the waits overlap.
-  `destroy/1` therefore blocks for up to the sandbox's wait plus the
-  longest wait of a drained service on `sbx`. A Pod whose DELETE fails
-  (anything but a 404) keeps its policy too, whatever its grace.
+  `destroy/1` therefore blocks for up to whichever is longest: the sandbox's
+  wait plus the longest wait of a drained service on `sbx`, or the wait of
+  any drained service off `sbx`. A Pod whose DELETE fails (anything but a
+  404) keeps its policy too, whatever its grace.
 
   A service's `env` goes in a per-session Secret, `cc-<key>-<name>-env`
   (`crowd_control.role=service-secret`), which its container reads by
@@ -340,6 +344,7 @@ defmodule CrowdControl.Backend.Kubernetes do
 
   # How long past a drained Pod's grace `destroy/1` waits to see it gone
   # before giving up on deleting its NetworkPolicy, and the GET backoff.
+  # `:destroy_margin_ms` overrides the margin (mainly for tests).
   @destroy_margin_ms 10_000
   @gone_poll_first_ms 100
   @gone_poll_max_ms 1_000
@@ -1994,10 +1999,10 @@ defmodule CrowdControl.Backend.Kubernetes do
     grace = Services.sandbox_grace(refs)
     started = System.monotonic_time(:millisecond)
     state = start_pod_delete(config, name, grace)
-    unreached = start_pod_deletes(config, unreached, started)
-    running? = still_running?(config, name, state, gone_deadline(started, grace))
+    unreached = start_pod_deletes(config, unreached)
+    running? = still_running?(config, name, state, gone_deadline(config, started, grace))
 
-    reached = start_pod_deletes(config, reached, System.monotonic_time(:millisecond))
+    reached = start_pod_deletes(config, reached)
 
     running =
       for {pod, pod_state, deadline} <- unreached ++ reached,
@@ -2016,9 +2021,11 @@ defmodule CrowdControl.Backend.Kubernetes do
   # A drained `:separate` Pod is held to the sandbox's rule: its own
   # NetworkPolicy (the same name) goes only once it is gone, so its deadline
   # starts at its own DELETE.
-  defp start_pod_deletes(config, pods, started) do
-    for {:pod, name, grace, _reach} <- pods,
-        do: {name, start_pod_delete(config, name, grace), gone_deadline(started, grace)}
+  defp start_pod_deletes(config, pods) do
+    for {:pod, name, grace, _reach} <- pods do
+      started = System.monotonic_time(:millisecond)
+      {name, start_pod_delete(config, name, grace), gone_deadline(config, started, grace)}
+    end
   end
 
   # `:gone` when the Pod no longer exists, or was deleted with no grace (the
@@ -2043,7 +2050,8 @@ defmodule CrowdControl.Backend.Kubernetes do
     end
   end
 
-  defp gone_deadline(started, grace), do: started + grace * 1_000 + @destroy_margin_ms
+  defp gone_deadline(config, started, grace),
+    do: started + grace * 1_000 + (config[:destroy_margin_ms] || @destroy_margin_ms)
 
   defp still_running?(_config, _name, :gone, _deadline), do: false
   defp still_running?(_config, _name, :running, _deadline), do: true
