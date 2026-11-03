@@ -1453,9 +1453,11 @@ defmodule CrowdControl.Session do
   # traps exits so a cancel (terminate_child) reaches the inner process too.
   #
   # The inner process is a bare spawn_link, so it inherits no `$callers`; it is
-  # given the task's own chain (which Task.Supervisor already started with the
-  # session), so Mox and Ecto sandbox allowances granted to the session, or to
-  # whoever started it, reach the user's callback.
+  # given the task's own chain instead, which Task.Supervisor started as
+  # `[session]`, so the callback sees `[task, session]`. Mox and Ecto sandbox
+  # allowances granted to the session reach the user's callback. Those granted
+  # to whoever started the session don't: a GenServer has no `$callers` of its
+  # own, so the chain stops at the session.
   defp run_callback(session, key, fun) do
     Process.flag(:trap_exit, true)
     session_ref = Process.monitor(session)

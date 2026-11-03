@@ -1271,8 +1271,7 @@ defmodule CrowdControl.SessionControlTest do
 
       push(ctl, can_use_tool_frame("callers"))
       assert_receive {:callers, "callers", callers}, 2_000
-      assert is_list(callers)
-      assert pid in callers
+      assert [_task, ^pid | _] = callers
 
       TestHelpers.stop_session(pid)
     end
