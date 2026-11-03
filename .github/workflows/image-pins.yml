@@ -8,6 +8,11 @@ name: Image pins
 # upstream, and drift that nobody's change caused must not fail every PR. It
 # runs weekly, on demand, and on PRs and pushes that touch a file that can
 # carry a pin.
+#
+# To fix a reported drift, pin the top-level digest that
+# `docker buildx imagetools inspect <tag>` prints (the index of a multi-platform
+# image), never a single-platform manifest's digest: that is the digest this
+# workflow compares against.
 on:
   schedule:
     - cron: "17 6 * * 1"
