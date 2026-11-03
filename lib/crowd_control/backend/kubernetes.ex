@@ -1994,10 +1994,10 @@ defmodule CrowdControl.Backend.Kubernetes do
     grace = Services.sandbox_grace(refs)
     started = System.monotonic_time(:millisecond)
     state = start_pod_delete(config, name, grace)
-    unreached = start_pod_deletes(config, unreached, started)
+    unreached = start_pod_deletes(config, unreached)
     running? = still_running?(config, name, state, gone_deadline(started, grace))
 
-    reached = start_pod_deletes(config, reached, System.monotonic_time(:millisecond))
+    reached = start_pod_deletes(config, reached)
 
     running =
       for {pod, pod_state, deadline} <- unreached ++ reached,
@@ -2016,9 +2016,11 @@ defmodule CrowdControl.Backend.Kubernetes do
   # A drained `:separate` Pod is held to the sandbox's rule: its own
   # NetworkPolicy (the same name) goes only once it is gone, so its deadline
   # starts at its own DELETE.
-  defp start_pod_deletes(config, pods, started) do
-    for {:pod, name, grace, _reach} <- pods,
-        do: {name, start_pod_delete(config, name, grace), gone_deadline(started, grace)}
+  defp start_pod_deletes(config, pods) do
+    for {:pod, name, grace, _reach} <- pods do
+      started = System.monotonic_time(:millisecond)
+      {name, start_pod_delete(config, name, grace), gone_deadline(started, grace)}
+    end
   end
 
   # `:gone` when the Pod no longer exists, or was deleted with no grace (the
