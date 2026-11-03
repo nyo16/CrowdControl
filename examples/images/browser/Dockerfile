@@ -13,9 +13,11 @@
 #       -t crowd_control/browser:dev examples/images/browser
 #
 # The base image is pinned by digest, and once a digest is present it alone
-# decides the image: the tag in front of it is not checked. Bumping
-# PLAYWRIGHT_VERSION therefore means replacing the digest below with the new
-# tag's (`docker buildx imagetools inspect mcr.microsoft.com/playwright:v<version>-noble`).
+# decides the image: the build does not check the tag in front of it.
+# .github/workflows/image-pins.yml does, and flags a digest that no longer
+# matches its tag. Bumping PLAYWRIGHT_VERSION therefore means replacing the
+# digest below with the new tag's top-level (index) digest, from
+# `docker buildx imagetools inspect mcr.microsoft.com/playwright:v<version>-noble`.
 # The --build-arg must equal the repository's PLAYWRIGHT_VERSION file; this
 # build context is examples/images/browser, so nothing here can read that file
 # and compare. The npm check further down is weaker than a version match: it

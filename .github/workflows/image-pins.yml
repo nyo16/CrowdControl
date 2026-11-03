@@ -1,0 +1,90 @@
+name: Image pins
+
+# Every image pinned by digest still resolves to that digest under its tag.
+# A pin that drifts is not wrong (the digest wins), but it is no longer what
+# its tag says, so a reader bumping one or reviewing a diff is misled.
+#
+# Its own workflow, not a CI job: tags like `golang:1.26` are re-pushed
+# upstream, and drift that nobody's change caused must not fail every PR. It
+# runs weekly, on demand, and on PRs and pushes that touch a file that can
+# carry a pin.
+#
+# To fix a reported drift, pin the top-level digest that
+# `docker buildx imagetools inspect <tag>` prints (the index of a multi-platform
+# image), never a single-platform manifest's digest: that is the digest this
+# workflow compares against.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: &pin_paths
+      - Dockerfile
+      - "examples/**"
+      - "lib/**"
+      - "test/**"
+      - PLAYWRIGHT_VERSION
+      - .github/workflows/image-pins.yml
+  pull_request:
+    branches: [master]
+    paths: *pin_paths
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # Two pin shapes need normalising before one regex matches them all: Elixir
+  # sources split a pin as `"repo:tag@" <> "sha256:…"`, and the browser
+  # example's FROM templates its tag with ${PLAYWRIGHT_VERSION}.
+  image_pins:
+    name: Image digest pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compare pinned digests with their tags
+        run: |
+          set -euo pipefail
+          # A registry that is briefly down is not drift: three tries, 2 s and
+          # 4 s apart, before the pin is reported as "(inspect failed)".
+          inspect() {
+            local delay
+            for delay in 2 4 0; do
+              if docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}' | tr -d '"'; then
+                return 0
+              fi
+              if [ "$delay" -gt 0 ]; then
+                sleep "$delay"
+              fi
+            done
+            return 1
+          }
+          # shellcheck disable=SC2016 # the perl program is single-quoted on purpose
+          pins=$(find Dockerfile examples lib test -type f -print0 \
+            | PW="$(cat PLAYWRIGHT_VERSION)" xargs -0 perl -0777 -ne '
+                s/@"\s*<>\s*"sha256:/\@sha256:/g;
+                s/\$\{PLAYWRIGHT_VERSION\}/$ENV{PW}/g;
+                print "$1\n" while m{([a-z0-9./_-]+:[A-Za-z0-9._-]+\@sha256:[a-f0-9]{64})}g' \
+            | sort -u)
+          if [ -z "$pins" ]; then
+            echo "::error::no digest pins found, so this job is not testing what it claims"
+            exit 1
+          fi
+          fail=0
+          for pin in $pins; do
+            ref=${pin%@*}
+            want=${pin#*@}
+            have=$(inspect "$ref") || have="(inspect failed)"
+            if [ "$have" = "$want" ]; then
+              echo "ok   $pin"
+            else
+              echo "::error::$ref resolves to $have, pinned $want"
+              fail=1
+            fi
+          done
+          exit "$fail"
