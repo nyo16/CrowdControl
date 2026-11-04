@@ -4,10 +4,11 @@ name: Image pins
 # A pin that drifts is not wrong (the digest wins), but it is no longer what
 # its tag says, so a reader bumping one or reviewing a diff is misled.
 #
-# Its own workflow, not a CI job: tags like `golang:1.26` are re-pushed
-# upstream, and drift that nobody's change caused must not fail every PR. It
-# runs weekly, on demand, and on PRs and pushes that touch a file that can
-# carry a pin.
+# Its own workflow, not a CI job, so upstream drift never fails CI's jobs or
+# gates `publish`: tags like `golang:1.26` are re-pushed upstream. It runs
+# weekly, on demand, and on PRs and pushes that touch a file that can carry a
+# pin, which is most PRs, because `lib/**` and `test/**` can carry pins. A red
+# run there is informational unless the PR touched a pin.
 #
 # To fix a reported drift, pin the top-level digest that
 # `docker buildx imagetools inspect <tag>` prints (the index of a multi-platform
@@ -55,7 +56,7 @@ jobs:
           inspect() {
             local delay
             for delay in 2 4 0; do
-              if docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}' | tr -d '"'; then
+              if timeout 30 docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}' | tr -d '"'; then
                 return 0
               fi
               if [ "$delay" -gt 0 ]; then
