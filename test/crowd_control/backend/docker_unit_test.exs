@@ -352,6 +352,31 @@ defmodule CrowdControl.Backend.DockerUnitTest do
     end
   end
 
+  describe "list_live/1 scope (blocker: a reaper that tears down sandboxd's containers)" do
+    test "a container labelled agent=sandboxd is not listed; the owner filter stays" do
+      {handle, agent} =
+        stub_daemon(%{},
+          containers: [
+            %{
+              "Id" => "mine",
+              "Image" => "img",
+              "Labels" => %{"crowd_control.owner" => "o1", "crowd_control.session" => "s1"}
+            },
+            %{
+              "Id" => "theirs",
+              "Image" => "img",
+              "Labels" => %{"crowd_control.owner" => "o1", "crowd_control.agent" => "sandboxd"}
+            }
+          ]
+        )
+
+      assert {:ok, [%Docker{container_id: "mine", session_key: "s1"}]} =
+               Docker.list_live(Keyword.put(handle.config, :owner, "o1"))
+
+      assert [{:list, %{"label" => ["crowd_control.owner=o1"]}}] = events(agent)
+    end
+  end
+
   describe "API.server_version/1 (blocker: a gate that cannot see the daemon's version)" do
     alias CrowdControl.Backend.Docker.API
 
@@ -480,7 +505,12 @@ defmodule CrowdControl.Backend.DockerUnitTest do
   # order. `inspects` maps an exec id to the answers its inspects get, in turn;
   # the last answer repeats. Exec ids are handed out as e1, e2, ...
   defp stub_daemon(inspects, config \\ []) do
-    {:ok, agent} = Agent.start_link(fn -> %{events: [], next: 1, inspects: inspects} end)
+    {containers, config} = Keyword.pop(config, :containers, [])
+
+    {:ok, agent} =
+      Agent.start_link(fn ->
+        %{events: [], next: 1, inspects: inspects, containers: containers}
+      end)
 
     adapter = fn req ->
       path = URI.parse(to_string(req.url)).path
@@ -495,6 +525,11 @@ defmodule CrowdControl.Backend.DockerUnitTest do
     }
 
     {handle, agent}
+  end
+
+  defp route(state, :get, "/containers/json", req) do
+    filters = URI.decode_query(URI.parse(to_string(req.url)).query || "")["filters"]
+    {{200, state.containers}, record(state, {:list, JSON.decode!(filters)})}
   end
 
   defp route(state, :post, "/containers/ctr/exec", req) do

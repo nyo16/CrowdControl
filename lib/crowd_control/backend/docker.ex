@@ -822,7 +822,18 @@ defmodule CrowdControl.Backend.Docker do
 
     case API.request(opts, :get, "/containers/json", params: [filters: filters, all: false]) do
       {:ok, containers} when is_list(containers) ->
-        {:ok, Enum.map(containers, &handle_from_container(&1, opts, owner))}
+        # Two scopes, as in Provider.Docker's list: owner (above), or one node's
+        # reaper reaps another node's containers; agent, or it also picks up
+        # Backend.Sandboxd's providers' containers and tears a stack apart, or a
+        # single-container sandbox, from under its session. Containers this
+        # backend started carry no agent label, so they are still listed. The
+        # Engine API cannot filter on a label's absence, so this runs here.
+        handles =
+          containers
+          |> Enum.reject(&sandboxd?/1)
+          |> Enum.map(&handle_from_container(&1, opts, owner))
+
+        {:ok, handles}
 
       {:ok, other} ->
         {:error, {:docker, {:unexpected_list_response, other}}}
@@ -831,6 +842,9 @@ defmodule CrowdControl.Backend.Docker do
         {:error, reason}
     end
   end
+
+  defp sandboxd?(container),
+    do: (Map.get(container, "Labels") || %{})["crowd_control.agent"] == "sandboxd"
 
   defp handle_from_container(container, opts, owner) do
     labels = Map.get(container, "Labels") || %{}
