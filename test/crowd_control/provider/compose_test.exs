@@ -328,7 +328,8 @@ defmodule CrowdControl.Provider.ComposeTest do
   end
 
   describe "images (blocker: a root sidecar nobody declared, or an image that isn't there)" do
-    test "a sidecar whose image defaults to root is refused, and nothing is created", context do
+    test "a sidecar whose image defaults to root is refused, and nothing is left behind",
+         context do
       # alpine/socat sets no USER, so with no `user:` it would run as root.
       sidecar = %{
         name: "sidecar",
@@ -346,7 +347,7 @@ defmodule CrowdControl.Provider.ComposeTest do
       assert leftovers(opts, context.session) == {[], [], []}
     end
 
-    test "a missing image is image_not_found, and nothing is created", context do
+    test "a missing image is image_not_found, and nothing is left behind", context do
       sidecar = %{name: "sidecar", image: "cc-missing/none:0", egress: :none, user: "65534"}
       opts = with_sidecar(context.opts, sidecar)
 
@@ -354,6 +355,38 @@ defmodule CrowdControl.Provider.ComposeTest do
                Compose.acquire(opts)
 
       assert leftovers(opts, context.session) == {[], [], []}
+    end
+
+    test "a sidecar with a numeric default user is created from the inspected Id", context do
+      image = commit_numeric_user_image(context.opts)
+
+      # alpine/socat has no python for the base :ready probe, and the check
+      # under test is the create, not readiness.
+      sidecar = %{
+        name: "sidecar",
+        image: image,
+        egress: :none,
+        entrypoint: ["socat"],
+        command: ["TCP-LISTEN:8080,fork,reuseaddr", "SYSTEM:echo ok"]
+      }
+
+      opts = context.opts |> with_sidecar(sidecar) |> Keyword.put(:ready, %{})
+      {:ok, handle, _endpoint} = Compose.acquire(opts)
+
+      try do
+        {:ok, %{"Id" => id}} = API.request(opts, :get, "/images/#{image}/json")
+
+        image_of = fn service ->
+          {:ok, body} = inspect_container(opts, container(handle, service))
+          body["Config"]["Image"]
+        end
+
+        assert image_of.("sidecar") == id
+        assert image_of.("sandbox") == @agent_image
+        assert image_of.("forwarder") == @forwarder_image
+      after
+        Compose.release(handle)
+      end
     end
   end
 
@@ -403,6 +436,34 @@ defmodule CrowdControl.Provider.ComposeTest do
     Keyword.update!(opts, :services, fn services ->
       Enum.map(services, &if(&1.name == "sidecar", do: sidecar, else: &1))
     end)
+  end
+
+  # A local image whose default user is numeric non-root: commit an unstarted
+  # container of the forwarder image with `USER 65534`. Unique tag, removed on
+  # exit, so a developer's daemon keeps nothing.
+  defp commit_numeric_user_image(config) do
+    tag = :crypto.strong_rand_bytes(6) |> Base.encode16(case: :lower)
+    repo = "cc-test/uid65534"
+
+    {:ok, %{"Id" => container_id}} =
+      API.request(config, :post, "/containers/create", json: %{"Image" => @forwarder_image})
+
+    try do
+      {:ok, _} =
+        API.request(config, :post, "/commit",
+          params: [container: container_id, repo: repo, tag: tag, changes: "USER 65534"]
+        )
+    after
+      {:ok, _} = API.request(config, :delete, "/containers/#{container_id}")
+    end
+
+    image = "#{repo}:#{tag}"
+
+    on_exit(fn ->
+      API.request([timeout: 30_000], :delete, "/images/#{image}", params: [force: true])
+    end)
+
+    image
   end
 
   # Everything the daemon holds for this session, by the label every stack
