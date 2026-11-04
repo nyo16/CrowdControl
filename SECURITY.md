@@ -410,6 +410,12 @@ held back. A Pod still there at the deadline, or one whose DELETE failed, keeps
 its policy, and the orphan sweep, which counts a terminating Pod as live,
 removes it later. If the sandbox Pod is not confirmed gone by its own deadline,
 the `sbx` services are still deleted then, and only the sandbox's policy stays.
+If the sandbox Pod's own DELETE failed, it may run on indefinitely, so its
+`sbx` services stay as well — their Pods, Services and NetworkPolicies, with a
+warning naming them — and a later `destroy/1` (the reaper's orphan pass) or
+the sweep removes them once the sandbox Pod is gone. Their ConfigMaps and
+Secrets are still deleted: a running Pod keeps the env it loaded and the last
+files it was given.
 Every object carries
 a `crowd_control.sweep_after_ms` annotation (provision time plus the session's
 `:provision_timeout` plus `:orphan_margin_ms`, default a minute), and the sweep
@@ -679,18 +685,25 @@ service that uses it, rather than a create failure after the networks exist.
 
 **A sidecar's image default user is part of its posture.** A sidecar with no
 `user:` runs as whatever its image declares, so that inspect also reads the
-image's user. It passes only as a numeric, non-zero uid (`1000`,
-`1000:1000`). Anything else — no `USER`, a name such as `node` or `nginx`, or
-a spelling Docker still runs as uid 0 (`00`, `+0`, `:1000`) — is refused with
-`{:error, {:compose, {:weakening_not_declared, {name, :user}}}}` unless the
-service sets `user:` or names `:user` in `weaken:`. A name is refused because
-Docker resolves it against the image's own `/etc/passwd`, which proves nothing
-from outside; Kubernetes' `runAsNonRoot` refuses a non-numeric user for the
-same reason, so this is the same rule on both substrates. A sidecar checked
-this way is created from the inspected image Id rather than its name, so a tag
-re-pointed between the check and the create can't swap in an unchecked image.
-The sandbox is exempt, as on Kubernetes, where its `runAsNonRoot` is opt-in
-through `:run_as_user`.
+image's default user. It passes only as a numeric uid in `1..2147483647`
+(`1000`, `1000:1000`); Docker itself refuses a uid above that range, so this
+refusal only comes earlier. Anything else — no `USER`, a name such as `node` or
+`nginx`, or a spelling Docker still runs as uid 0 (`00`, `+0`, `:1000`) — is
+refused with `{:error, {:compose, {:weakening_not_declared, {name, :user}}}}`
+unless the service sets `user:` or names `:user` in `weaken:`. A name is
+refused because Docker resolves it against the image's own `/etc/passwd`,
+which proves nothing from outside. A sidecar checked this way is created from
+the inspected image Id rather than its name, so a tag re-pointed between the
+check and the create can't swap in an unchecked image. The sandbox is exempt,
+as on Kubernetes, where its `runAsNonRoot` is opt-in through `:run_as_user`.
+
+The numeric rule covers the image's **default** user only; the substrates
+differ on an explicit one. On Compose an explicit `user:` is trusted as
+written: a name is passed to Docker, which resolves it against the image's
+`/etc/passwd`, and only `root` or a numeric uid 0 needs `weaken: [:user]`, so a
+name the image maps to uid 0 runs as root undeclared. Kubernetes refuses a
+named `user:` outright, `{:error, {:k8s, {:bad_user, {name, user}}}}`. Use a
+numeric `user:` on a sidecar whose image you don't control.
 
 **The capture file is the sandbox's alone.** A sidecar that reads the
 transcript must mount the sandbox's capture volume (the same named volume or
@@ -721,9 +734,9 @@ forwarder and to nothing else in the stack: it is "no NAT", not "dropped". The
 forwarder runs `socat` and no attacker-controlled code, which is why that weaker
 posture is acceptable there and would not be for the sandbox.
 The forwarder runs as `nobody` (`65534:65534`), whatever its image's default.
-`:agent_port` may be any TCP port, `1..65535`: Docker sets
-`net.ipv4.ip_unprivileged_port_start=0` in each container's network namespace,
-so `nobody` can bind a privileged port too. Anything else is
+`:agent_port` may be any TCP port, `1..65535`: Docker Engine 20.10 or later
+sets `net.ipv4.ip_unprivileged_port_start=0` in each container's network
+namespace, so `nobody` can bind a privileged port too. Anything else is
 `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}` before any request.
 
 **Credentials.** With `:proxy_service` named, the provider mints a per-session

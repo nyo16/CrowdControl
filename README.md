@@ -1599,9 +1599,10 @@ false`, `readonly_rootfs: false`, a root `user:`) only when also named in its
 `weaken: [...]` list, and `privileged` never. Every image must be a valid
 reference and present on the daemon (the providers never pull); the provider
 inspects each one before creating anything. A sidecar with no `user:` whose
-image's default user isn't a numeric non-zero uid (no `USER`, `root`, or a name
-such as `node`) needs a numeric `user:` or `weaken: [:user]`, and is created
-from the inspected image Id. Per-service networks and any
+image's default user isn't a numeric uid in `1..2147483647` (no `USER`, `root`,
+or a name such as `node`) needs a numeric `user:` or `weaken: [:user]`, and is
+created from the inspected image Id. An explicit `user:` name is trusted as
+written, as Docker resolves it. Per-service networks and any
 `egress: :allow` sidecar need Docker Engine ≥ 25.0.5 (CVE-2024-29018). See
 [docs/providers.md](docs/providers.md) for the rules.
 

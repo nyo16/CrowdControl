@@ -316,7 +316,10 @@ destroying the wrong thing:
   stack apart one container at a time, orphaning its networks and volumes.
 
 `crowd_control.stack=single` exists as a *positive* discriminator because Docker
-label filters cannot express label absence.
+label filters cannot express label absence. The agent scope holds the other way
+too: `Backend.Docker.list_live/1` drops containers labelled
+`crowd_control.agent=sandboxd` (client-side, for the same reason), so its reaper
+never tears down a `Backend.Sandboxd` sandbox or stack.
 
 `release/1` deletes the container before the network, in that order, because a
 network `DELETE` answers `403` while a container is still attached. `404` is
@@ -387,8 +390,9 @@ The **forwarder** sidecar is dual-homed on 1 and 2 and publishes the agent port 
 `socat TCP-LISTEN:<port>,fork,reuseaddr TCP:<sandbox>:<port>` and addressing the
 sandbox by its network alias. It runs as `nobody` (`65534:65534`), so a custom
 `:forwarder_image` must let uid 65534 run `socat`. `:agent_port` may be any TCP
-port, `1..65535`: Docker sets `net.ipv4.ip_unprivileged_port_start=0` in each
-container's network namespace, so `nobody` can bind a privileged one; anything
+port, `1..65535`: Docker Engine 20.10 or later sets
+`net.ipv4.ip_unprivileged_port_start=0` in each container's network namespace, so
+`nobody` can bind a privileged one; anything
 else is `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`, before any
 request. `fork` is not decorative: a single-slot forwarder
 (`busybox nc -e`) dropped two of three concurrent requests in testing, and
@@ -479,15 +483,18 @@ stack's HostConfig with `host_config:`:
   lacks is `{:error, {:compose, {:image_not_found, {service, image}}}}`, naming
   the first service that uses it.
 * **A sidecar's image default user** counts as its `user:` when it sets none, and
-  passes only as a numeric, non-zero uid (`1000`, `1000:1000`). No `USER`, a name
-  (`node`, `nginx`), or a spelling Docker runs as uid 0 (`00`, `+0`, `:1000`) is
-  held to the `weaken: [:user]` rule, `{:error, {:compose,
-  {:weakening_not_declared, {service, :user}}}}`; set a numeric `user:` or declare
-  the weakening. This is Kubernetes' `runAsNonRoot`, which also refuses a
-  non-numeric user, done by the provider. Such a sidecar is created from the
+  passes only as a numeric uid in `1..2147483647` (`1000`, `1000:1000`; Docker
+  refuses a larger one itself). No `USER`, a name (`node`, `nginx`), or a spelling
+  Docker runs as uid 0 (`00`, `+0`, `:1000`) is held to the `weaken: [:user]`
+  rule, `{:error, {:compose, {:weakening_not_declared, {service, :user}}}}`; set a
+  numeric `user:` or declare the weakening. Such a sidecar is created from the
   inspected image Id, so the image that was checked is the image that runs. The
   presets all set `user:`, so they skip the user check. The sandbox is exempt, as
-  on Kubernetes, and the forwarder runs as `nobody`.
+  on Kubernetes, and the forwarder runs as `nobody`. The numeric rule is for the
+  image's *default* user only. An explicit `user:` name is trusted as written:
+  Docker resolves it against the image's `/etc/passwd`, and only `root` or a
+  numeric uid 0 needs `weaken: [:user]`, so a name the image maps to uid 0 runs as
+  root undeclared. Kubernetes refuses a named `user:` (`{:k8s, {:bad_user, …}}`).
 * **`privileged`** is refused outright, `{:error, {:compose, {:privileged_refused,
   service}}}`, declared or not.
 
@@ -994,7 +1001,11 @@ its own policy. The order follows reach. A `:separate` Pod on `sbx`, which the
 sandbox Pod can reach and a drained `:pod` shipper may still be sending to, is
 deleted only once the sandbox Pod's wait is over. Every other `:separate` Pod is
 deleted alongside the sandbox Pod, and all the waits overlap, each against its own
-deadline. The derived Services, ConfigMaps and Secrets go after every wait.
+deadline. The derived Services, ConfigMaps and Secrets go after every wait. A
+sandbox Pod whose own DELETE fails keeps its `sbx` services — Pod, Service and
+NetworkPolicy, logged in one warning — since it may still reach them; a later
+`destroy/1` (the reaper's orphan pass) or the sweep removes them once it is gone.
+Their ConfigMaps and Secrets are deleted as usual.
 
 A service's `env` never reaches a Pod spec. Each service with a non-empty `env`
 gets a per-session Secret, `cc-<session_key>-<service>-env`, labelled

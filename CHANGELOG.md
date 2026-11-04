@@ -193,7 +193,7 @@
   `image:`, and on Compose the top-level `:image` and `:forwarder_image`, must
   be a distribution reference (`[domain[:port]/]path[:tag][@digest]`, lowercase
   path, name at most 255 characters) or a bare `sha256:<64 hex>` Id; anything
-  else, including `?`, `#`, whitespace or `..`, is
+  else, including `?`, `#`, whitespace or a `..` path segment, is
   `{:compose | :k8s, {:bad_service, {name, :image}}}` before any request.
 - **Compose checks every image before creating anything.** `acquire/1`
   inspects each distinct image once — the sandbox's, the forwarder's and every
@@ -203,21 +203,22 @@
   failure after the networks exist.
 - **Compose refuses a sidecar whose image default user isn't a numeric
   non-root uid.** A sidecar with no `user:` runs as its image's default user,
-  which passes only as `uid` or `uid:gid` with a non-zero uid. No `USER`,
-  `root`, any name (`node`, `nginx`), and spellings Docker runs as uid 0
-  (`00`, `+0`, `-0`, `:1000`) need `weaken: [:user]`, as an explicit root
-  `user:` does, or `{:compose, {:weakening_not_declared, {name, :user}}}`.
-  This is Kubernetes' `runAsNonRoot` rule, which refuses a non-numeric user
-  too, and it can refuse a stack that worked before, including one whose
-  image runs as a named non-root user: set a numeric `user:` on the sidecar,
-  or declare the weakening. Such a sidecar is created from the inspected
-  image Id, so `docker ps` shows an Id for it. The sandbox is exempt, and the
-  presets set `user:`.
+  which passes only as `uid` or `uid:gid` with a uid in `1..2147483647` (Docker
+  refuses a larger one at container start). No `USER`, `root`, any name
+  (`node`, `nginx`), and spellings Docker runs as uid 0 (`00`, `+0`, `-0`,
+  `:1000`) need `weaken: [:user]`, as an explicit root `user:` does, or
+  `{:compose, {:weakening_not_declared, {name, :user}}}`. This can refuse a
+  stack that worked before, including one whose image runs as a named non-root
+  user: set a numeric `user:` on the sidecar, or declare the weakening. Such a
+  sidecar is created from the inspected image Id, so `docker ps` shows an Id
+  for it. The sandbox is exempt, and the presets set `user:`. The rule is for
+  the image's default user only: an explicit `user:` name on a Compose sidecar
+  is still trusted as written, while Kubernetes refuses a named user.
 - **The Compose forwarder runs as `nobody`** (`65534:65534`), so a custom
   `:forwarder_image` must let uid 65534 run `socat`. `:agent_port` may be any
-  port in `1..65535`: Docker lets an unprivileged process bind below 1024
-  inside a container. Anything else is `{:compose, {:bad_agent_port,
-  {forwarder, port}}}`.
+  port in `1..65535`: Docker Engine 20.10 or later lets an unprivileged process
+  bind below 1024 inside a container. Anything else is `{:compose,
+  {:bad_agent_port, {forwarder, port}}}`.
 - **Kubernetes `destroy/1` takes `:destroy_margin_ms`** (default 10 s), how
   long past a drained Pod's grace it waits to see the Pod gone before keeping
   its NetworkPolicy. Mainly for tests.
@@ -227,6 +228,16 @@
 - **A reattached session keeps its original turn deadline**, re-armed from the
   persisted wall-clock time, instead of starting a fresh `:timeout` window
   after every host restart.
+- **A Kubernetes sandbox whose DELETE failed keeps the services it can
+  reach.** `destroy/1` no longer deletes the Pods, Services and
+  NetworkPolicies of the `sbx` services when the sandbox Pod's own DELETE
+  fails (anything but a 404), and logs one warning naming them; a later
+  `destroy/1` from the reaper's orphan pass, or the orphan sweep, removes them
+  once the sandbox Pod is gone.
+- **`Backend.Docker.list_live/1` no longer lists sandboxd containers.**
+  Containers labelled `crowd_control.agent=sandboxd` belong to
+  `Backend.Sandboxd`'s providers; a `Backend.Docker` reaper on the same owner
+  would have torn their stacks apart from under live sessions.
 
 ## 0.3.0 — 2026-09-01
 
