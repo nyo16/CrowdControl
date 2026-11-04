@@ -148,13 +148,24 @@ defmodule CrowdControl.ServiceTest do
             "name:tag@" <> digest,
             digest,
             "localhost/x",
-            String.duplicate("a", 255)
+            "img:1..2",
+            String.duplicate("a", 255),
+            String.duplicate("a", 255) <> ":tag"
           ] do
         assert {:ok, %Service{image: ^image}} =
                  Service.normalize(sidecar(image: image), :sidecar)
       end
 
-      for image <- ["a?b", "a#b", "a b", "../x", "A/B", "pg:16\n", String.duplicate("a", 256)] do
+      for image <- [
+            "a?b",
+            "a#b",
+            "a b",
+            "../x",
+            "A/B",
+            "pg:16\n",
+            String.duplicate("a", 256),
+            String.duplicate("a", 256) <> ":tag"
+          ] do
         assert {:error, {:bad_service, {"b", :image}}} =
                  Service.normalize(sidecar(image: image), :sidecar)
 

@@ -1137,7 +1137,21 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
     test "a sidecar image default user is refused unless it is a numeric non-zero uid" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
 
-      for user <- ["", "0", "00", "0:0", "0:1000", "+0", "-0", ":1000", "1000:", "root", "nginx"] do
+      for user <- [
+            "",
+            "0",
+            "00",
+            "0:0",
+            "0:1000",
+            "+0",
+            "-0",
+            ":1000",
+            "1000:",
+            "root",
+            "nginx",
+            "2147483648",
+            "99999999999999999999"
+          ] do
         routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", user)}}
 
         assert {{:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}}, requests} =
@@ -1151,7 +1165,7 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
     test "a numeric non-zero uid is accepted and left to the image" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
 
-      for user <- ["1000", "1000:1000"] do
+      for user <- ["1000", "1000:1000", "2147483647"] do
         routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", user)}}
 
         assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
@@ -1259,6 +1273,59 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       assert container_body(requests, "cache")["Image"] == "cache:1"
       assert container_body(requests, "sandbox")["Image"] == "sandbox:dev"
       assert container_body(requests, "forwarder")["Image"] == "alpine/socat:1.8.1.3"
+    end
+
+    test "a shared image is inspected once and still checked for the service that needs it" do
+      # The exempt service comes first, so a check made only on an image's
+      # first inspect would never see the bare sidecar.
+      variants = [
+        {[image: "shared:1"], [%{name: "db", image: "shared:1", egress: :none}], "sandbox"},
+        {[],
+         [
+           %{name: "cache", image: "shared:1", egress: :none, user: "1000:1000"},
+           %{name: "db", image: "shared:1", egress: :none}
+         ], "cache"}
+      ]
+
+      for {opts, specs, exempt} <- variants do
+        root = %{{:get, "/images/shared:1/json"} => {200, image_json("shared:1", "")}}
+
+        assert {{:error, {:compose, {:weakening_not_declared, {"db", :user}}}}, requests} =
+                 acquire([services: specs, routes: root] ++ opts)
+
+        assert Enum.count(requests, &(&1.path == "/images/shared:1/json")) == 1
+        refute Enum.any?(requests, &(&1.method == :post))
+
+        non_root = %{{:get, "/images/shared:1/json"} => {200, image_json("shared:1", "1000")}}
+
+        assert {{:ok, _handle, _endpoint}, requests} =
+                 acquire([services: specs, routes: non_root] ++ opts)
+
+        assert Enum.count(requests, &(&1.path == "/images/shared:1/json")) == 1
+        assert container_body(requests, "db")["Image"] == image_id("shared:1")
+        assert container_body(requests, exempt)["Image"] == "shared:1"
+      end
+    end
+
+    test "a sidecar with an explicit user: is inspected, then created by name with that user" do
+      specs = [%{name: "db", image: "db:1", egress: :none, user: "1000:1000"}]
+      routes = %{{:get, "/images/db:1/json"} => {200, image_json("db:1", "")}}
+
+      assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
+
+      assert Enum.count(requests, &(&1.path == "/images/db:1/json")) == 1
+      assert container_body(requests, "db")["Image"] == "db:1"
+      assert container_body(requests, "db")["User"] == "1000:1000"
+    end
+
+    test "the sandbox and the forwarder are exempt from the default-user check" do
+      routes = %{
+        {:get, "/images/sandbox:dev/json"} => {200, image_json("sandbox:dev", "")},
+        {:get, "/images/alpine/socat:1.8.1.3/json"} =>
+          {200, image_json("alpine/socat:1.8.1.3", "")}
+      }
+
+      assert {{:ok, _handle, _endpoint}, _requests} = acquire(routes: routes)
     end
 
     test "an image that isn't a reference is refused before any HTTP" do

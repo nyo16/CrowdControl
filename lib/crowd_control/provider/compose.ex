@@ -318,9 +318,13 @@ defmodule CrowdControl.Provider.Compose do
   @default_proxy_port 8080
 
   # `nobody`: the forwarder holds nothing and needs no privilege. It can still
-  # listen on any `:agent_port`: Docker sets `net.ipv4.ip_unprivileged_port_start`
-  # to 0 in each container's network namespace.
+  # listen on any `:agent_port`: Docker Engine 20.10 or later sets
+  # `net.ipv4.ip_unprivileged_port_start` to 0 in each container's network
+  # namespace.
   @forwarder_user "65534:65534"
+
+  # Docker's uid range is `0..2147483647`; see `numeric_non_root?/1`.
+  @max_uid 2_147_483_647
 
   # Pinned, and only the *command* is load-bearing: any image with socat on
   # PATH works, which is what :forwarder_image is for on an air-gapped
@@ -1817,10 +1821,14 @@ defmodule CrowdControl.Provider.Compose do
   # on Kubernetes; the forwarder has an explicit user.
   defp validate_images(opts, services) do
     result =
-      Enum.reduce_while(services, {%{}, %{}}, fn service, {inspected, ids} ->
-        with {:ok, image} <- inspect_image(opts, service, inspected),
+      Enum.reduce_while(services, %{inspected: %{}, ids: %{}}, fn service, acc ->
+        with {:ok, image} <- inspect_image(opts, service, acc.inspected),
              :ok <- check_image_user(service, image) do
-          {:cont, {Map.put(inspected, service.image, image), put_image_id(ids, service, image)}}
+          {:cont,
+           %{
+             inspected: Map.put(acc.inspected, service.image, image),
+             ids: put_image_id(acc.ids, service, image)
+           }}
         else
           {:error, _reason} = error -> {:halt, error}
         end
@@ -1828,7 +1836,7 @@ defmodule CrowdControl.Provider.Compose do
 
     case result do
       {:error, _reason} = error -> error
-      {_inspected, ids} -> {:ok, ids}
+      %{ids: ids} -> {:ok, ids}
     end
   end
 
@@ -1869,9 +1877,15 @@ defmodule CrowdControl.Provider.Compose do
   # and `":1000"` as uid 0. Kubernetes' `runAsNonRoot` refuses any non-numeric
   # user for the same reason. So only `uid` or `uid:gid`, all digits, with a
   # uid that is numerically non-zero (`"00"` is root), passes.
+  #
+  # The uid must also be in Docker's own range, `0..2147483647`: the daemon
+  # refuses anything above at container start ("uids and gids must be in range
+  # 0-2147483647"), so refusing it here moves that failure to `acquire/1`,
+  # before anything is created. The gid isn't range-checked: it isn't a
+  # posture question.
   defp numeric_non_root?(user) do
     case Regex.run(~r/\A(\d+)(?::\d+)?\z/, user, capture: :all_but_first) do
-      [uid] -> String.to_integer(uid) != 0
+      [uid] -> String.to_integer(uid) in 1..@max_uid
       nil -> false
     end
   end

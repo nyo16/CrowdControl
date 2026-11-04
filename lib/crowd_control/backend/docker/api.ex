@@ -139,8 +139,9 @@ defmodule CrowdControl.Backend.Docker.API do
   The name goes into the path unencoded: the Engine API routes
   `repo/name:tag`, `name@sha256:…` and `repo/name:tag@sha256:…` as raw path
   segments (checked against a live daemon). Callers pass a reference that
-  `CrowdControl.Service.image_reference?/1` accepted, so no `?`, `#` or `..`
-  can reach the path.
+  `CrowdControl.Service.image_reference?/1` accepted, so no `?`, `#` or
+  whitespace, and no `..` path segment, can reach the path. A tag such as
+  `1..2` is valid.
   """
   @spec image_inspect(config(), String.t()) ::
           {:ok, %{id: String.t(), user: String.t()}} | {:error, term()}

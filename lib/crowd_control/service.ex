@@ -303,16 +303,17 @@ defmodule CrowdControl.Service do
   # The distribution/reference grammar, transcribed from upstream's regexp.go
   # (https://github.com/distribution/reference/blob/main/regexp.go):
   # `[domain[:port]/]path(/path)*[:tag][@digest]`, lowercase path components, a
-  # name of at most 255 characters. A bare image ID (`sha256:<64 hex>`) is also
-  # a reference the Engine accepts. Anything else is refused before it reaches a
-  # request path, where `?`, `#` or `..` would change which endpoint is asked.
+  # name of at most 255 characters. A bare image ID (`sha256:<64 hex>`), which
+  # the Engine also accepts, needs no case of its own: the grammar reads it as
+  # the name `sha256` with a 64-character tag. Anything else is refused before
+  # it reaches a request path, so no `?`, `#` or whitespace, and no `..` path
+  # segment, can change which endpoint is asked. A tag such as `1..2` is valid.
   @spec image_reference?(term()) :: boolean()
   def image_reference?(image) when is_binary(image) do
-    image =~ ~r/\Asha256:[a-f0-9]{64}\z/ or
-      case Regex.run(image_reference_regex(), image, capture: ["name"]) do
-        [name] -> byte_size(name) <= @max_image_name
-        nil -> false
-      end
+    case Regex.run(image_reference_regex(), image, capture: ["name"]) do
+      [name] -> byte_size(name) <= @max_image_name
+      nil -> false
+    end
   end
 
   def image_reference?(_image), do: false
