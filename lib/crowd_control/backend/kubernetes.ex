@@ -277,7 +277,10 @@ defmodule CrowdControl.Backend.Kubernetes do
   `destroy/1` therefore blocks for up to whichever is longest: the sandbox's
   wait plus the longest wait of a drained service on `sbx`, or the wait of
   any drained service off `sbx`. A Pod whose DELETE fails (anything but a
-  404) keeps its policy too, whatever its grace.
+  404) keeps its policy too, whatever its grace. A sandbox Pod whose DELETE
+  fails keeps its `sbx` services as well — their Pods, Services and
+  NetworkPolicies, since it may still reach them — and a later `destroy/1`
+  (the reaper's orphan pass) or the sweep removes them once it is gone.
 
   A service's `env` goes in a per-session Secret, `cc-<key>-<name>-env`
   (`crowd_control.role=service-secret`), which its container reads by
@@ -1981,11 +1984,15 @@ defmodule CrowdControl.Backend.Kubernetes do
   # network — and a drained `:pod` sidecar keeps shipping to it for the whole
   # drain, so a `:separate` Pod on `sbx` is DELETEd only once the sandbox
   # Pod's wait is over (its 404, or its deadline: as before, a sandbox not
-  # confirmed gone keeps only its own policy). Every other `:separate` Pod is
-  # DELETEd with the sandbox Pod, and all the waits overlap: each runs against
-  # its own deadline from its own DELETE. A NetworkPolicy goes only once its
-  # own Pod is gone, and the derived Services, ConfigMaps and Secrets after
-  # every wait.
+  # confirmed gone keeps only its own policy). A sandbox whose own DELETE
+  # failed may still run for as long as it likes, so its `sbx` services are
+  # not DELETEd at all — Pod, Service and NetworkPolicy, which share a name —
+  # and a later `destroy/1` (the reaper's orphan pass, which reads the refs
+  # off the sandbox Pod again) or the sweep removes them once it is gone.
+  # Every other `:separate` Pod is DELETEd with the sandbox Pod, and all the
+  # waits overlap: each runs against its own deadline from its own DELETE. A
+  # NetworkPolicy goes only once its own Pod is gone, and the derived
+  # Services, ConfigMaps and Secrets after every wait.
   def destroy(%__MODULE__{pod_name: name} = handle) do
     config = handle.config
     refs = Map.get(handle, :services) || []
@@ -2002,7 +2009,10 @@ defmodule CrowdControl.Backend.Kubernetes do
     unreached = start_pod_deletes(config, unreached)
     running? = still_running?(config, name, state, gone_deadline(config, started, grace))
 
-    reached = start_pod_deletes(config, reached)
+    {reached, kept} =
+      if state == :running,
+        do: {[], keep_reached(name, reached)},
+        else: {start_pod_deletes(config, reached), MapSet.new()}
 
     running =
       for {pod, pod_state, deadline} <- unreached ++ reached,
@@ -2010,7 +2020,9 @@ defmodule CrowdControl.Backend.Kubernetes do
           into: MapSet.new(),
           do: pod
 
-    for object <- others, do: delete_unless_running(config, object, running)
+    for object <- others,
+        not kept?(object, kept),
+        do: delete_unless_running(config, object, running)
 
     # The Pod's only NetworkPolicy. Without it a Pod is non-isolated, i.e.
     # allow-all, so it goes only once the Pod has.
@@ -2051,7 +2063,9 @@ defmodule CrowdControl.Backend.Kubernetes do
   end
 
   defp gone_deadline(config, started, grace),
-    do: started + grace * 1_000 + (config[:destroy_margin_ms] || @destroy_margin_ms)
+    do: started + grace * 1_000 + destroy_margin(config)
+
+  defp destroy_margin(config), do: config[:destroy_margin_ms] || @destroy_margin_ms
 
   defp still_running?(_config, _name, :gone, _deadline), do: false
   defp still_running?(_config, _name, :running, _deadline), do: true
@@ -2085,6 +2099,25 @@ defmodule CrowdControl.Backend.Kubernetes do
         "until it is, and the reaper's orphan sweep deletes it then"
     )
   end
+
+  # ConfigMaps and Secrets are not kept: a running Pod keeps the env it
+  # loaded, and the kubelet keeps a deleted ConfigMap's last projection.
+  defp keep_reached(_sandbox, []), do: MapSet.new()
+
+  defp keep_reached(sandbox, pods) do
+    names = for {:pod, pod, _grace, _reach} <- pods, do: pod
+
+    Logger.warning(
+      "Kubernetes destroy: #{sandbox} could not be deleted, so the services it can " <>
+        "reach stay (#{Enum.join(names, ", ")}); the reaper's next destroy or its " <>
+        "orphan sweep removes them once it is gone"
+    )
+
+    MapSet.new(names)
+  end
+
+  defp kept?({kind, name}, kept) when kind in [:service, :network_policy], do: name in kept
+  defp kept?(_object, _kept), do: false
 
   defp delete_unless_running(config, {:network_policy, name} = object, running) do
     if name in running, do: keep_policy(name), else: delete_logged(config, object)

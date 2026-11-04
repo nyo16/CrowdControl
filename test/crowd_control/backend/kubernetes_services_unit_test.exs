@@ -1336,8 +1336,11 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       before = System.monotonic_time(:millisecond)
       assert Kubernetes.destroy(handle(config, services: refs)) == :ok
 
-      assert System.monotonic_time(:millisecond) - before >= 1_000,
-             "the sandbox's deadline was not waited out"
+      elapsed = System.monotonic_time(:millisecond) - before
+      assert elapsed >= 1_000, "the sandbox's deadline was not waited out"
+
+      # Ignoring `:destroy_margin_ms` would add its 10 s default to the wait.
+      assert elapsed < 5_000, "the sandbox's deadline ignored :destroy_margin_ms"
 
       at = indexes(log.())
 
@@ -1362,20 +1365,55 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       end
     end
 
-    test "a sandbox Pod whose delete failed keeps its deny-all" do
+    test "a sandbox Pod whose delete failed keeps its deny-all and its sbx services" do
+      {:ok, seen} = Agent.start_link(fn -> MapSet.new() end)
+      sandbox = "cc-#{@key}"
+
       {config, log} =
         recorder(fn
-          %{method: :delete, path: "/api/v1/namespaces/ns1/pods/" <> _} ->
+          %{method: :delete, path: "/api/v1/namespaces/ns1/pods/" <> ^sandbox} ->
             {500, %{"message" => "etcd is unhappy"}}
+
+          %{method: :get, path: "/api/v1/namespaces/ns1/pods/" <> pod} ->
+            if Agent.get_and_update(seen, &{pod in &1, MapSet.put(&1, pod)}),
+              do: {404, %{"message" => "not found"}},
+              else: {200, terminating_pod(pod)}
 
           %{method: :delete} ->
             {200, %{}}
         end)
 
-      assert Kubernetes.destroy(handle(config, services: [])) == :ok
+      refs = [
+        %{name: "vector", placement: :pod, grace: 1, sbx: true},
+        %{name: "aggregator", placement: :separate, grace: 30, sbx: true},
+        %{name: "proxy", placement: :separate, grace: 45, sbx: false}
+      ]
 
-      refute Enum.any?(log.(), &(&1.path =~ "networkpolicies")),
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+
+      at = indexes(log.())
+
+      assert at.({:get, :pods, sandbox}) == [], "a failed DELETE has nothing to wait for"
+
+      assert at.({:delete, :networkpolicies, "#{sandbox}-deny-all"}) == [],
              "a Pod that may still run must keep its only NetworkPolicy"
+
+      for kind <- [:pods, :services, :networkpolicies] do
+        assert at.({:delete, kind, "#{sandbox}-aggregator"}) == [],
+               "a sandbox Pod that may still run may still reach the aggregator's #{kind}"
+      end
+
+      assert [_proxy_delete] = at.({:delete, :pods, "#{sandbox}-proxy"})
+      assert [_terminating, gone] = at.({:get, :pods, "#{sandbox}-proxy"})
+      assert [policy_delete] = at.({:delete, :networkpolicies, "#{sandbox}-proxy"})
+      assert gone < policy_delete, "the proxy's policy was deleted before its Pod was gone"
+      assert [_] = at.({:delete, :services, "#{sandbox}-proxy"})
+
+      # ConfigMaps and Secrets go as they always have, kept services' included.
+      for name <- ["vector", "aggregator", "proxy"] do
+        assert [_] = at.({:delete, :configmaps, Files.config_map_name(@key, name)})
+        assert [_] = at.({:delete, :secrets, Secrets.secret_name(@key, name)})
+      end
     end
 
     test "the sweep leaves every object of a session whose Pod is still terminating" do
