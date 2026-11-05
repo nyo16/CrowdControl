@@ -358,7 +358,7 @@ defmodule CrowdControl.Provider.ComposeTest do
     end
 
     test "a sidecar with a numeric default user is created from the inspected Id", context do
-      image = commit_numeric_user_image(context.opts)
+      image = commit_numeric_user_image(context.opts, context.owner)
 
       # alpine/socat has no python for the base :ready probe, and the check
       # under test is the create, not readiness.
@@ -440,10 +440,26 @@ defmodule CrowdControl.Provider.ComposeTest do
 
   # A local image whose default user is numeric non-root: commit an unstarted
   # container of the forwarder image with `USER 65534`. Unique tag, removed on
-  # exit, so a developer's daemon keeps nothing.
-  defp commit_numeric_user_image(config) do
+  # exit, so a developer's daemon keeps nothing. `on_exit` runs LIFO, so this
+  # one runs before setup's: it releases the owner's stacks first, since a
+  # container still using the image would keep it.
+  defp commit_numeric_user_image(config, owner) do
     tag = :crypto.strong_rand_bytes(6) |> Base.encode16(case: :lower)
     repo = "cc-test/uid65534"
+    image = "#{repo}:#{tag}"
+
+    on_exit(fn ->
+      case Compose.list_live(owner: owner, timeout: 30_000) do
+        {:ok, handles} -> Enum.each(handles, &Compose.release/1)
+        _ -> :ok
+      end
+
+      case API.request(config, :delete, "/images/#{image}", params: [force: true]) do
+        {:ok, _} -> :ok
+        {:error, {:docker, {:not_found, _}}} -> :ok
+        other -> IO.warn("could not remove test image #{image}: #{inspect(other)}")
+      end
+    end)
 
     {:ok, %{"Id" => container_id}} =
       API.request(config, :post, "/containers/create", json: %{"Image" => @forwarder_image})
@@ -456,12 +472,6 @@ defmodule CrowdControl.Provider.ComposeTest do
     after
       {:ok, _} = API.request(config, :delete, "/containers/#{container_id}")
     end
-
-    image = "#{repo}:#{tag}"
-
-    on_exit(fn ->
-      API.request([timeout: 30_000], :delete, "/images/#{image}", params: [force: true])
-    end)
 
     image
   end
