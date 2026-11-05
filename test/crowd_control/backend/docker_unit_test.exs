@@ -375,6 +375,41 @@ defmodule CrowdControl.Backend.DockerUnitTest do
 
       assert [{:list, %{"label" => ["crowd_control.owner=o1"]}}] = events(agent)
     end
+
+    test "a container labelled agent=docker with owner and session is listed" do
+      {handle, _agent} =
+        stub_daemon(%{},
+          containers: [
+            %{
+              "Id" => "mine",
+              "Image" => "img",
+              "Labels" => %{
+                "crowd_control.owner" => "o1",
+                "crowd_control.session" => "s1",
+                "crowd_control.agent" => "docker"
+              }
+            }
+          ]
+        )
+
+      assert {:ok, [%Docker{container_id: "mine", session_key: "s1", owner: "o1"}]} =
+               Docker.list_live(Keyword.put(handle.config, :owner, "o1"))
+    end
+
+    test "provision stamps agent=docker so an image's agent label cannot override it" do
+      {handle, agent} = stub_daemon(%{})
+
+      assert {:ok, %Docker{container_id: "ctr"}} =
+               Docker.provision(handle.config ++ [image: "img", session_key: "s1", owner: "o1"])
+
+      assert [{:create_container, %{"Labels" => labels}} | _] = events(agent)
+
+      assert %{
+               "crowd_control.agent" => "docker",
+               "crowd_control.owner" => "o1",
+               "crowd_control.session" => "s1"
+             } = labels
+    end
   end
 
   describe "API.server_version/1 (blocker: a gate that cannot see the daemon's version)" do
@@ -529,7 +564,15 @@ defmodule CrowdControl.Backend.DockerUnitTest do
 
   defp route(state, :get, "/containers/json", req) do
     filters = URI.decode_query(URI.parse(to_string(req.url)).query || "")["filters"]
-    {{200, state.containers}, record(state, {:list, JSON.decode!(filters)})}
+    {{200, state.containers}, record(state, {:list, filters && JSON.decode!(filters)})}
+  end
+
+  defp route(state, :post, "/containers/create", req) do
+    {{201, %{"Id" => "ctr"}}, record(state, {:create_container, decoded_body(req)})}
+  end
+
+  defp route(state, :post, "/containers/ctr/start", _req) do
+    {{204, ""}, record(state, {:start_container, "ctr"})}
   end
 
   defp route(state, :post, "/containers/ctr/exec", req) do

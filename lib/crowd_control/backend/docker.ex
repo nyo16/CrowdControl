@@ -219,9 +219,14 @@ defmodule CrowdControl.Backend.Docker do
         "Image" => handle.image,
         "Entrypoint" => ["/bin/sh", "-c", entrypoint_script(handle)],
         "Env" => [],
+        # Docker copies image labels onto a container unless the create sets
+        # the key, so this backend stamps its own agent value: a
+        # sandboxd-labelled image then neither hides the container from
+        # list_live/1 here nor shows it to sandboxd's providers.
         "Labels" => %{
           "crowd_control.session" => to_string(handle.session_key),
           "crowd_control.owner" => handle.owner,
+          "crowd_control.agent" => "docker",
           "crowd_control.created_at" => to_string(System.system_time(:millisecond))
         },
         "HostConfig" => host_config(handle)
@@ -825,9 +830,11 @@ defmodule CrowdControl.Backend.Docker do
         # Two scopes, as in Provider.Docker's list: owner (above), or one node's
         # reaper reaps another node's containers; agent, or it also picks up
         # Backend.Sandboxd's providers' containers and tears a stack apart, or a
-        # single-container sandbox, from under its session. Containers this
-        # backend started carry no agent label, so they are still listed. The
-        # Engine API cannot filter on a label's absence, so this runs here.
+        # single-container sandbox, from under its session. This backend stamps
+        # agent=docker at create, overriding any agent label the image carries,
+        # so rejecting agent=sandboxd (rather than requiring agent=docker) still
+        # lists legacy containers created before that label existed. The Engine
+        # API cannot filter on a label's absence, so this runs here.
         handles =
           containers
           |> Enum.reject(&sandboxd?/1)
@@ -843,8 +850,8 @@ defmodule CrowdControl.Backend.Docker do
     end
   end
 
-  defp sandboxd?(container),
-    do: (Map.get(container, "Labels") || %{})["crowd_control.agent"] == "sandboxd"
+  defp sandboxd?(%{"Labels" => %{"crowd_control.agent" => "sandboxd"}}), do: true
+  defp sandboxd?(_container), do: false
 
   defp handle_from_container(container, opts, owner) do
     labels = Map.get(container, "Labels") || %{}
