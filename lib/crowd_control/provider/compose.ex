@@ -101,7 +101,8 @@ defmodule CrowdControl.Provider.Compose do
   neither weakens anything. A key that *weakens* the hardened default —
   `:cap_add`, `no_new_privileges: false`, `readonly_rootfs: false`, a root
   `user:` (or, on a sidecar with no `user:`, an image whose default user is
-  not a numeric non-zero uid — see "Posture is never inferred"), a
+  not a numeric uid in `1..2147483647` (and a gid, if given, in
+  `0..2147483647`) — see "Posture is never inferred"), a
   `host_path` mount on a sidecar (`:host_path`), or a `tmpfs` without
   `noexec,nosuid` (`:tmpfs_exec`) — must also be named in the
   service's `weaken: [...]` list (see `CrowdControl.Service`), or
@@ -227,16 +228,20 @@ defmodule CrowdControl.Provider.Compose do
       networks exist.
     * A sidecar with no `user:` runs as its image's default user, so that
       default is part of its posture. Unless the service names `:user` in
-      `weaken:`, the default passes only when it is a numeric, non-zero uid
-      (`"1000"`, `"1000:1000"`); anything else — `""` (no `USER`), a name
-      such as `node`, or a spelling Docker still runs as uid 0 (`"00"`,
-      `"+0"`, `":1000"`) — is refused with `{:error, {:compose,
-      {:weakening_not_declared, {name, :user}}}}`. That is Kubernetes'
-      `runAsNonRoot` rule, which refuses a non-numeric user too. Such a sidecar
-      is then created from the inspected image Id rather than its name, so the
-      image whose user was checked is the image that runs. The sandbox is
-      exempt, as on Kubernetes, where its `runAsNonRoot` is opt-in
-      (`:run_as_user`); the forwarder always runs as `nobody`.
+      `weaken:`, the default passes only when it is a numeric uid in
+      `1..2147483647` (and a gid, if given, in `0..2147483647`): `"1000"`,
+      `"1000:1000"`. Anything else — `""` (no `USER`), a name such as `node`,
+      a spelling Docker still runs as uid 0 (`"00"`, `"+0"`, `":1000"`), or an
+      id outside that range — is refused with `{:error, {:compose,
+      {:weakening_not_declared, {name, :user}}}}`. Such a sidecar is then
+      created from the inspected image Id rather than its name, so the image
+      whose user was checked is the image that runs. The sandbox is exempt, as
+      on Kubernetes, where its `runAsNonRoot` is opt-in (`:run_as_user`); the
+      forwarder always runs as `nobody`.
+    * An explicit `user:` name is trusted as written. Docker resolves it
+      against the image's `/etc/passwd`, and only `root` or a numeric uid 0
+      needs `weaken: [:user]`, so a name the image maps to uid 0 runs as root
+      undeclared. Kubernetes refuses a named `user:`.
 
   ## Egress proxy
 
@@ -1878,15 +1883,20 @@ defmodule CrowdControl.Provider.Compose do
   # user for the same reason. So only `uid` or `uid:gid`, all digits, with a
   # uid that is numerically non-zero (`"00"` is root), passes.
   #
-  # The uid must also be in Docker's own range, `0..2147483647`: the daemon
-  # refuses anything above at container start ("uids and gids must be in range
-  # 0-2147483647"), so refusing it here moves that failure to `acquire/1`,
-  # before anything is created. The gid isn't range-checked: it isn't a
-  # posture question.
+  # The uid, and the gid when given, must also be in Docker's own range,
+  # `0..2147483647`: the daemon refuses anything above at container start
+  # ("uids and gids must be in range 0-2147483647"), so refusing it here moves
+  # that failure to `acquire/1`, before anything is created.
   defp numeric_non_root?(user) do
-    case Regex.run(~r/\A(\d+)(?::\d+)?\z/, user, capture: :all_but_first) do
-      [uid] -> String.to_integer(uid) in 1..@max_uid
-      nil -> false
+    case Regex.run(~r/\A(\d+)(?::(\d+))?\z/, user, capture: :all_but_first) do
+      [uid] ->
+        String.to_integer(uid) in 1..@max_uid
+
+      [uid, gid] ->
+        String.to_integer(uid) in 1..@max_uid and String.to_integer(gid) in 0..@max_uid
+
+      nil ->
+        false
     end
   end
 

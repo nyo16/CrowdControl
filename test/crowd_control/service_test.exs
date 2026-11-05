@@ -161,6 +161,7 @@ defmodule CrowdControl.ServiceTest do
             "a#b",
             "a b",
             "../x",
+            "a/../b",
             "A/B",
             "pg:16\n",
             String.duplicate("a", 256),

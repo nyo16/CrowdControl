@@ -1134,7 +1134,7 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
   end
 
   describe "images (blocker: a root sidecar nobody declared, or an image that isn't there)" do
-    test "a sidecar image default user is refused unless it is a numeric non-zero uid" do
+    test "a sidecar image default user is refused unless it is a numeric uid in Docker's range, non-zero" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
 
       for user <- [
@@ -1150,6 +1150,7 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
             "root",
             "nginx",
             "2147483648",
+            "1000:2147483648",
             "99999999999999999999"
           ] do
         routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", user)}}
@@ -1165,7 +1166,7 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
     test "a numeric non-zero uid is accepted and left to the image" do
       specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
 
-      for user <- ["1000", "1000:1000", "2147483647"] do
+      for user <- ["1000", "1000:1000", "2147483647", "1000:2147483647", "1000:0"] do
         routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", user)}}
 
         assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
@@ -1318,14 +1319,18 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       assert container_body(requests, "db")["User"] == "1000:1000"
     end
 
-    test "the sandbox and the forwarder are exempt from the default-user check" do
+    test "the sandbox is exempt by role, and the forwarder has an explicit user" do
       routes = %{
         {:get, "/images/sandbox:dev/json"} => {200, image_json("sandbox:dev", "")},
         {:get, "/images/alpine/socat:1.8.1.3/json"} =>
           {200, image_json("alpine/socat:1.8.1.3", "")}
       }
 
-      assert {{:ok, _handle, _endpoint}, _requests} = acquire(routes: routes)
+      assert {{:ok, _handle, _endpoint}, requests} = acquire(routes: routes)
+
+      for path <- ["/images/sandbox:dev/json", "/images/alpine/socat:1.8.1.3/json"] do
+        assert Enum.count(requests, &(&1.method == :get and &1.path == path)) == 1, path
+      end
     end
 
     test "an image that isn't a reference is refused before any HTTP" do
