@@ -14,7 +14,7 @@ ARG SMOKESCREEN_COMMIT=336cb34495041ce3a33b8d489a2edcbf5f300913
 
 # Bases pinned by digest (multi-arch index), so a rebuild is reproducible;
 # refresh with `docker buildx imagetools inspect <tag>`.
-FROM golang:1.26@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c AS build
+FROM golang:1.26@sha256:b27fde63cc160f04a81cf7cf43c6560b47d736a1f0e3babe17745e8fbdff198d AS build
 
 ARG SMOKESCREEN_COMMIT
 
