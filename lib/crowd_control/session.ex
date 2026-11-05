@@ -674,6 +674,12 @@ defmodule CrowdControl.Session do
 
   # `:unknown` (no binary, no Claude Code banner, a hang) skips the gate: the
   # spawn then fails, or system/init decides.
+  #
+  # sobelow_skip because `executable` is what the agent adapter's
+  # `build_command/1` resolved, the binary `start_backend/6` spawns next
+  # anyway, run with a literal `--version` and no shell: there is nothing to
+  # inject into, and CI.System flags any System.cmd/3 whose command is a variable.
+  # sobelow_skip ["CI.System"]
   defp local_cli_version(executable, env) do
     task =
       Task.async(fn ->
