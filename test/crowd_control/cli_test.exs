@@ -1,6 +1,7 @@
 defmodule CrowdControl.CLITest do
   use ExUnit.Case, async: true
 
+  alias CrowdControl.Agent.ClaudeCode
   alias CrowdControl.CLI
 
   describe "build_command/1" do
@@ -215,6 +216,177 @@ defmodule CrowdControl.CLITest do
     test "adds bare flag" do
       {_exec, args, _env} = CLI.build_command(bare: true)
       assert "--bare" in args
+    end
+  end
+
+  describe "inline :mcp_config" do
+    @sdk %{"mcpServers" => %{"app" => %{"type" => "sdk", "name" => "app"}}}
+
+    test "an inline map becomes one JSON argv token" do
+      {_exec, args, _env} = CLI.build_command(mcp_config: @sdk)
+      idx = Enum.find_index(args, &(&1 == "--mcp-config"))
+      assert JSON.decode!(Enum.at(args, idx + 1)) == @sdk
+      assert length(args) == idx + 2
+    end
+
+    test "maps and paths can be mixed, in order, after one flag" do
+      {_exec, args, _env} = CLI.build_command(mcp_config: ["/config/a.json", @sdk, "b.json"])
+      idx = Enum.find_index(args, &(&1 == "--mcp-config"))
+      assert [path_a, json, path_b] = Enum.slice(args, (idx + 1)..(idx + 3))
+      assert path_a == "/config/a.json"
+      assert JSON.decode!(json) == @sdk
+      assert path_b == Path.expand("b.json")
+      assert Enum.count(args, &(&1 == "--mcp-config")) == 1
+    end
+
+    test "a map is not treated as a path, so its JSON is not expanded" do
+      {_exec, args, _env} = CLI.build_command(mcp_config: @sdk)
+      refute Enum.any?(args, &String.starts_with?(&1, File.cwd!()))
+    end
+
+    test "atom keys are accepted" do
+      config = %{mcpServers: %{web: %{type: "http", url: "http://browser:8931/mcp"}}}
+      {_exec, args, _env} = CLI.build_command(mcp_config: config)
+
+      assert %{"mcpServers" => %{"web" => %{"type" => "http"}}} =
+               JSON.decode!(List.last(args))
+    end
+
+    test "a server without a type raises, naming it" do
+      config = %{"mcpServers" => %{"web" => %{"url" => "http://browser:8931/mcp"}}}
+
+      assert_raise ArgumentError, ~r/"web".*no "type"/, fn ->
+        CLI.build_command(mcp_config: ["/config/a.json", config])
+      end
+    end
+
+    test "a map without mcpServers raises" do
+      assert_raise ArgumentError, ~r/mcpServers/, fn ->
+        CLI.build_command(mcp_config: %{"app" => %{"type" => "sdk"}})
+      end
+    end
+
+    test "an entry that is neither a path nor a map raises" do
+      assert_raise ArgumentError, ~r/paths or maps/, fn ->
+        CLI.build_command(mcp_config: [:nope])
+      end
+    end
+  end
+
+  describe "permission prompt options" do
+    test "adds --permission-prompt-tool" do
+      {_exec, args, _env} = CLI.build_command(permission_prompt_tool: "stdio")
+      assert args_contain_pair?(args, "--permission-prompt-tool", "stdio")
+    end
+
+    test "rejects a control character in the prompt tool name" do
+      assert_raise ArgumentError, fn ->
+        CLI.build_command(permission_prompt_tool: "mcp__x\n--bare")
+      end
+    end
+
+    test "adds --permission-prompts host or none" do
+      for value <- ["host", "none"] do
+        {_exec, args, _env} = CLI.build_command(permission_prompts: value)
+        assert args_contain_pair?(args, "--permission-prompts", value)
+      end
+    end
+
+    test "rejects any other --permission-prompts value" do
+      assert_raise ArgumentError, ~r/permission_prompts/, fn ->
+        CLI.build_command(permission_prompts: "ask")
+      end
+    end
+
+    test ":can_use_tool sets the stdio prompt tool" do
+      {_exec, args, _env} = ClaudeCode.build_command(can_use_tool: {M, :f, []})
+      assert args_contain_pair?(args, "--permission-prompt-tool", "stdio")
+      assert Enum.count(args, &(&1 == "--permission-prompt-tool")) == 1
+    end
+
+    test ":can_use_tool with an explicit stdio prompt tool is fine" do
+      {_exec, args, _env} =
+        ClaudeCode.build_command(can_use_tool: {M, :f, []}, permission_prompt_tool: "stdio")
+
+      assert args_contain_pair?(args, "--permission-prompt-tool", "stdio")
+    end
+
+    test ":can_use_tool with a named prompt tool raises" do
+      assert_raise ArgumentError, ~r/cannot be combined/, fn ->
+        ClaudeCode.build_command(
+          can_use_tool: {M, :f, []},
+          permission_prompt_tool: "mcp__approver__ask"
+        )
+      end
+    end
+
+    test "a named prompt tool alone passes through" do
+      {_exec, args, _env} = ClaudeCode.build_command(permission_prompt_tool: "mcp__approver__ask")
+      assert args_contain_pair?(args, "--permission-prompt-tool", "mcp__approver__ask")
+    end
+  end
+
+  describe ":sdk_mcp_servers" do
+    test "adds an inline sdk entry per server after the caller's configs" do
+      {_exec, args, _env} =
+        ClaudeCode.build_command(
+          mcp_config: "/config/a.json",
+          sdk_mcp_servers: %{"tools" => :spec, "app" => :spec}
+        )
+
+      idx = Enum.find_index(args, &(&1 == "--mcp-config"))
+      assert Enum.at(args, idx + 1) == "/config/a.json"
+
+      assert JSON.decode!(Enum.at(args, idx + 2)) == %{
+               "mcpServers" => %{
+                 "app" => %{"type" => "sdk", "name" => "app"},
+                 "tools" => %{"type" => "sdk", "name" => "tools"}
+               }
+             }
+    end
+
+    test "rejects a server name that is not a plain binary" do
+      assert_raise ArgumentError, ~r/sdk_mcp_servers/, fn ->
+        ClaudeCode.build_command(sdk_mcp_servers: %{app: :spec})
+      end
+
+      assert_raise ArgumentError, ~r/sdk_mcp_servers/, fn ->
+        ClaudeCode.build_command(sdk_mcp_servers: %{"a b" => :spec})
+      end
+    end
+  end
+
+  describe "contract_flags/0" do
+    test "covers every flag build_command/1 can emit" do
+      {_exec, args, _env} =
+        ClaudeCode.build_command(
+          model: "m",
+          system_prompt: "s",
+          allowed_tools: ["Read"],
+          permission_mode: "plan",
+          permission_prompts: "none",
+          can_use_tool: {M, :f, []},
+          max_budget_usd: 1,
+          session_id: "id",
+          resume: "id",
+          add_dir: "/d",
+          settings_file: "/s.json",
+          setting_sources: ["user"],
+          sdk_mcp_servers: %{"app" => :spec},
+          agents: %{},
+          plugin_dir: "/p",
+          continue: true,
+          include_partial_messages: true,
+          no_session_persistence: true,
+          strict_mcp_config: true,
+          bare: true
+        )
+
+      emitted = args |> Enum.filter(&String.starts_with?(&1, "--")) |> MapSet.new()
+      table = CLI.contract_flags() |> Enum.map(& &1.flag) |> MapSet.new()
+
+      assert MapSet.subset?(emitted, table), inspect(MapSet.difference(emitted, table))
+      assert MapSet.equal?(emitted, table), inspect(MapSet.difference(table, emitted))
     end
   end
 

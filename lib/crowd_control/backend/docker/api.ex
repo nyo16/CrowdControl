@@ -102,6 +102,82 @@ defmodule CrowdControl.Backend.Docker.API do
     end
   end
 
+  @doc """
+  The daemon's Engine version as `{major, minor, patch}` (`GET /version`).
+
+  Cached per `docker_host` in `:persistent_term`, the same trade as the
+  Kubernetes enforcement probe: a daemon does not change version under a live
+  VM often enough to pay a round trip per acquire, and a VM restart re-reading
+  it once is the correct cost. Only a parsed answer is cached; a failed or
+  unparseable one is returned and asked again next time.
+  """
+  @spec server_version(config()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {:error, term()}
+  def server_version(config) do
+    key = {__MODULE__, :server_version, host(config)}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        with {:ok, body} <- request(config, :get, "/version"),
+             {:ok, version} <- parse_version(body) do
+          :persistent_term.put(key, version)
+          {:ok, version}
+        end
+
+      version ->
+        {:ok, version}
+    end
+  end
+
+  @doc """
+  An image's Id and default user (`GET /images/{name}/json`: `Id`,
+  `Config.User`).
+
+  `user: ""` — Docker's answer for an image that sets no `USER` — means root.
+  An image the daemon does not have is `{:error, {:docker, {:not_found, _}}}`.
+
+  The name goes into the path unencoded: the Engine API routes
+  `repo/name:tag`, `name@sha256:…` and `repo/name:tag@sha256:…` as raw path
+  segments (checked against a live daemon). Callers pass a reference that
+  `CrowdControl.Service.image_reference?/1` accepted, so no `?`, `#` or
+  whitespace, and no `..` path segment, can reach the path. A tag such as
+  `1..2` is valid.
+  """
+  @spec image_inspect(config(), String.t()) ::
+          {:ok, %{id: String.t(), user: String.t()}} | {:error, term()}
+  def image_inspect(config, image) when is_binary(image) do
+    path = "/images/#{image}/json"
+
+    with {:ok, body} <- request(config, :get, path) do
+      case body do
+        %{"Id" => id} when is_binary(id) -> {:ok, %{id: id, user: default_user(body)}}
+        _other -> {:error, {:docker, {:unexpected_body, path}}}
+      end
+    end
+  end
+
+  # No `Config`, or a null `User`: Docker sets neither for an image built
+  # without a `USER`, so this is the same root default as `""`.
+  defp default_user(%{"Config" => %{"User" => user}}) when is_binary(user), do: user
+  defp default_user(_body), do: ""
+
+  @doc false
+  # Public so the table of real-world version strings is assertable without a
+  # daemon: "26.1.4", "25.0.5-ce", "28.0.0-rc.1", and the patch-less "27.1".
+  @spec parse_version(term()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {:error, term()}
+  def parse_version(%{"Version" => version}) when is_binary(version) do
+    case Regex.run(~r/^v?(\d+)\.(\d+)(?:\.(\d+))?/, version) do
+      [_, major, minor, patch] -> {:ok, {int(major), int(minor), int(patch)}}
+      [_, major, minor] -> {:ok, {int(major), int(minor), 0}}
+      nil -> {:error, {:docker, {:unparseable_version, String.slice(version, 0, 64)}}}
+    end
+  end
+
+  def parse_version(_body), do: {:error, {:docker, {:unparseable_version, nil}}}
+
+  defp int(digits), do: String.to_integer(digits)
+
   # `:req_adapter` is a test seam, threaded in exactly as
   # CrowdControl.Backend.Kubernetes.API does it: a hermetic test supplies a
   # function that answers Engine API calls, and needs no daemon, no container,

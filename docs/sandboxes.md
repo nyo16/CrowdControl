@@ -468,6 +468,76 @@ to close the websocket — which makes the API server tear the exec down *before
 channel-3 status, so a write that failed reported success and the CLI started with no credentials.
 Reading exactly the payload makes the command self-terminating, so the status arrives on its own.
 
+## Sidecars that live next to the sandbox
+
+Compose stacks and Kubernetes `:services` can put other containers beside the sandbox. Two of
+them touch the machinery above directly — one reads the capture, one is driven by the agent —
+and `CrowdControl.Preset` ships both as plain service specs.
+
+### The log sidecar reads the capture and never writes it
+
+`CrowdControl.Preset.LogShipper` is a Vector sidecar that tails `/var/log/cc/out.jsonl`, redacts
+it and ships it. Everything above depends on the capture being append-only: its byte offsets are
+the resume cursor, and it is capped rather than rotated for exactly that reason. So the sidecar
+gets the capture directory **read-only** and nothing else of the sandbox's:
+
+- **Compose** — the sandbox and Vector mount the same declared volume (`:capture_volume`), the
+  sandbox read-write at the capture directory and Vector `read_only: true`. Vector `depends_on`
+  the sandbox so the directory is copied up with the sandbox's ownership first.
+- **Kubernetes** — only `placement: :pod` can see the capture: the sidecar mounts the sandbox's
+  own capture `emptyDir`, and `CrowdControl.Backend.Kubernetes.Services` refuses that mount
+  unless it is `read_only: true`. A `:separate` service cannot see it at all.
+
+Vector's checkpoints live on a Vector-only in-memory `/var/lib/vector`, never on the
+sandbox-writable volume, so code in the sandbox cannot rewrite them to skip lines. (On Compose
+that tmpfs is mounted `uid=,gid=` the Vector user, mode `0700`: the image ships the directory
+root-owned, and a non-root Vector could not start on it.) Lines up to
+`:max_line_bytes` (the session's own 1 MiB cap) are shipped, and acknowledgements are on, so a
+checkpoint advances only once the sink accepted the line. A sidecar never writes, truncates or
+rotates the capture; that is a plan invariant, not a preset default.
+
+On Kubernetes the only sink is `{:vector, address: "10.96.12.7:6000"}`, an in-cluster aggregator
+the sandbox's policy names. It is rendered as `http://<host>:<port>` — Vector 0.61's vector sink
+never connects to a bare `host:port` — and an `https://` address is refused, since the preset
+has no TLS settings to honour it with.
+
+**Drain.** The sandbox's last bytes land just before teardown, so a shipper killed at the same
+moment loses roughly the last two seconds. A service with `drain:` (ms; the preset sets `15_000`,
+which has to cover Vector's own delivery latency, measured at about 10 s on Kubernetes)
+and `shutdown_limit:` (seconds; default `20`) is stopped differently:
+
+- **Compose** — `release/1` waits the longest `drain` once, so the file source reaches EOF, then
+  sends `POST /containers/{id}/stop?t=<shutdown_limit + 5>` before the force-remove. The budget
+  is a container label, so a reaper-rebuilt handle drains the same way. A failed stop is logged
+  and never blocks removal, and a rolled-back `acquire/1` does not drain.
+- **Kubernetes** — the drained sidecar carries a `preStop` `sleep` of the drain (rounded up to
+  seconds; Kubernetes 1.30), and `destroy/1` deletes the Pod with a grace period of
+  `drain + shutdown_limit + 5` seconds instead of 0, so Vector gets SIGTERM after EOF and its own
+  graceful-shutdown limit before SIGKILL. The CLI gets the `SIGTERM` too. The Pod keeps running
+  through that grace, so `destroy/1` waits for it to be gone (grace plus 10 s) before deleting its
+  NetworkPolicies, and blocks that long: with the preset's defaults a drained destroy takes about
+  17 s, which is why `Session.stop/1` and `CrowdControl.stop_all/1` do not time out.
+
+Redaction (gitleaks-derived filters plus CrowdControl's `ccst_` and `ccpw_` tokens) runs on the
+raw line before parsing, and is best-effort — see [SECURITY.md](../SECURITY.md).
+
+### The browser sidecar is a second process the agent drives
+
+`CrowdControl.Preset.Browser` runs Chromium in its own container behind Playwright's
+`launchServer` (WebSocket on 3000, at the per-session path `/<ccpw_ token>`) and `playwright mcp`
+(HTTP on 8931, bound to the same browser). The agent reaches it as `ws://browser:3000/<token>` and
+`http://browser:8931/mcp`, through the env, inline MCP config and system-prompt line in
+`CrowdControl.Preset.Browser.sandbox_overrides/1`. It does not use the FIFO, the capture or the
+exec channel: its output reaches the transcript only as the agent's own tool results.
+
+It has `egress: :none` and sits on `sbx` with the sandbox and on `brw` with the forward proxy,
+so its only way out is `CrowdControl.Preset.EgressProxy`, which the sandbox cannot reach.
+`CrowdControl.Preset.browser_stack/1` wires the two for either substrate. On Kubernetes both are
+`placement: :separate`, peers resolve through `hostAliases`, and `:app_ports` lets the browser
+open a dev server in the sandbox as `sandbox:<port>`. Chromium needs a 1 GiB `/dev/shm` and an
+init, which the preset declares as resource overrides — no weakening. The service must be named
+`browser` with the example image, whose MCP server allows only `Host: browser:8931`.
+
 ## Where to go next
 
 - [architecture.md](architecture.md) — the four layers, what each is forbidden to know, the

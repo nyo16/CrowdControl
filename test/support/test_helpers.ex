@@ -14,8 +14,16 @@ defmodule CrowdControl.TestHelpers do
   end
 
   @doc """
-  Stop a session, tolerating mailbox congestion. Falls back to a hard
-  `Process.exit(pid, :kill)` if the GenServer.call times out.
+  Absolute path to the fake control-protocol CLI (an Elixir script run through
+  its `elixir` shebang) used by control-protocol tests.
+  """
+  def fake_control_cli_path do
+    Path.expand("../support/fake_control_cli.exs", __DIR__)
+  end
+
+  @doc """
+  Stop a session. `Session.stop/1` waits as long as the stop takes, so only a
+  session already dead (the stop exits) is caught; it is then killed for good.
   """
   def stop_session(pid) when is_pid(pid) do
     Session.stop(pid)

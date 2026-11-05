@@ -426,9 +426,12 @@ CrowdControl.run("Search the GitHub repo for issues",
   permission_mode: "bypassPermissions"
 )
 
-# Load multiple MCP configs
+# Load multiple MCP configs, or pass one inline (every server needs a "type")
 CrowdControl.run("Analyze the project",
-  mcp_config: ["/config/mcp_filesystem.json", "/config/mcp_github.json"],
+  mcp_config: [
+    "/config/mcp_filesystem.json",
+    %{"mcpServers" => %{"docs" => %{"type" => "http", "url" => "http://localhost:4000/mcp"}}}
+  ],
   permission_mode: "bypassPermissions"
 )
 
@@ -484,6 +487,97 @@ CrowdControl.run_many("Refactor this module for clarity", [
   [add_dir: "/path/to/project", model: "opus", max_budget_usd: 2.00]
 ])
 ```
+
+### Typed errors
+
+`run!/2` returns the result map or raises `CrowdControl.Error`; `classify/1`
+returns `{:ok, map}` or `{:error, error}` without raising, for a result you
+already have:
+
+```elixir
+try do
+  %{"result" => text} = CrowdControl.run!("Summarize this repo")
+  text
+rescue
+  e in CrowdControl.Error ->
+    case e.kind do
+      :api_error -> {:retry, e.reason.category}   # :rate_limit, :overloaded, ...
+      :max_budget_exceeded -> {:stop, e.reason.cost_usd}
+      _ -> reraise e, __STACKTRACE__
+    end
+end
+
+# Inside a receive loop: {:result, _, _} = result
+case CrowdControl.classify(result) do
+  {:ok, map} -> map["result"]
+  {:error, %CrowdControl.Error{kind: kind}} -> {:failed, kind}
+end
+```
+
+`CrowdControl.Error.kinds/0` lists every kind. Subscribers still receive the
+untyped `{:result, subtype, map}`.
+
+### Tool approval, interrupts and in-BEAM tools
+
+Claude Code only (CLI 2.1.268 or newer). Callbacks are `{module, function,
+extra_args}` tuples, never funs — session options are persisted, and a closure
+cannot be. Each is called as `apply(module, function, [request, context | extra_args])`.
+
+```elixir
+defmodule MyApp.Approver do
+  def can_use_tool(%{"tool_name" => "Bash"}, _ctx), do: :defer   # ask a human
+  def can_use_tool(%{"input" => input}, _ctx), do: {:allow, input}
+end
+
+{:ok, session} =
+  CrowdControl.start_session(
+    prompt: "Clean up the build directory",
+    can_use_tool: {MyApp.Approver, :can_use_tool, []},
+    permission_timeout: 600_000
+  )
+
+CrowdControl.Session.subscribe(session)
+
+receive do
+  {:crowd_control, ^session, {:control_request, id, "can_use_tool", _request}} ->
+    CrowdControl.Session.respond(session, id, {:deny, "not today"})
+end
+
+# Stop the turn in progress without killing the CLI
+{:ok, _} = CrowdControl.Session.interrupt(session)
+```
+
+A deferred request is re-sent to every new subscriber until answered. Callbacks
+can run more than once across a host restart, so make them idempotent by
+`context.request_id`.
+
+Tools served from the BEAM, without an MCP subprocess:
+
+```elixir
+server =
+  CrowdControl.SdkMcp.tool_server("app", [
+    %{
+      name: "lookup_order",
+      description: "Look up an order by id",
+      input_schema: %{"type" => "object", "properties" => %{"id" => %{"type" => "string"}}},
+      call: {MyApp.Tools, :lookup_order, []}   # returns {:ok, text} | {:error, text}
+    }
+  ])
+
+CrowdControl.run("Where is order 42?", sdk_mcp_servers: %{"app" => server})
+# the model sees the tool as mcp__app__lookup_order
+```
+
+Control requests arrive on a stream the sandbox can write to, so a hook's or a
+tool's arguments may be forged: each must authorize its own input. With
+`:can_use_tool` set, an SDK `tools/call` runs only after a matching allow in
+the same turn or when the tool is pre-approved (`:allowed_tools`,
+`bypassPermissions`, an `addRules` grant); anything else gets JSON-RPC
+`-32001`. `:max_pending_control` (default 64) bounds requests awaiting an
+answer. `SECURITY.md` has the details.
+
+See `CrowdControl.Session` for `:hooks`, `:on_control_request`,
+`:interrupt_grace`, `set_model/2` and `set_permission_mode/2`.
 
 ### Resource limits
 
@@ -1074,6 +1168,8 @@ CrowdControl.start_session(
 | `:pod_poll_ms` | 60s | Reader's idle Pod-liveness poll |
 | `:max_inflight_bytes` | 4 MiB | Reader backpressure watermark |
 | `:proxy_url`, `:session_token` | unset | Egress proxy — see [SECURITY.md](SECURITY.md#egress-proxy-contract) |
+| `:services` | `[]` | Sidecars, the same `CrowdControl.Service` specs Compose takes plus a **required** `placement` (`:pod`, `:separate`, `{:external, target}`); needs an explicit `:network` — see [docs/providers.md](docs/providers.md) |
+| `:sandbox_ports` | `[]` | The sandbox's own app ports a `:separate` service sharing `sbx` may reach as `sandbox:<port>` |
 
 Hardening:
 
@@ -1156,8 +1252,20 @@ RBAC the backend's identity needs, in `:namespace`:
 
     pods            create, get, list, delete
     pods/exec       create
-    events          list                    # only to explain a failed provision
-    networkpolicies create, get, delete     # only under network: :deny_all
+    pods/log        get                       # diagnostics on a failed provision
+    events          list                      # diagnostics on a failed provision
+    networkpolicies create, get, list, delete # under network: :deny_all, or with
+                                              # a placement: :separate service
+    services        create, get, list, delete # :separate services, :sandbox_ports
+    configmaps      create, get, list, delete # services with :files
+    secrets         create, get, list, delete # services with env
+
+`list` on `services`, `configmaps`, `secrets` and `networkpolicies` is the
+reaper's orphan sweep (`CrowdControl.Backend.Kubernetes.sweep_orphans/1`);
+grant it wherever the reaper runs this backend, even before any session uses
+`:services`. A service's `env` lives in a per-session Secret
+(`cc-<session_key>-<service>-env`) its container reads through
+`secretKeyRef`, so no literal value is in any Pod spec.
 
 **Namespace isolation is yours to provision, deliberately.** The backend runs
 every sandbox in `:namespace` and never creates, labels or deletes one: that
@@ -1474,18 +1582,38 @@ endpoints, so the stack is synthesized directly.
 |--------|---------|-------|
 | `:services` | `[]` | Sidecar specs; a spec named `:sandbox_service` *is* the sandbox |
 | `:sandbox_service` | `"sandbox"` | |
-| `:forwarder_service` / `:forwarder_image` | `"forwarder"` / `alpine/socat:1.8.1.3` | Always synthesized, never caller-supplied |
+| `:forwarder_service` / `:forwarder_image` | `"forwarder"` / `alpine/socat:1.8.1.3` | Always synthesized, never caller-supplied; runs as `nobody`, which Docker lets bind any `:agent_port` |
 | `:network` | `[internal: true, driver: "bridge"]` | |
 | `:volumes` | `[]` | Named volume **declarations**, created as `<project>-<name>` and destroyed with the stack. A service mounts one through its own `:volumes` — see [Mounting volumes](#mounting-volumes) |
 | `:ready` | `%{}` | Per-service healthchecks, gating start order |
 | `:project_name` | `cc-<session_key>` | |
-| `:proxy_service` | unset | Sidecar fronting the egress proxy |
+| `:proxy_service` | unset | Sidecar holding the Anthropic credential for the CLI (the API proxy — not the browser's forward proxy) |
+| `:networks` | `[]` | Extra internal networks, `[%{name: "brw"}]`; a service joins one through its own `networks:` (default `["sbx"]`) |
 | `:health_timeout` | `60_000` | |
 
-Agent and hardening options are the Docker provider's, and hardening applies to
-**every** container in the stack — there are deliberately no per-service
-overrides, because a sidecar quietly weaker than the sandbox it shares a network
-with is not a useful thing to express.
+Agent and hardening options are the Docker provider's, and hardening is the
+**default** for every container in the stack. A service may override it with
+`host_config:`: resource keys (`:shm_size`, `:init`, `:pids_limit`, `:memory`,
+`:cpus`, `:tmpfs`) freely, weakening keys (`:cap_add`, `no_new_privileges:
+false`, `readonly_rootfs: false`, a root `user:`) only when also named in its
+`weaken: [...]` list, and `privileged` never. Every image must be a valid
+reference and present on the daemon (the providers never pull); the provider
+inspects each one before creating anything. A sidecar with no `user:` whose
+image's default user isn't a numeric uid in `1..2147483647` (with a gid, if
+given, in `0..2147483647`; no `USER`, `root`, or a name such as `node` fails)
+needs a numeric `user:` or `weaken: [:user]`, and is created from the inspected
+image Id. An explicit `user:` name is trusted as written, as Docker resolves it,
+so a name the image maps to uid 0 runs as root undeclared. Per-service networks and any
+`egress: :allow` sidecar need Docker Engine ≥ 25.0.5 (CVE-2024-29018). See
+[docs/providers.md](docs/providers.md) for the rules.
+
+**A browser for the agent.** `CrowdControl.Preset.browser_stack/1` returns the
+strict two-tier layout — sandbox on `sbx`, a Playwright browser on `sbx` and
+`brw`, an allowlist forward proxy (Smokescreen) on `brw` plus the NAT bridge —
+as `{services, networks, sandbox_overrides}` for Compose or Kubernetes, and
+`CrowdControl.Preset.LogShipper` adds a redacting Vector sidecar over the
+capture. The network is the boundary; read
+[SECURITY.md](SECURITY.md#forward-proxy-contract) first.
 
 The sandbox sits on an `Internal: true` network with no port bindings at all: no
 default route exists, so the internet, the Docker host, sibling containers and
@@ -1580,7 +1708,7 @@ options — see `CrowdControl.Agent.Omp`.
 | `:no_session_persistence` | `true` to skip saving to disk |
 | `:settings` | Path to settings JSON file or inline JSON string |
 | `:setting_sources` | List of setting sources to load (`["user", "project", "local"]`) |
-| `:mcp_config` | Path to MCP config JSON file(s) (string or list) |
+| `:mcp_config` | MCP config file path(s) and/or inline `%{"mcpServers" => ...}` maps (one or a list); inline maps land in argv, so keep credentials out of them |
 | `:strict_mcp_config` | `true` to only use MCP servers from `:mcp_config` |
 | `:agents` | JSON string or map defining custom agents |
 | `:plugin_dir` | Path to a plugin directory |
@@ -1601,6 +1729,8 @@ options — see `CrowdControl.Agent.Omp`.
 | Function | Description |
 |----------|-------------|
 | `run(prompt, opts)` | Single-shot: start session, send prompt, collect result, stop |
+| `run!(prompt, opts)` | As `run/2`, returning the result map or raising `CrowdControl.Error` |
+| `classify(result)` | `{:ok, map}` or `{:error, %CrowdControl.Error{}}` for a `{:result, subtype, map}` |
 | `run_many(prompt, opts_list)` | Same prompt across N sessions with different options |
 | `start_session(opts)` | Start one supervised session (returns `{:error, :max_sessions_reached}` at limit) |
 | `start_sessions(opts_list)` | Start N sessions in parallel |
@@ -1619,7 +1749,24 @@ options — see `CrowdControl.Agent.Omp`.
 | `get_session_id(session)` | CLI-assigned session ID |
 | `get_messages(session)` | All accumulated messages |
 | `current_turn(session)` | Turn currently in flight (prompts written so far) |
+| `respond(session, request_id, decision)` | Answer a deferred control request |
+| `interrupt(session)` | End the turn in progress without killing the CLI |
+| `set_model(session, model)` / `set_permission_mode(session, mode)` | Change them for later turns |
+| `control(session, request, timeout)` | Send any control request (default timeout 60 s) |
+| `pending_requests(session)` | Control requests still awaiting an answer |
 | `stop(session)` | Graceful shutdown |
+
+### CrowdControl.Preset (service specs)
+
+Each returns plain service maps for Compose's or Kubernetes' `:services`, and
+raises `ArgumentError` on a bad option.
+
+| Function | Description |
+|----------|-------------|
+| `Preset.browser_stack(opts)` | Browser + forward proxy, wired: `{services, networks, sandbox_overrides}` for `substrate: :compose \| :kubernetes` |
+| `Preset.Browser.spec(opts)` | Chromium behind Playwright `launchServer` (3000) and `playwright mcp` (8931) |
+| `Preset.EgressProxy.spec(opts)` | Smokescreen hostname-allowlist forward proxy on 4750, the only `egress: :allow` service |
+| `Preset.LogShipper.spec(opts)` / `services(opts)` | Vector sidecar that tails, redacts and ships the capture |
 
 ### Message types
 
@@ -1635,6 +1782,9 @@ the same shape for every agent adapter:
 | `{:stream_event, map}` | Partial message delta (Claude Code: requires `:include_partial_messages`; omp: always) |
 | `{:timeout, :session_expired}` | Session timed out (requires `:timeout` option) |
 | `{:exit, status}` | CLI process exited with OS status code |
+| `{:control_request, id, subtype, request}` | A control callback deferred; answer with `respond/3` (re-sent on every `subscribe/1`) |
+| `{:control_cancelled, id}` | The CLI withdrew a pending control request |
+| `{:error, {:cli_version, have, need}}` | Claude Code is older than `CrowdControl.CLI.min_version/0`; the session stops |
 
 ## Architecture
 

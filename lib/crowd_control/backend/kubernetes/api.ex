@@ -81,6 +81,9 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   @pod_api [api_version: "v1", kind: "Pod"]
   @event_api [api_version: "v1", kind: "Event"]
   @netpol_api [api_version: "networking.k8s.io/v1", kind: "NetworkPolicy"]
+  @configmap_api [api_version: "v1", kind: "ConfigMap"]
+  @service_api [api_version: "v1", kind: "Service"]
+  @secret_api [api_version: "v1", kind: "Secret"]
 
   # kubereq raises rather than returns in several places: a malformed kubeconfig
   # (`Kubereq.Kubeconfig.load/1`, `Step.TLS.ca_cert!/1`), an unknown resource,
@@ -353,6 +356,70 @@ defmodule CrowdControl.Backend.Kubernetes.API do
     end
   end
 
+  @doc """
+  The API server's version as `{major, minor}` (`GET /version`).
+
+  Cached per `cluster_url/1` in `:persistent_term`, exactly like the
+  enforcement probe: a cluster does not change minor version under a live VM
+  often enough to pay a round trip per provision. Only a parsed answer is
+  cached.
+  """
+  @spec server_version(config()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}
+  def server_version(config) do
+    guard do
+      key = {__MODULE__, :server_version, cluster_url(config)}
+
+      case :persistent_term.get(key, nil) do
+        nil -> fetch_server_version(config, key)
+        version -> {:ok, version}
+      end
+    end
+  end
+
+  # `/version` is not a resource, so kubereq's operation step is switched off
+  # (`operation: nil`) — the same call kubereq makes for its own discovery —
+  # while its base-URL, auth and TLS steps still apply.
+  defp fetch_server_version(config, key) do
+    req = client(config, resource_path: "/version")
+
+    with {:ok, body} <- normalize(Req.request(req, method: :get, url: "/version", operation: nil)),
+         {:ok, version} <- parse_server_version(body) do
+      :persistent_term.put(key, version)
+      {:ok, version}
+    end
+  end
+
+  @doc false
+  # Public so the managed-cluster spellings are assertable without a cluster:
+  # GKE and EKS report `"minor": "30+"`, and `gitVersion` is the fallback.
+  @spec parse_server_version(term()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}
+  def parse_server_version(%{"major" => major, "minor" => minor} = body) do
+    case {leading_int(major), leading_int(minor)} do
+      {ma, mi} when is_integer(ma) and is_integer(mi) -> {:ok, {ma, mi}}
+      _ -> parse_server_version(Map.drop(body, ["major", "minor"]))
+    end
+  end
+
+  def parse_server_version(%{"gitVersion" => git}) when is_binary(git) do
+    case Regex.run(~r/^v?(\d+)\.(\d+)/, git) do
+      [_, ma, mi] -> {:ok, {String.to_integer(ma), String.to_integer(mi)}}
+      nil -> {:error, {:k8s, {:unparseable_version, String.slice(git, 0, 64)}}}
+    end
+  end
+
+  def parse_server_version(_body), do: {:error, {:k8s, {:unparseable_version, nil}}}
+
+  defp leading_int(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, _rest} when int >= 0 -> int
+      _ -> nil
+    end
+  end
+
+  defp leading_int(_value), do: nil
+
   # --- pods ---
 
   @doc "GET a Pod by name."
@@ -368,17 +435,19 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   end
 
   @doc """
-  DELETE a Pod with no grace period.
+  DELETE a Pod, with `grace` seconds before SIGKILL (default `0`).
 
   `kubereq` has no `DeleteOptions` option, so `gracePeriodSeconds` goes through
-  as a plain Req param. Zero because the sandbox holds no state worth draining
-  and a lingering terminating Pod is still a billed Pod.
+  as a plain Req param. Zero is the default because a bare sandbox holds no
+  state worth draining and a lingering terminating Pod is still a billed Pod. A
+  Pod with a drained sidecar (a log shipper that must flush) passes the budget
+  from `CrowdControl.Backend.Kubernetes.Drain.grace_seconds/1` instead.
   """
-  @spec delete_pod(config(), String.t()) :: {:ok, map()} | {:error, term()}
-  def delete_pod(config, name) do
+  @spec delete_pod(config(), String.t(), non_neg_integer()) :: {:ok, map()} | {:error, term()}
+  def delete_pod(config, name, grace \\ 0) when is_integer(grace) and grace >= 0 do
     run(fn ->
       Kubereq.delete(client(config, @pod_api), namespace(config), name,
-        params: [gracePeriodSeconds: 0]
+        params: [gracePeriodSeconds: grace]
       )
     end)
   end
@@ -646,6 +715,121 @@ defmodule CrowdControl.Backend.Kubernetes.API do
   @spec delete_network_policy(config(), String.t()) :: {:ok, map()} | {:error, term()}
   def delete_network_policy(config, name) do
     run(fn -> Kubereq.delete(client(config, @netpol_api), namespace(config), name) end)
+  end
+
+  @doc """
+  Every NetworkPolicy matching `label_selectors`, following `continue` to the
+  last page. The orphan sweep reads this as evidence of what exists, so it
+  carries `list_all/3`'s never-truncated contract.
+  """
+  @spec list_network_policies(config(), keyword() | [tuple()]) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_network_policies(config, label_selectors) do
+    list_labelled(config, @netpol_api, label_selectors)
+  end
+
+  # --- services ---
+
+  @doc "GET a Service by name."
+  @spec get_service(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def get_service(config, name) do
+    run(fn -> Kubereq.get(client(config, @service_api), namespace(config), name) end)
+  end
+
+  @doc """
+  POST a Service manifest. The created object carries the allocated
+  `spec.clusterIP`, which is what `hostAliases` are built from.
+  """
+  @spec create_service(config(), map()) :: {:ok, map()} | {:error, term()}
+  def create_service(config, manifest) do
+    run(fn -> Kubereq.create(client(config, @service_api), manifest) end)
+  end
+
+  @doc "DELETE a Service by name."
+  @spec delete_service(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def delete_service(config, name) do
+    run(fn -> Kubereq.delete(client(config, @service_api), namespace(config), name) end)
+  end
+
+  @doc """
+  Every Service matching `label_selectors`, following `continue` to the last
+  page, with `list_all/3`'s never-truncated contract.
+  """
+  @spec list_services(config(), keyword() | [tuple()]) :: {:ok, [map()]} | {:error, term()}
+  def list_services(config, label_selectors) do
+    list_labelled(config, @service_api, label_selectors)
+  end
+
+  # --- config maps ---
+
+  @doc "GET a ConfigMap by name."
+  @spec get_config_map(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def get_config_map(config, name) do
+    run(fn -> Kubereq.get(client(config, @configmap_api), namespace(config), name) end)
+  end
+
+  @doc "POST a ConfigMap manifest."
+  @spec create_config_map(config(), map()) :: {:ok, map()} | {:error, term()}
+  def create_config_map(config, manifest) do
+    run(fn -> Kubereq.create(client(config, @configmap_api), manifest) end)
+  end
+
+  @doc "DELETE a ConfigMap by name."
+  @spec delete_config_map(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def delete_config_map(config, name) do
+    run(fn -> Kubereq.delete(client(config, @configmap_api), namespace(config), name) end)
+  end
+
+  @doc """
+  Every ConfigMap matching `label_selectors`, following `continue` to the last
+  page — the same never-truncated contract as `list_all/3`, because the reaper
+  sweep reads this as the evidence of what exists.
+  """
+  @spec list_config_maps(config(), keyword() | [tuple()]) :: {:ok, [map()]} | {:error, term()}
+  def list_config_maps(config, label_selectors) do
+    list_labelled(config, @configmap_api, label_selectors)
+  end
+
+  # --- secrets ---
+
+  @doc "GET a Secret by name."
+  @spec get_secret(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def get_secret(config, name) do
+    run(fn -> Kubereq.get(client(config, @secret_api), namespace(config), name) end)
+  end
+
+  @doc "POST a Secret manifest."
+  @spec create_secret(config(), map()) :: {:ok, map()} | {:error, term()}
+  def create_secret(config, manifest) do
+    run(fn -> Kubereq.create(client(config, @secret_api), manifest) end)
+  end
+
+  @doc "DELETE a Secret by name."
+  @spec delete_secret(config(), String.t()) :: {:ok, map()} | {:error, term()}
+  def delete_secret(config, name) do
+    run(fn -> Kubereq.delete(client(config, @secret_api), namespace(config), name) end)
+  end
+
+  @doc """
+  Every Secret matching `label_selectors`, following `continue` to the last
+  page, with `list_all/3`'s never-truncated contract: the reaper sweep reads
+  it as the evidence of what exists.
+  """
+  @spec list_secrets(config(), keyword() | [tuple()]) :: {:ok, [map()]} | {:error, term()}
+  def list_secrets(config, label_selectors) do
+    list_labelled(config, @secret_api, label_selectors)
+  end
+
+  defp list_labelled(config, resource, label_selectors) do
+    guard do
+      paginate(
+        client(config, resource),
+        namespace(config),
+        [label_selectors: label_selectors],
+        nil,
+        []
+      )
+    end
   end
 
   # --- exec ---

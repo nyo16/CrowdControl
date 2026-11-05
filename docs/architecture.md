@@ -248,18 +248,94 @@ back to `:running`. Only `exited: true`, set on `:eof`, is really terminal.
 **Destroy happens before the `{:exit, _}` broadcast**, so a subscriber that receives it is entitled to
 assume the sandbox and its env file are already gone.
 
+## The control protocol
+
+An agent with the `:control` capability (today only `CrowdControl.Agent.ClaudeCode`) speaks the
+stream-json control protocol alongside its messages. The session switches it on when any of
+`:can_use_tool`, `:hooks`, `:sdk_mcp_servers` or `:on_control_request` is set; omp has no such
+channel and its control APIs return `{:error, :unsupported}`.
+
+**Frames handled.** `control_request` from the CLI (`can_use_tool`, `hook_callback`, `mcp_message`,
+anything else via `:on_control_request`), `control_response` to the session's own requests
+(`initialize`, `interrupt`, `set_model`, `set_permission_mode`, `Session.control/3`), and
+`control_cancel_request`. `keep_alive` is dropped. None of these is stored or broadcast: a subscriber
+sees `{:control_request, id, subtype, request}` only when a callback defers, and
+`{:control_cancelled, id}` when the CLI withdraws one.
+
+**Requests are untrusted input.** Control frames come from the CLI's stdout — on a remote backend the
+capture file — which model-driven code can write to, so any `control_request` may be forged and
+cannot be authenticated. Hooks, `:on_control_request` and SDK tools therefore get
+sandbox-controllable input and must authorize their own arguments. The capture is only partly trusted
+while model code shares the CLI's uid: a captured line is the sandbox's word, not the CLI's.
+
+**SDK tool gate.** With `:can_use_tool` set, `Control.gate/4` runs an MCP `tools/call` only when the
+CLI would have let the model make it: a `can_use_tool` allow for `mcp__<server>__<tool>` answered
+earlier in the turn whose `updatedInput` equals the call's arguments (one call per allow; leftovers
+are cleared at the turn's result), or a pre-approved tool — an `:allowed_tools` match (exact,
+`mcp__<server>` or `mcp__<server>__*`), permission mode `bypassPermissions` (from `:permission_mode`,
+a `setMode` update in an allow, or an acknowledged `set_permission_mode`), or a bare `addRules` allow
+granted this session. Anything else is answered with JSON-RPC `-32001` `"tool call not approved"` and
+a decision event with `source: :gate`. The gate's state (mode, granted tools, unused allows) is
+persisted with the pending set, so it survives reattach. Hooks have no gate.
+
+**Pending cap.** At most `:max_pending_control` (default 64) requests are pending at once. Past it a
+new request is answered immediately with an error (a deny for `can_use_tool`, with a decision event
+`source: :cap`; a JSON-RPC error for `mcp_message`) and never persisted, so a forged flood bounds
+memory and store writes alike; the first refusal per turn is logged.
+
+**Persist before dispatch.** An incoming request is entered into the pending set and the record is
+written to the store *before* its callback is started. A node that dies between the two leaves a
+request the reattached session still knows about; the reverse order would leave one nobody answers.
+
+**Callbacks run under `CrowdControl.CallbackSupervisor`**, monitored rather than linked, because a
+`:can_use_tool` callback may block on a human while the session has to keep reading stdout. Each task
+monitors its session in turn and runs the user's MFA in a linked inner process, so a callback still
+running when the session dies, however it dies, dies with it. A crash becomes a deny
+(`"callback crashed"`), a malformed return a deny (`"invalid callback decision"`), and a decision that
+cannot be encoded as JSON a deny (`"unencodable decision"`); nothing a callback returns can raise
+inside the session. Callbacks are MFA tuples, never funs: they live in the persisted opts, and a
+closure cannot be. For the same reason a fun, pid, reference or port anywhere in `extra_args` raises
+`ArgumentError` at start — persisted arguments must be plain data.
+
+**Reattach recovery.** The reattached session re-sends `initialize`. For permission requests the CLI's
+`pending_permission_requests` is the truth; hooks are dispatched again; an in-flight `mcp_message` is
+re-run only when its tool is declared `idempotent: true`, and otherwise answered with JSON-RPC
+`-32603` ("host restarted; call state unknown"). The consequence for callers: **callbacks are
+at-least-once** and must be idempotent by `request_id`, while responses are idempotent — answering an
+already-answered `request_id` through `Session.respond/3` is a no-op.
+
+**Timers.**
+
+* The turn timer pauses while a permission request or a deferred hook is waiting, so time spent on a
+  human does not count against `:timeout`.
+* `:permission_timeout` (default `:infinity`) denies an unanswered permission request with
+  `"permission timed out"`.
+* At the turn deadline an `:interrupt`-capable agent is sent `interrupt` first and destroyed only if
+  no result arrives within `:interrupt_grace` (30 s with a control feature on, else 0). omp is
+  destroyed at the deadline as before.
+* A reattached session — any reattachable session, control features or not — re-arms its deadline
+  from the persisted wall-clock time rather than starting a fresh one.
+
+**Version gate.** Control needs Claude Code `CrowdControl.CLI.min_version/0` or newer.
+`Backend.Local` checks `claude --version` before spawning when its output reads `X.Y.Z (Claude
+Code)`; every backend checks `claude_code_version` in `system/init`, which only arrives after the first
+user message, and broadcasts `{:error, {:cli_version, have, need}}` before stopping.
+`mix crowd_control.contract` checks a binary's flags and control frames against what the library
+assumes.
+
 ## The supervision tree
 
 CrowdControl.Application's start/2 installs `CrowdControl.LogRedactor` before starting any child —
 a rejected exec upgrade makes kubereq's connection process crash with the whole `%Req.Request{}`,
-kubeconfig included, as its last message — then starts exactly three children under
+kubeconfig included, as its last message — then starts exactly four children under
 `CrowdControl.Supervisor` with `strategy: :one_for_one`:
 
 | Order | Child | Why here |
 |---|---|---|
 | 1 | the configured `CrowdControl.Store` | must be up before any session can persist to it |
-| 2 | `DynamicSupervisor` named `CrowdControl.SessionSupervisor`, `max_children: max_sessions` | holds every session; `:max_sessions` defaults to 50 and `fetch_max_sessions!/0` raises on a non-positive integer |
-| 3 | `CrowdControl.Reaper` | **last**, because its boot reconciliation starts sessions under the supervisor above |
+| 2 | `Task.Supervisor` named `CrowdControl.CallbackSupervisor` | control callbacks run here, and must have a home before a session can dispatch one |
+| 3 | `DynamicSupervisor` named `CrowdControl.SessionSupervisor`, `max_children: max_sessions` | holds every session; `:max_sessions` defaults to 50 and `fetch_max_sessions!/0` raises on a non-positive integer |
+| 4 | `CrowdControl.Reaper` | **last**, because its boot reconciliation starts sessions under the supervisor above |
 
 `start_session/1` maps `{:error, :max_children}` to `{:error, :max_sessions_reached}`, so the
 `max_children` cap surfaces as a named condition rather than a supervisor internal.

@@ -82,6 +82,17 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
                gate(services: [%{name: "proxy", egress: :none}])
     end
 
+    test "an {:external, _} placement buys no image here: placement is ignored, so it is a container" do
+      external = %{
+        name: "aggregator",
+        egress: :none,
+        ports: [6000],
+        placement: {:external, %{ip_block: "10.0.0.0/8"}}
+      }
+
+      assert {:error, {:compose, {:image_required, "aggregator"}}} = gate(services: [external])
+    end
+
     test "refuses duplicate service names" do
       specs = [
         %{name: "proxy", image: "i", egress: :none},
@@ -495,14 +506,26 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       assert "ANTHROPIC_API_KEY=sk-real-secret" in proxy_env
       assert ["CC_SESSION_TOKEN=" <> token] = Enum.filter(proxy_env, &(&1 =~ "CC_SESSION_TOKEN"))
       assert ("ANTHROPIC_API_KEY=" <> token) in sandbox_env
+
+      # Prefixed, so a log shipper's redaction can find it (B6.4).
+      assert "ccst_" <> random = token
+      assert byte_size(random) == 43
     end
 
     test "an explicit :session_token is used rather than a minted one", %{specs: specs} do
       {_handle, _endpoint, requests} =
-        acquire!(services: specs, proxy_service: "proxy", session_token: "sess-123")
+        acquire!(services: specs, proxy_service: "proxy", session_token: "ccst_sess-123")
 
-      assert "CC_SESSION_TOKEN=sess-123" in container_body(requests, "proxy")["Env"]
-      assert "ANTHROPIC_API_KEY=sess-123" in container_body(requests, "sandbox")["Env"]
+      assert "CC_SESSION_TOKEN=ccst_sess-123" in container_body(requests, "proxy")["Env"]
+      assert "ANTHROPIC_API_KEY=ccst_sess-123" in container_body(requests, "sandbox")["Env"]
+    end
+
+    test "an explicit :session_token without the ccst_ prefix is refused before any HTTP",
+         %{specs: specs} do
+      for token <- ["sess-123", "CCST_x", " ccst_x", :ccst_x] do
+        assert {:error, {:compose, {:bad_session_token, :prefix}}} =
+                 gate(services: specs, proxy_service: "proxy", session_token: token)
+      end
     end
 
     test "with no :proxy_service the environment is untouched, real key included" do
@@ -685,6 +708,132 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
     test "a service with no mounts gets no Binds key at all" do
       {_handle, _endpoint, requests} = acquire!([])
       refute Map.has_key?(container_body(requests, "sandbox")["HostConfig"], "Binds")
+    end
+  end
+
+  describe "the capture file (blocker: a sidecar rewriting the transcript)" do
+    setup do
+      sandbox = %{name: "sandbox", volumes: [%{name: "cclog", target: "/var/log/cc"}]}
+      {:ok, sandbox: sandbox}
+    end
+
+    test "a read-only mount of the capture volume is accepted", %{sandbox: sandbox} do
+      shipper = %{
+        name: "vector",
+        image: "vector:1",
+        egress: :none,
+        volumes: [%{name: "cclog", target: "/in", read_only: true}]
+      }
+
+      {_handle, _endpoint, requests} =
+        acquire!(services: [sandbox, shipper], volumes: [%{name: "cclog"}])
+
+      assert container_body(requests, "vector")["HostConfig"]["Binds"] == [
+               "#{@project}-cclog:/in:ro"
+             ]
+    end
+
+    test "a writable mount of the capture source is refused, at any target",
+         %{sandbox: sandbox} do
+      for target <- ["/var/log/cc", "/elsewhere"] do
+        shipper = %{
+          name: "vector",
+          image: "vector:1",
+          egress: :none,
+          volumes: [%{name: "cclog", target: target}]
+        }
+
+        assert {:error, {:compose, {:capture_mount_writable, "vector"}}} =
+                 gate(services: [sandbox, shipper], volumes: [%{name: "cclog"}])
+      end
+    end
+
+    test "a writable host path shared with the sandbox's capture is refused" do
+      sandbox = %{name: "sandbox", volumes: [%{host_path: "/srv/cap", target: "/var/log/cc"}]}
+
+      shipper = %{
+        name: "vector",
+        image: "vector:1",
+        egress: :none,
+        volumes: [%{host_path: "/srv/cap", target: "/in"}],
+        weaken: [:host_path]
+      }
+
+      assert {:error, {:compose, {:capture_mount_writable, "vector"}}} =
+               gate(services: [sandbox, shipper])
+
+      ro = put_in(shipper, [:volumes], [%{host_path: "/srv/cap", target: "/in", read_only: true}])
+      assert {{:ok, _, _}, _} = acquire(services: [sandbox, ro])
+    end
+
+    test "the check follows a custom :capture_path" do
+      sandbox = %{name: "sandbox", volumes: [%{name: "cclog", target: "/cap"}]}
+
+      shipper = %{
+        name: "vector",
+        image: "vector:1",
+        egress: :none,
+        volumes: [%{name: "cclog", target: "/in"}]
+      }
+
+      opts = [services: [sandbox, shipper], volumes: [%{name: "cclog"}]]
+
+      assert {{:ok, _, _}, _} = acquire(opts)
+
+      assert {:error, {:compose, {:capture_mount_writable, "vector"}}} =
+               gate([capture_path: "/cap/out.jsonl"] ++ opts)
+    end
+
+    test ":files staged into the capture volume are refused, on any service",
+         %{sandbox: sandbox} do
+      file = %{path: "/in/out.jsonl", content: "{}\n"}
+
+      # A sidecar's writable mount is refused first; a read-only one cannot
+      # take files at all. Either way nothing is staged into the capture.
+      writer = %{
+        name: "seed",
+        image: "seed:1",
+        egress: :none,
+        volumes: [%{name: "cclog", target: "/in"}],
+        files: [file]
+      }
+
+      assert {:error, {:compose, {:capture_mount_writable, "seed"}}} =
+               gate(services: [sandbox, writer], volumes: [%{name: "cclog"}])
+
+      seeded = Map.put(sandbox, :files, [%{path: "/var/log/cc/out.jsonl", content: "{}\n"}])
+
+      assert {:error, {:compose, {:capture_mount_writable, "sandbox"}}} =
+               gate(services: [seeded], volumes: [%{name: "cclog"}])
+    end
+
+    test "with no capture mount, the sandbox still may not pre-seed the capture" do
+      seeded = %{name: "sandbox", files: [%{path: "/var/log/cc/out.jsonl", content: "{}\n"}]}
+
+      assert {:error, {:compose, {:capture_mount_writable, "sandbox"}}} =
+               gate(services: [seeded])
+    end
+  end
+
+  describe "host paths (blocker: a sidecar with the host filesystem, undeclared)" do
+    test "a sidecar host_path mount needs weaken: [:host_path], read-only or not" do
+      for read_only <- [false, true] do
+        spec = %{
+          name: "db",
+          image: "db:1",
+          egress: :none,
+          volumes: [%{host_path: "/srv/in", target: "/in", read_only: read_only}]
+        }
+
+        assert {:error, {:compose, {:weakening_not_declared, {"db", :host_path}}}} =
+                 gate(services: [spec])
+
+        {_handle, _endpoint, requests} =
+          acquire!(services: [Map.put(spec, :weaken, [:host_path])])
+
+        suffix = if read_only, do: ":ro", else: ""
+        assert container_body(requests, "db")["HostConfig"]["Binds"] == ["/srv/in:/in" <> suffix]
+      end
     end
   end
 
@@ -980,7 +1129,240 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       {_handle, _endpoint, requests} = acquire!(services: specs)
 
       assert container_body(requests, "proxy")["User"] == "1000:1000"
-      refute Map.has_key?(container_body(requests, "forwarder"), "User")
+      refute Map.has_key?(container_body(requests, "sandbox"), "User")
+    end
+  end
+
+  describe "images (blocker: a root sidecar nobody declared, or an image that isn't there)" do
+    test "a sidecar image default user is refused unless it is a numeric uid in Docker's range, non-zero" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
+
+      for user <- [
+            "",
+            "0",
+            "00",
+            "0:0",
+            "0:1000",
+            "+0",
+            "-0",
+            ":1000",
+            "1000:",
+            "root",
+            "nginx",
+            "2147483648",
+            "1000:2147483648",
+            "99999999999999999999"
+          ] do
+        routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", user)}}
+
+        assert {{:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}}, requests} =
+                 acquire(services: specs, routes: routes),
+               "user #{inspect(user)}"
+
+        refute Enum.any?(requests, &(&1.method == :post))
+      end
+    end
+
+    test "a numeric non-zero uid is accepted and left to the image" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
+
+      for user <- ["1000", "1000:1000", "2147483647", "1000:2147483647", "1000:0"] do
+        routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", user)}}
+
+        assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
+        refute Map.has_key?(container_body(requests, "proxy"), "User")
+      end
+    end
+
+    test "a null User or a missing Config is the root default" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
+      id = image_id("proxy:1")
+
+      for body <- [%{"Id" => id, "Config" => %{"User" => nil}}, %{"Id" => id}] do
+        routes = %{{:get, "/images/proxy:1/json"} => {200, body}}
+
+        assert {{:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}}, requests} =
+                 acquire(services: specs, routes: routes)
+
+        refute Enum.any?(requests, &(&1.method == :post))
+      end
+    end
+
+    test "an inspect answer with no Id is an error, with no create" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
+      routes = %{{:get, "/images/proxy:1/json"} => {200, %{}}}
+
+      assert {{:error, {:docker, {:unexpected_body, "/images/proxy:1/json"}}}, requests} =
+               acquire(services: specs, routes: routes)
+
+      refute Enum.any?(requests, &(&1.method == :post))
+    end
+
+    test "weaken: [:user] accepts the root default; the image is still checked for existence" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :none, weaken: [:user]}]
+      routes = %{{:get, "/images/proxy:1/json"} => {200, image_json("proxy:1", "")}}
+
+      assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
+      assert find(requests, :get, "/images/proxy:1/json")
+      refute Map.has_key?(container_body(requests, "proxy"), "User")
+    end
+
+    test "every distinct image is inspected once, in service order, before anything else" do
+      specs = [
+        %{name: "proxy", image: "registry.test:5000/team/proxy:1", egress: :none},
+        %{name: "db", image: "shared:1", egress: :none},
+        %{name: "cache", image: "shared:1", egress: :none, user: "1000:1000"}
+      ]
+
+      {_handle, _endpoint, requests} = acquire!(services: specs)
+
+      assert for(r <- requests, String.starts_with?(r.path, "/images/"), do: r.path) == [
+               "/images/sandbox:dev/json",
+               "/images/registry.test:5000/team/proxy:1/json",
+               "/images/shared:1/json",
+               "/images/alpine/socat:1.8.1.3/json"
+             ]
+
+      first_other = Enum.find_index(requests, &(not String.starts_with?(&1.path, "/images/")))
+      assert first_other == 4
+    end
+
+    test "a missing sandbox, forwarder or sidecar image is image_not_found, with no create" do
+      missing = {404, %{"message" => "No such image"}}
+
+      sidecars = [
+        %{name: "db", image: "shared:1", egress: :none},
+        %{name: "cache", image: "shared:1", egress: :none}
+      ]
+
+      for {image, opts, name} <- [
+            {"sandbox:dev", [], "sandbox"},
+            {"alpine/socat:1.8.1.3", [], "forwarder"},
+            {"fwd:1", [forwarder_image: "fwd:1", forwarder_service: "fwd"], "fwd"},
+            {"shared:1", [services: sidecars], "db"}
+          ] do
+        routes = %{{:get, "/images/#{image}/json"} => missing}
+
+        assert {{:error, {:compose, {:image_not_found, {^name, ^image}}}}, requests} =
+                 acquire([routes: routes] ++ opts)
+
+        refute Enum.any?(requests, &(&1.method == :post))
+      end
+    end
+
+    test "any other inspect failure is returned as-is, with no create" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :none}]
+      routes = %{{:get, "/images/proxy:1/json"} => {500, %{"message" => "boom"}}}
+
+      assert {{:error, {:docker, {:http_status, 500, "boom"}}}, requests} =
+               acquire(services: specs, routes: routes)
+
+      refute Enum.any?(requests, &(&1.method == :post))
+    end
+
+    test "a sidecar whose default user was checked is created from the inspected Id" do
+      specs = [
+        %{name: "proxy", image: "proxy:1", egress: :none},
+        %{name: "db", image: "db:1", egress: :none, user: "1000:1000"},
+        %{name: "cache", image: "cache:1", egress: :none, weaken: [:user]}
+      ]
+
+      {_handle, _endpoint, requests} = acquire!(services: specs)
+
+      assert container_body(requests, "proxy")["Image"] == image_id("proxy:1")
+      assert container_body(requests, "db")["Image"] == "db:1"
+      assert container_body(requests, "cache")["Image"] == "cache:1"
+      assert container_body(requests, "sandbox")["Image"] == "sandbox:dev"
+      assert container_body(requests, "forwarder")["Image"] == "alpine/socat:1.8.1.3"
+    end
+
+    test "a shared image is inspected once and still checked for the service that needs it" do
+      # The exempt service comes first, so a check made only on an image's
+      # first inspect would never see the bare sidecar.
+      variants = [
+        {[image: "shared:1"], [%{name: "db", image: "shared:1", egress: :none}], "sandbox"},
+        {[],
+         [
+           %{name: "cache", image: "shared:1", egress: :none, user: "1000:1000"},
+           %{name: "db", image: "shared:1", egress: :none}
+         ], "cache"}
+      ]
+
+      for {opts, specs, exempt} <- variants do
+        root = %{{:get, "/images/shared:1/json"} => {200, image_json("shared:1", "")}}
+
+        assert {{:error, {:compose, {:weakening_not_declared, {"db", :user}}}}, requests} =
+                 acquire([services: specs, routes: root] ++ opts)
+
+        assert Enum.count(requests, &(&1.path == "/images/shared:1/json")) == 1
+        refute Enum.any?(requests, &(&1.method == :post))
+
+        non_root = %{{:get, "/images/shared:1/json"} => {200, image_json("shared:1", "1000")}}
+
+        assert {{:ok, _handle, _endpoint}, requests} =
+                 acquire([services: specs, routes: non_root] ++ opts)
+
+        assert Enum.count(requests, &(&1.path == "/images/shared:1/json")) == 1
+        assert container_body(requests, "db")["Image"] == image_id("shared:1")
+        assert container_body(requests, exempt)["Image"] == "shared:1"
+      end
+    end
+
+    test "a sidecar with an explicit user: is inspected, then created by name with that user" do
+      specs = [%{name: "db", image: "db:1", egress: :none, user: "1000:1000"}]
+      routes = %{{:get, "/images/db:1/json"} => {200, image_json("db:1", "")}}
+
+      assert {{:ok, _handle, _endpoint}, requests} = acquire(services: specs, routes: routes)
+
+      assert Enum.count(requests, &(&1.path == "/images/db:1/json")) == 1
+      assert container_body(requests, "db")["Image"] == "db:1"
+      assert container_body(requests, "db")["User"] == "1000:1000"
+    end
+
+    test "the sandbox is exempt by role, and the forwarder has an explicit user" do
+      routes = %{
+        {:get, "/images/sandbox:dev/json"} => {200, image_json("sandbox:dev", "")},
+        {:get, "/images/alpine/socat:1.8.1.3/json"} =>
+          {200, image_json("alpine/socat:1.8.1.3", "")}
+      }
+
+      assert {{:ok, _handle, _endpoint}, requests} = acquire(routes: routes)
+
+      for path <- ["/images/sandbox:dev/json", "/images/alpine/socat:1.8.1.3/json"] do
+        assert Enum.count(requests, &(&1.method == :get and &1.path == path)) == 1, path
+      end
+    end
+
+    test "an image that isn't a reference is refused before any HTTP" do
+      for image <- ["a?b", "a#b", "a b", "../x", "A/B"] do
+        assert {:error, {:compose, {:bad_service, {"db", :image}}}} =
+                 gate(services: [%{name: "db", image: image, egress: :none}])
+
+        assert {:error, {:compose, {:bad_service, {"sandbox", :image}}}} = gate(image: image)
+
+        assert {:error, {:compose, {:bad_service, {"forwarder", :image}}}} =
+                 gate(forwarder_image: image)
+      end
+
+      assert {:error, {:compose, {:bad_service, {"forwarder", :image}}}} =
+               gate(forwarder_image: "")
+    end
+
+    test "the forwarder runs as nobody" do
+      {_handle, _endpoint, requests} = acquire!([])
+
+      assert container_body(requests, "forwarder")["User"] == "65534:65534"
+    end
+
+    test "any TCP port is an :agent_port, privileged ones included" do
+      {_handle, _endpoint, requests} = acquire!(agent_port: 80)
+
+      assert container_body(requests, "forwarder")["ExposedPorts"] == %{"80/tcp" => %{}}
+
+      for port <- [0, 65_536, "8080"] do
+        assert {:error, {:compose, {:bad_agent_port, {"fwd", ^port}}}} =
+                 gate(agent_port: port, forwarder_service: "fwd")
+      end
     end
   end
 
@@ -1000,6 +1382,609 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       routes = %{{:post, "/networks/create"} => {409, %{"message" => "already exists"}}}
 
       assert {{:ok, _handle, _endpoint}, _requests} = acquire(routes: routes)
+    end
+  end
+
+  describe "version gate (blocker: CVE-2024-29018 DNS exfiltration from an internal network)" do
+    test "an :allow sidecar on a daemon below 25.0.5 creates nothing" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :allow}]
+      routes = %{{:get, "/version"} => {200, %{"Version" => "25.0.4"}}}
+
+      assert {{:error, {:version, :docker, {25, 0, 4}, {25, 0, 5}}}, requests} =
+               acquire(services: specs, docker_host: unique_host(), routes: routes)
+
+      assert [{:get, "/images/" <> _} | _] = Enum.map(requests, &{&1.method, &1.path})
+      assert List.last(requests).path == "/version"
+      refute Enum.any?(requests, &(&1.method == :post))
+    end
+
+    test "per-service networks are gated the same way" do
+      routes = %{{:get, "/version"} => {200, %{"Version" => "24.0.9"}}}
+
+      assert {{:error, {:version, :docker, {24, 0, 9}, {25, 0, 5}}}, requests} =
+               acquire(networks: [%{name: "brw"}], docker_host: unique_host(), routes: routes)
+
+      refute Enum.any?(requests, &(&1.method == :post))
+    end
+
+    test "a stack with no gated feature never asks for the version" do
+      {_handle, _endpoint, requests} = acquire!(docker_host: unique_host())
+
+      refute find(requests, :get, "/version")
+    end
+
+    test "an unreachable /version is a failed gate, not an assumed pass" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :allow}]
+      routes = %{{:get, "/version"} => {500, %{"message" => "boom"}}}
+
+      assert {{:error, {:docker, {:http_status, 500, "boom"}}}, requests} =
+               acquire(services: specs, docker_host: unique_host(), routes: routes)
+
+      refute Enum.any?(requests, &(&1.method == :post))
+    end
+  end
+
+  describe "CrowdControl.Service on Compose (blocker: two substrates drifting on one spec)" do
+    test "placement is Kubernetes-only and ignored with a warning" do
+      specs = [%{name: "db", image: "db:1", egress: :none, placement: :pod}]
+
+      log = capture_log(fn -> assert {{:ok, _, _}, _} = acquire(services: specs) end)
+
+      assert log =~ "placement"
+      assert log =~ "db"
+    end
+
+    test "a service's own ready: becomes its healthcheck" do
+      specs = [
+        %{
+          name: "db",
+          image: "db:1",
+          egress: :none,
+          ready: %{test: ["CMD", "true"], interval_ms: 10, timeout_ms: 10, retries: 1}
+        }
+      ]
+
+      {_handle, _endpoint, requests} = acquire!(services: specs)
+
+      assert container_body(requests, "db")["Healthcheck"]["Test"] == ["CMD", "true"]
+    end
+  end
+
+  describe ":files (blocker: configuration that never reaches the container)" do
+    test "files are uploaded as a tar between create and start" do
+      specs = [
+        %{
+          name: "proxy",
+          image: "proxy:1",
+          egress: :none,
+          files: [
+            %{
+              path: "/cfg/config.yaml",
+              content: "acl_file: /cfg/acl.yaml\n",
+              mode: 0o440,
+              uid: 65_532
+            },
+            %{path: "/cfg/acl.yaml", content: "allowed_domains: []\n"}
+          ]
+        }
+      ]
+
+      {_handle, _endpoint, requests} = acquire!(services: specs)
+
+      upload = find(requests, :put, "/containers/ctr-proxy/archive")
+      assert upload.query == %{"path" => "/"}
+
+      create = index(requests, :post, "/containers/create", "proxy")
+      put = index(requests, :put, "/containers/ctr-proxy/archive")
+      start = index(requests, :post, "/containers/ctr-proxy/start")
+      assert create < put and put < start
+
+      assert {:ok, entries} = :erl_tar.extract({:binary, upload.body}, [:memory])
+
+      assert Enum.sort(entries) == [
+               {~c"cfg/acl.yaml", "allowed_domains: []\n"},
+               {~c"cfg/config.yaml", "acl_file: /cfg/acl.yaml\n"}
+             ]
+
+      assert {:ok, table} = :erl_tar.table({:binary, upload.body}, [:verbose])
+
+      assert {_, :regular, _, _, 0o440, 65_532, 0} =
+               List.keyfind(table, ~c"cfg/config.yaml", 0)
+
+      assert {_, :regular, _, _, 0o644, 0, 0} = List.keyfind(table, ~c"cfg/acl.yaml", 0)
+    end
+
+    test "a service without files makes no upload" do
+      {_handle, _endpoint, requests} = acquire!([])
+      refute Enum.any?(requests, &(&1.method == :put))
+    end
+
+    test "a file under a writable volume is uploaded into that volume" do
+      specs = [
+        %{
+          name: "vector",
+          image: "vector:1",
+          egress: :none,
+          volumes: [%{name: "cfg", target: "/etc/vector"}],
+          files: [%{path: "/etc/vector/conf.d/vector.yaml", content: "sources: {}\n"}]
+        }
+      ]
+
+      {_handle, _endpoint, requests} =
+        acquire!(services: specs, volumes: [%{name: "cfg"}], readonly_rootfs: true)
+
+      upload = find(requests, :put, "/containers/ctr-vector/archive")
+      assert upload.query == %{"path" => "/etc/vector"}
+
+      assert {:ok, [{~c"conf.d/vector.yaml", "sources: {}\n"}]} =
+               :erl_tar.extract({:binary, upload.body}, [:memory])
+    end
+
+    test "the daemon's 403 cases are refused before any HTTP" do
+      ro_mount = [%{name: "cfg", target: "/cfg", read_only: true}]
+
+      cases = [
+        # Read-only rootfs and no volume under the path.
+        {[readonly_rootfs: true], %{}, []},
+        # A read-only mount.
+        {[], %{}, ro_mount},
+        # Read-only only for this service.
+        {[], %{readonly_rootfs: true}, []},
+        # Under a tmpfs, which hides the file once it mounts.
+        {[], %{tmpfs: %{"/cfg" => "rw,noexec,nosuid"}}, []}
+      ]
+
+      for {stack, host_config, volumes} <- cases do
+        spec = %{
+          name: "proxy",
+          image: "proxy:1",
+          egress: :none,
+          host_config: host_config,
+          volumes: volumes,
+          files: [%{path: "/cfg/a.yaml", content: "x"}]
+        }
+
+        opts = [services: [spec], volumes: [%{name: "cfg"}]] ++ stack
+
+        assert {:error, {:compose, {:files_not_writable, {"proxy", "/cfg/a.yaml"}}}} =
+                 gate(opts)
+      end
+    end
+
+    test "malformed files are refused before any HTTP" do
+      for {files, reason} <- [
+            {[%{path: "cfg/a", content: ""}], {:bad_file, {"proxy", "cfg/a"}}},
+            {[%{path: "/cfg/../etc/passwd", content: ""}],
+             {:bad_file, {"proxy", "/cfg/../etc/passwd"}}},
+            {[%{path: "/a", content: ""}, %{path: "/a", content: ""}],
+             {:duplicate_file, {"proxy", "/a"}}},
+            {[%{path: "/a", content: :binary.copy("x", 1_048_577)}],
+             {:files_too_large, {"proxy", 1_048_577}}}
+          ] do
+        spec = %{name: "proxy", image: "proxy:1", egress: :none, files: files}
+        assert {:error, {:compose, ^reason}} = gate(services: [spec])
+      end
+    end
+
+    test "scrub/1 drops files along with env" do
+      specs = [
+        %{name: "db", image: "db:1", egress: :none, files: [%{path: "/a", content: "big"}]}
+      ]
+
+      {handle, _endpoint, _requests} = acquire!(services: specs)
+
+      assert [spec] = Compose.scrub(handle).config[:services]
+      refute Map.has_key?(spec, :files)
+    end
+
+    test "archive/2 round-trips through :erl_tar, each entry with its own mode" do
+      # A last segment past ustar's 100-byte name field, which its 155-byte
+      # prefix can't absorb, so :erl_tar writes a PAX header ahead of the
+      # entry, which the mode pass must step over.
+      long = "x/" <> String.duplicate("c", 120) <> ".yaml"
+
+      files = [
+        %{path: "/w/a.txt", content: "alpha", mode: 0o600, uid: 1, gid: 2},
+        %{path: "/w/" <> long, content: "gamma", mode: 0o440, uid: 65_532, gid: 0},
+        %{path: "/w/deep/b.bin", content: <<0, 255, 1>>, mode: 0o755, uid: 0, gid: 0}
+      ]
+
+      bytes = Compose.archive("/w", files)
+
+      assert {:ok, entries} = :erl_tar.extract({:binary, bytes}, [:memory])
+
+      assert Enum.sort(entries) == [
+               {~c"a.txt", "alpha"},
+               {~c"deep/b.bin", <<0, 255, 1>>},
+               {String.to_charlist(long), "gamma"}
+             ]
+
+      # The mode is set by archive/2 itself: OTP 28's :erl_tar.add/3 ignores
+      # `:mode` and would write 0o644 for every entry.
+      assert {:ok, table} = :erl_tar.table({:binary, bytes}, [:verbose])
+
+      assert Enum.sort(
+               for {name, :regular, _, _, mode, uid, gid} <- table, do: {name, mode, uid, gid}
+             ) ==
+               [
+                 {~c"a.txt", 0o600, 1, 2},
+                 {~c"deep/b.bin", 0o755, 0, 0},
+                 {String.to_charlist(long), 0o440, 65_532, 0}
+               ]
+
+      # Deterministic: a body is a function of its inputs.
+      assert Compose.archive("/w", files) == bytes
+    end
+  end
+
+  describe "per-service networks (blocker: a sandbox one hop from the internet)" do
+    test "a sandbox sharing a network with an :allow service is refused" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :allow, networks: ["sbx", "brw"]}]
+
+      assert {:error, {:compose, {:sandbox_shares_network_with_egress, {"proxy", "sbx"}}}} =
+               gate(services: specs, networks: [%{name: "brw"}])
+    end
+
+    test "joining the sandbox on an extra network shared with an :allow service is refused" do
+      specs = [
+        %{name: "sandbox", networks: ["sbx", "brw"]},
+        %{name: "proxy", image: "proxy:1", egress: :allow, networks: ["brw"]}
+      ]
+
+      assert {:error, {:compose, {:sandbox_shares_network_with_egress, {"proxy", "brw"}}}} =
+               gate(services: specs, networks: [%{name: "brw"}])
+    end
+
+    test "an :allow service left on the default sbx is refused once networks are in use" do
+      specs = [%{name: "proxy", image: "proxy:1", egress: :allow}]
+
+      assert {:error, {:compose, {:sandbox_shares_network_with_egress, {"proxy", "sbx"}}}} =
+               gate(services: specs, networks: [%{name: "brw"}])
+    end
+
+    test "the :proxy_service is the one sanctioned relay" do
+      specs = [
+        %{name: "api", image: "api:1", egress: :allow},
+        %{name: "browser", image: "b:1", egress: :none, networks: ["sbx", "brw"]},
+        %{name: "proxy", image: "proxy:1", egress: :allow, networks: ["brw"]}
+      ]
+
+      assert {{:ok, _, _}, _} =
+               acquire(services: specs, networks: [%{name: "brw"}], proxy_service: "api")
+    end
+
+    test "browser on sbx and brw, proxy on brw and egress: the two-tier layout" do
+      specs = [
+        %{name: "browser", image: "b:1", egress: :none, networks: ["sbx", "brw"]},
+        %{name: "proxy", image: "proxy:1", egress: :allow, networks: ["brw"]}
+      ]
+
+      {handle, _endpoint, requests} = acquire!(services: specs, networks: [%{name: "brw"}])
+
+      brw = network_body(requests, "-brw")
+      assert brw["Name"] == @project <> "-brw"
+      assert brw["Internal"] == true
+      assert brw["Labels"]["com.docker.compose.network"] == "brw"
+      assert brw["Labels"]["crowd_control.session"] == @session
+
+      assert container_body(requests, "browser")["NetworkingConfig"] == %{
+               "EndpointsConfig" => %{(@project <> "-sbx") => %{"Aliases" => ["browser"]}}
+             }
+
+      assert container_body(requests, "proxy")["NetworkingConfig"] == %{
+               "EndpointsConfig" => %{(@project <> "-brw") => %{"Aliases" => ["proxy"]}}
+             }
+
+      assert container_body(requests, "proxy")["HostConfig"]["NetworkMode"] == @project <> "-brw"
+
+      connects =
+        for r <- requests,
+            r.method == :post,
+            String.ends_with?(r.path, "/connect"),
+            do: {r.path, r.body["Container"]}
+
+      assert {"/networks/#{@project}-brw/connect", "ctr-browser"} in connects
+      assert {"/networks/#{@project}-egress/connect", "ctr-proxy"} in connects
+      refute {"/networks/#{@project}-sbx/connect", "ctr-proxy"} in connects
+      refute Enum.any?(connects, &(elem(&1, 1) == "ctr-sandbox"))
+
+      assert handle.networks == [@project <> "-brw"]
+    end
+
+    test "Preset.browser_stack/1's Compose output is accepted as is, in the two-tier layout" do
+      {services, networks, _overrides} =
+        CrowdControl.Preset.browser_stack(
+          substrate: :compose,
+          proxy: [image: "smokescreen:1", allow_domains: ["example.com"], nc: true],
+          browser: [image: "browser:1"]
+        )
+
+      {_handle, _endpoint, requests} = acquire!(services: services, networks: networks)
+
+      assert container_body(requests, "browser")["NetworkingConfig"] == %{
+               "EndpointsConfig" => %{(@project <> "-sbx") => %{"Aliases" => ["browser"]}}
+             }
+
+      proxy = container_body(requests, "egress-proxy")
+      assert proxy["HostConfig"]["NetworkMode"] == @project <> "-brw"
+      assert proxy["User"] == "65532:65532"
+      assert ["/bin/sh", "-c", "exec smokescreen " <> _] = proxy["Entrypoint"]
+      assert proxy["Healthcheck"]["Test"] == ["CMD", "nc", "-z", "127.0.0.1", "4750"]
+
+      browser = container_body(requests, "browser")["HostConfig"]
+      assert browser["ShmSize"] == 1_073_741_824
+      assert browser["Init"] == true
+      assert browser["Tmpfs"]["/tmp"] == "rw,noexec,nosuid,size=512m"
+
+      connects =
+        for r <- requests,
+            r.method == :post and String.ends_with?(r.path, "/connect"),
+            do: {r.path, r.body["Container"]}
+
+      assert {"/networks/#{@project}-brw/connect", "ctr-browser"} in connects
+      assert {"/networks/#{@project}-egress/connect", "ctr-egress-proxy"} in connects
+
+      # The Smokescreen config is staged before start.
+      assert find(requests, :put, "/containers/ctr-egress-proxy/archive")
+    end
+
+    test "memberships must name sbx or a declared network" do
+      specs = [%{name: "browser", image: "b:1", egress: :none, networks: ["brw"]}]
+
+      assert {:error, {:compose, {:unknown_network, {"browser", "brw"}}}} =
+               gate(services: specs)
+    end
+
+    test "the sandbox must stay on sbx, which the forwarder reaches it across" do
+      assert {:error, {:compose, {:sandbox_needs_network, "sbx"}}} =
+               gate(services: [%{name: "sandbox", networks: ["brw"]}], networks: [%{name: "brw"}])
+    end
+
+    test "a stack network may not reuse a fixed network's name" do
+      for name <- ["sbx", "pub", "egress", "Bad"] do
+        assert {:error, {:compose, {:bad_stack_network, %{name: ^name}}}} =
+                 gate(networks: [%{name: name}])
+      end
+
+      assert {:error, {:compose, {:bad_stack_network, %{name: "brw"}}}} =
+               gate(networks: [%{name: "brw"}, %{name: "brw"}])
+    end
+
+    test "teardown deletes the extra networks, after the containers" do
+      {handle, _endpoint, _requests} = acquire!(networks: [%{name: "brw"}])
+      {:ok, requests} = with_recorder(handle, fn handle -> Compose.release(handle) end)
+
+      deletes = paths(requests, :delete)
+      assert "/networks/#{@project}-brw" in deletes
+
+      assert Enum.find_index(deletes, &(&1 == "/containers/ctr-forwarder")) <
+               Enum.find_index(deletes, &(&1 == "/networks/#{@project}-brw"))
+    end
+
+    test "a reaper-rebuilt handle finds extra networks by label" do
+      containers = [container_json("a1", @session, "sandbox")]
+
+      routes = %{
+        {:get, "/containers/json"} => {200, containers},
+        {:get, "/networks"} => {200, [%{"Name" => @project <> "-brw"}]}
+      }
+
+      {:ok, recorder} = recorder(routes)
+
+      {:ok, [handle]} = Compose.list_live(req_adapter: recorder.adapter, owner: "node-a")
+      :ok = Compose.release(handle)
+
+      requests = recorder.log.()
+      assert "/networks/#{@project}-brw" in paths(requests, :delete)
+
+      filters = JSON.decode!(find(requests, :get, "/networks").query["filters"])
+      assert filters == %{"label" => ["crowd_control.session=#{@session}"]}
+    end
+  end
+
+  describe "per-service HostConfig (blocker: a weakened browser beside the sandbox)" do
+    test "ShmSize and Init are rendered for the service that asks, and only it" do
+      specs = [
+        %{
+          name: "browser",
+          image: "b:1",
+          egress: :none,
+          host_config: %{shm_size: 1_073_741_824, init: true}
+        }
+      ]
+
+      {_handle, _endpoint, requests} = acquire!(services: specs)
+
+      browser = container_body(requests, "browser")["HostConfig"]
+      assert browser["ShmSize"] == 1_073_741_824
+      assert browser["Init"] == true
+
+      refute Map.has_key?(container_body(requests, "sandbox")["HostConfig"], "ShmSize")
+      refute Map.has_key?(container_body(requests, "forwarder")["HostConfig"], "Init")
+    end
+
+    test "an undeclared weakening is refused before any HTTP" do
+      specs = [
+        %{name: "browser", image: "b:1", egress: :none, host_config: %{cap_add: ["SYS_ADMIN"]}}
+      ]
+
+      assert {:error, {:compose, {:weakening_not_declared, {"browser", :cap_add}}}} =
+               gate(services: specs)
+
+      specs = [%{name: "browser", image: "b:1", egress: :none, user: "0"}]
+
+      assert {:error, {:compose, {:weakening_not_declared, {"browser", :user}}}} =
+               gate(services: specs)
+    end
+
+    test "a declared weakening renders, and leaves the rest hardened" do
+      specs = [
+        %{
+          name: "browser",
+          image: "b:1",
+          egress: :none,
+          host_config: %{cap_add: ["SYS_ADMIN"], no_new_privileges: false},
+          weaken: [:cap_add, :no_new_privileges]
+        }
+      ]
+
+      {_handle, _endpoint, requests} = acquire!(services: specs)
+
+      browser = container_body(requests, "browser")["HostConfig"]
+      assert browser["CapAdd"] == ["SYS_ADMIN"]
+      assert browser["CapDrop"] == ["ALL"]
+      refute "no-new-privileges:true" in browser["SecurityOpt"]
+
+      sandbox = container_body(requests, "sandbox")["HostConfig"]
+      assert sandbox["SecurityOpt"] == ["no-new-privileges:true"]
+      refute Map.has_key?(sandbox, "CapAdd")
+    end
+
+    test "privileged is always refused" do
+      for spec <- [
+            %{name: "browser", image: "b:1", egress: :none, host_config: %{privileged: true}},
+            %{
+              name: "browser",
+              image: "b:1",
+              egress: :none,
+              host_config: %{privileged: true},
+              weaken: [:privileged]
+            }
+          ] do
+        assert {:error, {:compose, {:privileged_refused, "browser"}}} = gate(services: [spec])
+      end
+    end
+
+    test "a root user in any spelling needs weaken: [:user]; a non-root uid does not" do
+      for user <- ["0", "00", "000:1000", "root", "root:root"] do
+        spec = %{name: "browser", image: "b:1", egress: :none, user: user}
+
+        assert {:error, {:compose, {:weakening_not_declared, {"browser", :user}}}} =
+                 gate(services: [spec])
+
+        {_handle, _endpoint, requests} = acquire!(services: [Map.put(spec, :weaken, [:user])])
+        assert container_body(requests, "browser")["User"] == user
+      end
+
+      {_handle, _endpoint, requests} =
+        acquire!(services: [%{name: "browser", image: "b:1", egress: :none, user: "1000"}])
+
+      assert container_body(requests, "browser")["User"] == "1000"
+    end
+
+    test "a user the runtime might still read as root is invalid, declared or not" do
+      for user <- ["+0", " 0", "0 ", "-0", "0\n"] do
+        spec = %{name: "browser", image: "b:1", egress: :none, user: user, weaken: [:user]}
+        assert {:error, {:compose, {:bad_service, {"browser", :user}}}} = gate(services: [spec])
+      end
+    end
+
+    test "a tmpfs without noexec,nosuid needs weaken: [:tmpfs_exec]" do
+      spec = %{
+        name: "browser",
+        image: "b:1",
+        egress: :none,
+        host_config: %{tmpfs: %{"/tmp" => "rw,nosuid,size=512m"}}
+      }
+
+      assert {:error, {:compose, {:weakening_not_declared, {"browser", :tmpfs_exec}}}} =
+               gate(services: [spec])
+
+      {_handle, _endpoint, requests} =
+        acquire!(services: [Map.put(spec, :weaken, [:tmpfs_exec])])
+
+      assert container_body(requests, "browser")["HostConfig"]["Tmpfs"]["/tmp"] ==
+               "rw,nosuid,size=512m"
+    end
+
+    test "an env key that would corrupt KEY=value is refused before any HTTP" do
+      spec = %{name: "browser", image: "b:1", egress: :none, env: %{"A=B" => "c"}}
+      assert {:error, {:compose, {:bad_service, {"browser", :env}}}} = gate(services: [spec])
+    end
+  end
+
+  describe "teardown drain (blocker: a log shipper SIGKILLed mid-flush)" do
+    setup do
+      specs = [
+        %{name: "vector", image: "vector:1", egress: :none, drain: 10, shutdown_limit: 7}
+      ]
+
+      {:ok, specs: specs}
+    end
+
+    test "a drained service is stopped gracefully before any force-remove", %{specs: specs} do
+      {handle, _endpoint, requests} = acquire!(services: specs)
+
+      labels = container_body(requests, "vector")["Labels"]
+      assert labels["crowd_control.drain_ms"] == "10"
+      assert labels["crowd_control.stop_timeout_s"] == "12"
+
+      {:ok, requests} = with_recorder(handle, fn handle -> Compose.release(handle) end)
+
+      stop = find(requests, :post, "/containers/ctr-vector/stop")
+      assert stop.query == %{"t" => "12"}
+
+      stop_at = index(requests, :post, "/containers/ctr-vector/stop")
+      first_delete = Enum.find_index(requests, &(&1.method == :delete))
+      assert stop_at < first_delete
+
+      # Only the drained service; the sandbox and forwarder are unchanged.
+      assert [_] = Enum.filter(requests, &String.ends_with?(&1.path, "/stop"))
+    end
+
+    test "a session without a drained service keeps the plain force-remove path" do
+      {handle, _endpoint, _requests} = acquire!([])
+      {:ok, requests} = with_recorder(handle, fn handle -> Compose.release(handle) end)
+
+      refute Enum.any?(requests, &String.ends_with?(&1.path, "/stop"))
+    end
+
+    test "a stop that fails still lets teardown remove everything", %{specs: specs} do
+      {handle, _endpoint, _requests} = acquire!(services: specs)
+      routes = %{{:post, "/containers/ctr-vector/stop"} => {500, %{"message" => "stuck"}}}
+
+      log =
+        capture_log(fn ->
+          {:ok, requests} = with_recorder(handle, routes, fn h -> Compose.release(h) end)
+          assert "/containers/ctr-vector" in paths(requests, :delete)
+        end)
+
+      assert log =~ "drain of vector failed"
+    end
+
+    test "an already-stopped container (304) is not an error", %{specs: specs} do
+      {handle, _endpoint, _requests} = acquire!(services: specs)
+      routes = %{{:post, "/containers/ctr-vector/stop"} => {304, ""}}
+
+      log = capture_log(fn -> with_recorder(handle, routes, fn h -> Compose.release(h) end) end)
+      refute log =~ "drain"
+    end
+
+    test "a reaper-rebuilt handle drains from the container labels" do
+      labels = %{"crowd_control.drain_ms" => "0", "crowd_control.stop_timeout_s" => "9"}
+
+      containers = [
+        container_json("a1", @session, "sandbox"),
+        Map.update!(container_json("a2", @session, "vector"), "Labels", &Map.merge(&1, labels))
+      ]
+
+      {:ok, recorder} = recorder(%{{:get, "/containers/json"} => {200, containers}})
+
+      {:ok, [handle]} = Compose.list_live(req_adapter: recorder.adapter, owner: "node-a")
+      assert handle.drained == [{"vector", 0, 9}]
+
+      :ok = Compose.release(handle)
+      assert find(recorder.log.(), :post, "/containers/a2/stop").query == %{"t" => "9"}
+    end
+
+    test "a failed acquire rolls back without waiting on a drain", %{specs: specs} do
+      routes = %{
+        {:get, "/containers/ctr-forwarder/json"} =>
+          {200, %{"NetworkSettings" => %{"Ports" => %{"8080/tcp" => nil}}}}
+      }
+
+      assert {{:error, _}, requests} = acquire(services: specs, routes: routes)
+      refute Enum.any?(requests, &String.ends_with?(&1.path, "/stop"))
     end
   end
 
@@ -1081,7 +2066,15 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
     }
   end
 
-  defp request_body(%{body: body}) when is_binary(body) and body != "", do: JSON.decode!(body)
+  # A tar upload is kept as raw bytes; everything else this provider sends is
+  # JSON.
+  defp request_body(%{body: body}) when is_binary(body) and body != "" do
+    case JSON.decode(body) do
+      {:ok, decoded} -> decoded
+      {:error, _} -> body
+    end
+  end
+
   defp request_body(%{options: %{json: json}}), do: JSON.decode!(JSON.encode!(json))
   defp request_body(_req), do: %{}
 
@@ -1107,6 +2100,7 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       {:post, "/volumes/create"} -> {201, %{"Name" => "vol"}}
       {:post, "/containers/create"} -> {201, %{"Id" => "ctr-" <> service_of(req, opts)}}
       {:post, path} -> post_route(path)
+      {:put, "/containers/" <> _} -> {200, ""}
       {:get, path} -> get_route(path, Keyword.get(opts, :agent_port, 8080))
       {:delete, _path} -> {204, ""}
       _ -> raise "unstubbed Docker API call: #{inspect(key)}"
@@ -1115,12 +2109,25 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
 
   defp get_route("/containers/" <> rest, port), do: inspect_route(rest, port)
   defp get_route("/volumes", _port), do: {200, %{"Volumes" => []}}
+  defp get_route("/networks", _port), do: {200, []}
+
+  defp get_route("/images/" <> rest, _port),
+    do: {200, image_json(String.replace_suffix(rest, "/json", ""), "1000")}
+
+  defp get_route("/version", _port), do: {200, %{"Version" => "27.3.1", "ApiVersion" => "1.47"}}
   defp get_route("/v1/health", _port), do: {200, %{"ok" => true}}
   defp get_route(path, _port), do: raise("unstubbed Docker API call: #{inspect({:get, path})}")
+
+  # A stable fake Id per image name, so a test can tell which image a create
+  # body names without stubbing the inspect.
+  defp image_id(image), do: "sha256:" <> Base.encode16(:crypto.hash(:sha256, image), case: :lower)
+
+  defp image_json(image, user), do: %{"Id" => image_id(image), "Config" => %{"User" => user}}
 
   defp post_route(path) do
     cond do
       String.ends_with?(path, "/start") -> {204, ""}
+      String.ends_with?(path, "/stop") -> {204, ""}
       String.ends_with?(path, "/connect") -> {200, %{}}
       true -> raise "unstubbed Docker API POST: #{path}"
     end
@@ -1155,6 +2162,10 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
   defp ready_for(service) do
     %{service => %{test: ["CMD", "true"], interval_ms: 10, timeout_ms: 10, retries: 1}}
   end
+
+  # A docker_host no other test uses, so the per-host version cache is this
+  # test's alone. The host itself is never dialled: :req_adapter answers.
+  defp unique_host, do: "tcp://docker-#{System.unique_integer([:positive])}.test:2375"
 
   defp container_json(id, session, service) do
     labels =

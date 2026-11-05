@@ -10,12 +10,18 @@ defmodule CrowdControl do
   `CrowdControl.Agent.Omp` (omp) for the full list of session options.
   """
 
-  alias CrowdControl.Session
+  alias CrowdControl.{Backend, Session}
+  alias CrowdControl.Session.Control
 
   # Per-session start ceiling for `start_sessions/1`. Without a finite timeout,
   # `on_timeout: :kill_task` is dead code and a wedged start blocks the stream
   # forever. A killed start normalizes to `{:error, {:task_exit, _}}`.
   @start_timeout 30_000
+
+  # Slack on top of a run's turn timeout and interrupt grace before `run/2`
+  # gives up on a session that never reported its own expiry (a wedged
+  # session): enough for the expiry's teardown and broadcast to land.
+  @run_margin 30_000
 
   @type opts :: keyword()
   @type session :: pid()
@@ -176,7 +182,13 @@ defmodule CrowdControl do
     end
   end
 
-  @doc "Stop all sessions in parallel."
+  @doc """
+  Stop all sessions in parallel.
+
+  Waits for every session's teardown, which `CrowdControl.Session.stop/1`
+  does not bound (see there): a Kubernetes sandbox with drained sidecars can
+  take most of a minute to be destroyed.
+  """
   @spec stop_all([session()]) :: :ok
   def stop_all(sessions) do
     sessions
@@ -190,23 +202,41 @@ defmodule CrowdControl do
       end,
       max_concurrency: 16,
       ordered: false,
-      on_timeout: :kill_task,
-      timeout: 15_000
+      timeout: :infinity
     )
     |> Stream.run()
 
     :ok
   end
 
-  @doc "Single-shot convenience: start a session, send prompt, collect result, stop."
+  @doc """
+  Single-shot convenience: start a session, send prompt, collect result, stop.
+
+  Returns the `{:result, subtype, map}` message, or `{:error, reason}`:
+  `{:error, :timeout}` when the session expired (its turn outlived
+  `:timeout`), `{:error, :session_exited}`, or the session's own error.
+
+  The wait follows the session's own clock rather than a separate one: the
+  session's turn timer pauses while a permission request (or a deferred hook)
+  waits on an answer, and when the deadline passes a control-capable agent is
+  first interrupted and given `:interrupt_grace` to report its result, which
+  `run/2` then returns. A human-in-the-loop `:can_use_tool` may therefore hold
+  the turn for longer than `:timeout`. `run/2` keeps one wall-clock backstop
+  for a session that never reports anything: `:timeout` plus
+  `:interrupt_grace` (given at the top level or in the `backend:` config,
+  #{div(Control.default_interrupt_grace(), 1_000)} s when unset) plus #{div(@run_margin, 1_000)} s,
+  counted once the session has started. That backstop is not paused, so an
+  approval held longer than it ends the run with `{:error, :timeout}`; for an
+  open-ended human wait use `start_session/1` and `CrowdControl.Session`
+  directly, or `timeout: :infinity`.
+  """
   @spec run(binary(), opts()) :: result_message() | {:error, term()}
   def run(prompt, opts \\ []) do
     opts = Keyword.put(opts, :prompt, prompt)
 
     with {:ok, session} <- start_session(opts) do
       Session.subscribe(session)
-      deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, 60_000)
-      result = wait_for_result(session, deadline)
+      result = wait_for_result(session, run_deadline(opts))
 
       try do
         Session.stop(session)
@@ -217,6 +247,56 @@ defmodule CrowdControl do
       result
     end
   end
+
+  # `:infinity` when the session never expires on its own, so neither does
+  # the wait.
+  defp run_deadline(opts) do
+    case Keyword.get(opts, :timeout, Session.default_timeout()) do
+      timeout when is_integer(timeout) ->
+        System.monotonic_time(:millisecond) + timeout + run_grace(opts) + @run_margin
+
+      _nil_or_infinity ->
+        :infinity
+    end
+  end
+
+  # The grace run/2's backstop allows for. Resolved from the same opts the
+  # session resolves it from (Backend.resolve/1, so a `backend: {_, kw}` value
+  # wins over a top-level one), falling back to the default a control-feature
+  # session gets: the backstop must never be shorter than the session's own.
+  @doc false
+  @spec run_grace(opts()) :: non_neg_integer()
+  def run_grace(opts) do
+    {_backend, resolved} = Backend.resolve(opts)
+    Keyword.get(resolved, :interrupt_grace) || Control.default_interrupt_grace()
+  end
+
+  @doc """
+  Like `run/2`, but returns the result map of a successful turn and raises
+  `CrowdControl.Error` otherwise.
+
+  A result that classifies as an error (see `CrowdControl.Result.classify/1`)
+  raises with that error's kind. A run that produced no result at all (a start
+  failure, a timeout, the session exiting) raises with kind `:session_error`
+  and the `run/2` error term as its `reason`.
+  """
+  @spec run!(binary(), opts()) :: map()
+  def run!(prompt, opts \\ []) do
+    case run(prompt, opts) do
+      {:result, _, _} = result ->
+        case classify(result) do
+          {:ok, map} -> map
+          {:error, error} -> raise error
+        end
+
+      {:error, reason} ->
+        raise CrowdControl.Error, kind: :session_error, reason: reason
+    end
+  end
+
+  @doc "Classify a `{:result, subtype, map}` message. See `CrowdControl.Result.classify/1`."
+  @spec classify(result_message()) :: {:ok, map()} | {:error, CrowdControl.Error.t()}
+  defdelegate classify(result), to: CrowdControl.Result
 
   @doc "Start N sessions with different options but the same prompt; collect all results."
   @spec run_many(binary(), [opts()]) ::
@@ -233,12 +313,15 @@ defmodule CrowdControl do
     end
   end
 
-  # `deadline` is an absolute `System.monotonic_time(:millisecond)` value. Each
-  # non-result message recomputes the remaining wait against it instead of
-  # restarting the full timeout window (which made the deadline unbounded under
-  # a steady stream of intermediate messages).
+  # `deadline` is an absolute `System.monotonic_time(:millisecond)` value, or
+  # `:infinity`. Each non-result message recomputes the remaining wait against
+  # it instead of restarting the full timeout window (which made the deadline
+  # unbounded under a steady stream of intermediate messages).
   defp wait_for_result(session, deadline) do
-    wait = max(deadline - System.monotonic_time(:millisecond), 0)
+    wait =
+      if deadline == :infinity,
+        do: :infinity,
+        else: max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
       {:crowd_control, ^session, {:result, _, _} = msg} ->
@@ -250,8 +333,8 @@ defmodule CrowdControl do
       {:crowd_control, ^session, {:error, _reason} = err} ->
         err
 
-      # The session hit its own expiry; from the caller's perspective that is a
-      # timeout (in `run/2` the session and wait deadlines share `:timeout`).
+      # The session hit its own expiry, interrupt grace included: the turn's
+      # timeout, from the caller's perspective.
       {:crowd_control, ^session, {:timeout, _}} ->
         {:error, :timeout}
 

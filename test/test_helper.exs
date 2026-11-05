@@ -14,7 +14,10 @@
 #     # billable: creates a real spot VM. Needs GCP credentials; see gce_test.exs.
 #     mix test --include gce
 #
-ExUnit.configure(exclude: [:docker, :k8s, :omp, :sandboxd, :compose, :gce])
+#     # runs the rendered Vector config through timberio/vector in Docker
+#     mix test --include vector
+#
+ExUnit.configure(exclude: [:docker, :k8s, :omp, :sandboxd, :compose, :gce, :vector])
 
 # One agent secret for the whole suite.
 #

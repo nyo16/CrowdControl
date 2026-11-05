@@ -23,7 +23,11 @@
 # "Egress proxy contract" specifies what one must do (inject the real key
 # server-side, enforce a per-session budget, restrict destinations). Point
 # CC_EGRESS_PROXY_IMAGE at yours; it must serve HTTP on 8080 and answer
-# /healthz, or adjust `:port` and `:ready` below to match it.
+# /healthz, or adjust `:port` and `:ready` below to match it. It must also
+# default to a numeric non-root uid (`USER 1000`, not `USER proxy`): any other
+# default user is refused with
+# {:error, {:compose, {:weakening_not_declared, {"proxy", :user}}}} unless the
+# spec below sets a numeric `user:` (or, deliberately, `weaken: [:user]`).
 
 Application.put_env(
   :crowd_control,
@@ -67,8 +71,8 @@ provider = [
   },
   proxy_service: "proxy",
   health_timeout: 60_000,
-  # Hardening applies to every container in the stack; there are deliberately
-  # no per-service overrides.
+  # Hardening is the default for every container in the stack; a service can
+  # override it per key with `host_config:`, and weakening needs `weaken:`.
   cpus: 2.0,
   memory: 2 * 1024 * 1024 * 1024,
   ready_timeout: 60_000

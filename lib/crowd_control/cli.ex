@@ -22,12 +22,61 @@ defmodule CrowdControl.CLI do
     "--verbose"
   ]
 
+  # Lowest CLI release the control protocol is built against: from 2.1.268 a
+  # success `initialize` reply always carries `pending_permission_requests`,
+  # which reattach recovery depends on. `--permission-prompts` needs 2.1.259,
+  # so this one bound covers every flag below.
+  @min_version "2.1.268"
+
+  # Every flag build_command/1 can emit, checked against a real binary by
+  # `mix crowd_control.contract`. `operand` says whether it takes a value;
+  # `hidden` flags are missing from `claude --help`, so the task proves them by
+  # the parser's "argument missing" error instead. A test asserts this table
+  # covers build_command/1's output, so a new flag cannot skip the contract.
+  @contract_flags [
+    %{flag: "--print", operand: false, hidden: false},
+    %{flag: "--output-format", operand: true, hidden: false},
+    %{flag: "--input-format", operand: true, hidden: false},
+    %{flag: "--verbose", operand: false, hidden: false},
+    %{flag: "--model", operand: true, hidden: false},
+    %{flag: "--system-prompt", operand: true, hidden: false},
+    %{flag: "--allowed-tools", operand: true, hidden: false},
+    %{flag: "--permission-mode", operand: true, hidden: false},
+    %{flag: "--permission-prompt-tool", operand: true, hidden: true},
+    %{flag: "--permission-prompts", operand: true, hidden: false},
+    %{flag: "--max-budget-usd", operand: true, hidden: false},
+    %{flag: "--session-id", operand: true, hidden: false},
+    %{flag: "--resume", operand: true, hidden: false},
+    %{flag: "--add-dir", operand: true, hidden: false},
+    %{flag: "--settings", operand: true, hidden: false},
+    %{flag: "--setting-sources", operand: true, hidden: false},
+    %{flag: "--mcp-config", operand: true, hidden: false},
+    %{flag: "--agents", operand: true, hidden: false},
+    %{flag: "--plugin-dir", operand: true, hidden: false},
+    %{flag: "--continue", operand: false, hidden: false},
+    %{flag: "--include-partial-messages", operand: false, hidden: false},
+    %{flag: "--no-session-persistence", operand: false, hidden: false},
+    %{flag: "--strict-mcp-config", operand: false, hidden: false},
+    %{flag: "--bare", operand: false, hidden: false}
+  ]
+
+  @permission_prompts ["host", "none"]
+
+  @typedoc """
+  One `--mcp-config` entry: a path to a JSON file, or an inline
+  `%{"mcpServers" => %{name => server}}` map whose every server names its
+  `"type"`.
+  """
+  @type mcp_config_entry :: String.t() | map()
+
   @type opt ::
           {:executable, String.t()}
           | {:model, String.t()}
           | {:system_prompt, String.t()}
           | {:allowed_tools, [String.t()]}
           | {:permission_mode, String.t()}
+          | {:permission_prompt_tool, String.t()}
+          | {:permission_prompts, String.t()}
           | {:max_budget_usd, number()}
           | {:session_id, String.t()}
           | {:resume, String.t()}
@@ -39,7 +88,7 @@ defmodule CrowdControl.CLI do
           | {:settings_file, String.t()}
           | {:settings_json, String.t() | map()}
           | {:setting_sources, [String.t()]}
-          | {:mcp_config, String.t() | [String.t()]}
+          | {:mcp_config, mcp_config_entry() | [mcp_config_entry()]}
           | {:strict_mcp_config, boolean()}
           | {:agents, String.t() | map()}
           | {:plugin_dir, String.t()}
@@ -68,6 +117,12 @@ defmodule CrowdControl.CLI do
     * `:system_prompt` - custom system prompt
     * `:allowed_tools` - list of allowed tool names
     * `:permission_mode` - permission mode string
+    * `:permission_prompt_tool` - who answers permission prompts: `"stdio"` for
+      the host over the control channel, or the name of an MCP tool.
+      `CrowdControl.Agent.ClaudeCode` sets `"stdio"` itself when `:can_use_tool`
+      is given
+    * `:permission_prompts` - `"host"` (default: wait for the prompt tool) or
+      `"none"` (deny anything that would prompt; CLI 2.1.259+)
     * `:max_budget_usd` - spending ceiling as a number
     * `:session_id` - session ID for new sessions
     * `:resume` - session ID to resume
@@ -80,7 +135,11 @@ defmodule CrowdControl.CLI do
     * `:settings` - **deprecated**; use `:settings_file` or `:settings_json`. Heuristic: a
       string starting with `{` is treated as inline JSON, otherwise as a file path
     * `:setting_sources` - list of setting sources (e.g. `["user", "project", "local"]`)
-    * `:mcp_config` - path(s) to MCP config JSON files (sanitized + expanded)
+    * `:mcp_config` - MCP config path(s) (sanitized + expanded), inline
+      `%{"mcpServers" => ...}` map(s), or a list mixing both. Each map becomes
+      one JSON argv token, and every server in it must name its `"type"`: the
+      CLI silently skips a typeless entry. Inline maps land in argv, so keep
+      credentials in a config file or the environment, not in a map
     * `:strict_mcp_config` - `true` to only use MCP servers from `:mcp_config`
     * `:agents` - JSON string or map defining custom agents
     * `:plugin_dir` - path to a plugin directory (sanitized + expanded)
@@ -100,12 +159,32 @@ defmodule CrowdControl.CLI do
     {executable, args, env}
   end
 
+  @doc """
+  The lowest Claude Code release this module's flags and the control protocol
+  are built against.
+  """
+  @spec min_version() :: String.t()
+  def min_version, do: @min_version
+
+  @doc """
+  Every flag `build_command/1` can emit, as
+  `%{flag: "--model", operand: true, hidden: false}`.
+
+  `operand` is whether the flag takes a value; `hidden` flags are accepted by
+  the CLI but absent from `claude --help`. `mix crowd_control.contract` checks
+  each one against a real binary.
+  """
+  @spec contract_flags() :: [%{flag: String.t(), operand: boolean(), hidden: boolean()}]
+  def contract_flags, do: @contract_flags
+
   defp build_optional_args(opts) do
     []
     |> maybe_add("--model", opts[:model])
     |> maybe_add("--system-prompt", opts[:system_prompt])
     |> maybe_add_list("--allowed-tools", opts[:allowed_tools])
     |> maybe_add("--permission-mode", opts[:permission_mode])
+    |> maybe_add_text("--permission-prompt-tool", opts[:permission_prompt_tool])
+    |> maybe_add_permission_prompts(opts[:permission_prompts])
     |> maybe_add("--max-budget-usd", opts[:max_budget_usd])
     |> maybe_add("--session-id", opts[:session_id])
     |> maybe_add("--resume", opts[:resume])
@@ -126,6 +205,27 @@ defmodule CrowdControl.CLI do
 
   defp maybe_add(args, _flag, nil), do: args
   defp maybe_add(args, flag, value), do: [to_string(value), flag | args]
+
+  defp maybe_add_text(args, _flag, nil), do: args
+
+  defp maybe_add_text(args, flag, value) when is_binary(value) and value != "" do
+    validate_no_control_chars!(value, inspect(flag))
+    [value, flag | args]
+  end
+
+  defp maybe_add_text(_args, flag, other),
+    do: raise(ArgumentError, "#{flag} must be a non-empty binary, got: #{inspect(other)}")
+
+  defp maybe_add_permission_prompts(args, nil), do: args
+
+  defp maybe_add_permission_prompts(args, value) when value in @permission_prompts,
+    do: [value, "--permission-prompts" | args]
+
+  defp maybe_add_permission_prompts(_args, other) do
+    raise ArgumentError,
+          ":permission_prompts must be one of #{inspect(@permission_prompts)}, " <>
+            "got: #{inspect(other)}"
+  end
 
   defp maybe_add_list(args, _flag, nil), do: args
   defp maybe_add_list(args, flag, values), do: [Enum.join(values, ","), flag | args]
@@ -148,13 +248,51 @@ defmodule CrowdControl.CLI do
 
   defp maybe_add_mcp_config(args, nil), do: args
 
-  defp maybe_add_mcp_config(args, configs) when is_list(configs) do
-    sanitized = Enum.map(configs, &sanitize_path!/1)
-    Enum.reverse(sanitized) ++ ["--mcp-config" | args]
+  defp maybe_add_mcp_config(args, configs) do
+    tokens = configs |> List.wrap() |> Enum.map(&mcp_config_token!/1)
+    Enum.reverse(tokens) ++ ["--mcp-config" | args]
   end
 
-  defp maybe_add_mcp_config(args, config) when is_binary(config),
-    do: [sanitize_path!(config), "--mcp-config" | args]
+  defp mcp_config_token!(path) when is_binary(path), do: sanitize_path!(path)
+
+  defp mcp_config_token!(config) when is_map(config) and not is_struct(config) do
+    validate_mcp_servers!(config)
+    JSON.encode!(config)
+  end
+
+  defp mcp_config_token!(other) do
+    raise ArgumentError,
+          ":mcp_config entries must be paths or maps, got: #{inspect(other)}"
+  end
+
+  defp validate_mcp_servers!(config) do
+    servers =
+      case fetch_either(config, "mcpServers", :mcpServers) do
+        {:ok, servers} when is_map(servers) -> servers
+        _ -> raise ArgumentError, "an inline :mcp_config map needs an \"mcpServers\" map"
+      end
+
+    Enum.each(servers, fn {name, server} ->
+      case is_map(server) and fetch_either(server, "type", :type) do
+        {:ok, type}
+        when (is_binary(type) and type != "") or type in [:sdk, :stdio, :http, :sse, :ws] ->
+          :ok
+
+        _ ->
+          raise ArgumentError,
+                "MCP server #{inspect(name)} in :mcp_config has no \"type\"; " <>
+                  "Claude Code skips a typeless server instead of failing"
+      end
+    end)
+  end
+
+  # Inline maps come from Elixir code, so accept atom or string keys alike.
+  defp fetch_either(map, key, atom_key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(map, atom_key)
+    end
+  end
 
   defp maybe_add_agents(args, nil), do: args
 

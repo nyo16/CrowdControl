@@ -316,7 +316,13 @@ destroying the wrong thing:
   stack apart one container at a time, orphaning its networks and volumes.
 
 `crowd_control.stack=single` exists as a *positive* discriminator because Docker
-label filters cannot express label absence.
+label filters cannot express label absence. The agent scope holds the other way
+too: `Backend.Docker` labels its containers `crowd_control.agent=docker`, set at
+create so an image's own `crowd_control.agent` label can't override it, and its
+`list_live/1` drops containers labelled `crowd_control.agent=sandboxd`
+(client-side, for the same reason), so its reaper never tears down a
+`Backend.Sandboxd` sandbox or stack. Containers without a `crowd_control.agent`
+label, created before it, are still listed.
 
 `release/1` deletes the container before the network, in that order, because a
 network `DELETE` answers `403` while a container is still attached. `404` is
@@ -385,7 +391,13 @@ container.
 The **forwarder** sidecar is dual-homed on 1 and 2 and publishes the agent port on
 `127.0.0.1:0`, running
 `socat TCP-LISTEN:<port>,fork,reuseaddr TCP:<sandbox>:<port>` and addressing the
-sandbox by its network alias. `fork` is not decorative: a single-slot forwarder
+sandbox by its network alias. It runs as `nobody` (`65534:65534`), so a custom
+`:forwarder_image` must let uid 65534 run `socat`. `:agent_port` may be any TCP
+port, `1..65535`: Docker Engine 20.10 or later sets
+`net.ipv4.ip_unprivileged_port_start=0` in each container's network namespace, so
+`nobody` can bind a privileged one; anything
+else is `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`, before any
+request. `fork` is not decorative: a single-slot forwarder
 (`busybox nc -e`) dropped two of three concurrent requests in testing, and
 `Backend.Sandboxd` holds a long-lived chunked stream open for the whole session.
 
@@ -441,20 +453,118 @@ above observable rather than notional.
   exist, so it exists only as an explicit, typed-out act.
 
 Hardening (`:cpus`, `:memory`, `:cap_drop`, `:security_opt`, `:pids_limit`,
-`:user`, `:readonly_rootfs`, `:tmpfs`) comes from top-level options and applies to
-**every** container in the stack, through
-`CrowdControl.Backend.Docker.HostConfig`. There are deliberately no per-service
-overrides: one posture per stack is the whole reason that module exists, and a
-sidecar quietly weaker than the sandbox it shares a network with is not a useful
-thing to be able to express.
+`:user`, `:readonly_rootfs`, `:tmpfs`, `:shm_size`, `:init`) comes from top-level
+options and is the **default for every container** in the stack, through
+`CrowdControl.Backend.Docker.HostConfig`.
+
+### Hardened by default, per-service overrides, weakening explicit
+
+This replaces the earlier "one posture per stack" rule. A service may override the
+stack's HostConfig with `host_config:`:
+
+* **Resource keys** — `:shm_size`, `:init`, `:pids_limit`, `:memory`, `:cpus`,
+  `:tmpfs` (merged over the read-only defaults) — need no declaration. Chromium
+  needs far more `/dev/shm` than Docker's 64 MiB, and an init to reap its
+  children; neither weakens anything.
+* **Weakening keys** — `:cap_add`, `no_new_privileges: false`,
+  `readonly_rootfs: false`, a root `user:` (`:user`), a `kind: :host_path` mount on
+  a sidecar, read-only or not (`:host_path`), and a `:tmpfs` entry whose options
+  leave out `noexec` or `nosuid` or name `exec`/`suid` (`:tmpfs_exec`; the flags
+  are enforced on Compose only, because on Kubernetes a tmpfs is an `emptyDir`,
+  which mounts exec) — must each
+  also be named in the service's `weaken: [...]` list, or `acquire/1` refuses with
+  `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`. `user:` is a
+  uid or a lowercase name, optionally `:group`; root is decided numerically, so
+  `"0"`, `"00"`, `"0:1000"` and `"root"` all need `weaken: [:user]`, and `"+0"` or
+  `" 0"` is not a valid user at all. Env keys must match `[A-Za-z_][A-Za-z0-9_]*`.
+* **Every image** is a distribution reference (`[domain[:port]/]path[:tag][@digest]`,
+  or a bare `sha256:<64 hex>` Id), or `{:error, {:compose, {:bad_service,
+  {service, :image}}}}` before any request (on Kubernetes, `{:k8s, …}` for a
+  service's `image:`). Before anything is created, `acquire/1` inspects every
+  distinct image once — sandbox, forwarder and sidecars — with
+  `GET /images/{image}/json`. The providers never pull, so an image the daemon
+  lacks is `{:error, {:compose, {:image_not_found, {service, image}}}}`, naming
+  the first service that uses it.
+* **A sidecar's image default user** counts as its `user:` when it sets none, and
+  passes only as a numeric uid in `1..2147483647`, with a gid, if given, in
+  `0..2147483647` (`1000`, `1000:1000`; Docker refuses a larger one itself). No
+  `USER`, a name (`node`, `nginx`), or a spelling
+  Docker runs as uid 0 (`00`, `+0`, `:1000`) is held to the `weaken: [:user]`
+  rule, `{:error, {:compose, {:weakening_not_declared, {service, :user}}}}`; set a
+  numeric `user:` or declare the weakening. Such a sidecar is created from the
+  inspected image Id, so the image that was checked is the image that runs. The
+  presets all set `user:`, so they skip the user check. The sandbox is exempt, as
+  on Kubernetes, and the forwarder runs as `nobody`. The numeric rule is for the
+  image's *default* user only. An explicit `user:` name is trusted as written:
+  Docker resolves it against the image's `/etc/passwd`, and only `root` or a
+  numeric uid 0 needs `weaken: [:user]`, so a name the image maps to uid 0 runs as
+  root undeclared. Kubernetes refuses a named `user:` (`{:k8s, {:bad_user, …}}`).
+* **`privileged`** is refused outright, `{:error, {:compose, {:privileged_refused,
+  service}}}`, declared or not.
+
+The risk this accepts is specific. In the strict two-tier browser layout the
+browser shares a network with the sandbox *and* has a path to the egress proxy, so
+a weakened browser — root, added capabilities, no `no-new-privileges` — is the most
+valuable target a compromised sandbox can reach. That is why weakening is per key,
+written down, and never inferred.
+
+### Per-service networks
+
+`:networks: [%{name: "brw"}]` declares extra networks, created as
+`<project>-<name>` with `Internal: true`; `sbx`, `pub` and `egress` are reserved. A
+service's `networks:` lists its memberships (default `["sbx"]`, so a stack that
+declares none is built exactly as before): the first is its create-time endpoint,
+the rest are attached by `/connect` after create, and `egress: :allow` still adds
+the NAT bridge, so posture comes from `egress`, never from a membership. The
+sandbox must stay on `sbx`, which the forwarder reaches it across.
+
+Once a stack uses per-service networks (a `:networks` declaration or any
+`networks:` membership), the sandbox may share **no** network with an
+`egress: :allow` service other than the `:proxy_service`, whose SECURITY.md
+contract is the one sanctioned relay — the sandbox reaches the Anthropic API only
+through it:
+`{:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}`.
+A stack using neither keeps the older single-network `sbx` model, where an
+`egress: :allow` sidecar on `sbx` is the declared relay, because on one network
+there is nowhere else to put it. Declaring `:networks` opts into the strict model.
+The strict two-tier browser layout is the sandbox on `sbx`, the browser on `sbx`
+and `brw`, and the forward proxy on `brw` plus the NAT bridge.
+
+**Docker version floor.** Per-service networks and any `egress: :allow` sidecar
+need Docker Engine 25.0.5 or 26.0.0+: before that, the embedded DNS on an internal
+network forwarded queries upstream (CVE-2024-29018), an exfiltration path out of a
+network with no route. `GET /version` is asked once per `:docker_host` (cached in
+`:persistent_term`), only when one of those is in use, and an older daemon is
+`{:error, {:version, :docker, have, {25, 0, 5}}}` before anything is created.
+
+`placement:` on a service is Kubernetes-only and ignored on Compose with a warning.
 
 ### Everything is validated before a single byte reaches the daemon
 
 A stack is N resources, and discovering an invalid service spec after four of them
 exist means rolling back four resources to report a typo. So `acquire/1` runs every
-gate first — session key, project name, network spec, volume declarations, service
-specs, mount targets, `:ready` specs, proxy wiring — and only then creates the
+gate first — session key, project name, network spec, volume and network
+declarations, service specs (through `CrowdControl.Service`, the shape Kubernetes
+shares), mount targets, network memberships, `:files` destinations, `:ready`
+specs, proxy wiring, and the Docker version floor — and only then creates the
 networks, the volumes, and the containers in dependency order.
+
+**`:files`** are staged between `POST /containers/create` and `start` with
+`PUT /containers/{id}/archive`: an in-memory `:erl_tar` archive carrying each
+file's `mode`, `uid` and `gid`, one upload per destination root (the writable
+mount a file sits under, else `/`). The daemon refuses an archive into a read-only
+rootfs with `403` unless the destination is inside a volume, so that, a read-only
+mount, and a path under a tmpfs (written beneath it, hidden at start) are all
+`{:error, {:compose, {:files_not_writable, {service, path}}}}` before any request.
+Paths are absolute and free of `.`/`..` segments, unique, and at most 1 MiB in
+total; a `:mode` is `0..0o777` (no setuid, setgid or sticky bits). `:files` is for
+configuration, never credentials — those go through `env:` on both substrates (on
+Kubernetes, where `:files` becomes a ConfigMap readable by anyone with `get` on the
+namespace, `env` becomes a per-session Secret; see "Kubernetes `:services`"
+below). Nothing scans the content. No service may stage `:files` under the
+sandbox's capture directory, and a sidecar mounting the capture volume must mount
+it `read_only: true`: either is
+`{:error, {:compose, {:capture_mount_writable, service}}}`.
 
 Ordering comes from each spec's `:depends_on`, resolved by a topological sort
 (`order_services/1`). Readiness comes from `:ready`, which becomes a container
@@ -495,10 +605,22 @@ rather than by compose project, so the reaper reaps stacks instead of picking
 containers off one at a time and leaving a half-torn-down stack behind. The
 `com.docker.compose.oneoff=False` label filter additionally excludes
 `Provider.Docker`'s single containers, which carry no compose labels at all.
-`scrub/1` drops the top-level credential keys via
-`CrowdControl.Store.scrub_opts/1` and then strips each service spec's `:env` too,
-because `Store.scrub_opts/1` cannot see into `:services` and a service spec's
-`:env` is exactly where a proxy's upstream key or a database password lives.
+`scrub/1` runs the handle's config through `CrowdControl.Store.scrub_opts/1`,
+which drops the credential keys and keeps every service spec without its `:env`
+and `:files`, where a proxy's upstream key or a database password lives.
+
+Extra `:networks` are torn down with the fixed three, found the same two ways as
+named volumes: the names the handle knows, plus a `crowd_control.session` label
+query, so a stack rebuilt by `list_live/1` leaks none of them.
+
+**Drain.** A service with `drain:` set — a log shipper — is not SIGKILLed by the
+force-remove. `release/1` first waits the longest `drain` (ms) once, so the
+shipper's file source reaches EOF after the session's last byte, then sends
+`POST /containers/{id}/stop?t=<shutdown_limit + 5>`, giving it its own graceful
+shutdown limit plus a margin before the daemon's SIGKILL. The budget is a
+container label too, so a reaper-rebuilt handle drains the same way. A failed stop
+is logged and never blocks the force-remove; the sandbox and forwarder are not
+drained; a rolled-back `acquire/1` does not wait on a drain at all.
 
 ## `Provider.Gce`
 
@@ -797,6 +919,146 @@ Only messages travel, never `%GcpCompute.Error{}`'s `:body`: that field can hold
 `Inspect` redacts it, but an error tuple that reaches a crash report or `Logger`
 metadata is not always rendered through `Inspect` — which is exactly the leak
 [operations.md](operations.md)'s `LogRedactor` section covers from the other side.
+
+## Kubernetes `:services`
+
+`CrowdControl.Backend.Kubernetes` is a backend, not a provider, but it takes the
+same sidecar specs as `Provider.Compose` — a `CrowdControl.Service` map, with the
+same `egress`, `networks:`, `host_config:`/`weaken:`, `:files`, `:ready`, `drain`
+and `shutdown_limit` — so one stack definition means the same thing on both. The
+full rules are in `CrowdControl.Backend.Kubernetes.Services`; this is the map.
+
+### Placement is required, because a Pod boundary is posture
+
+Compose ignores `placement:` (with a warning). Kubernetes refuses a service
+without one, `{:error, {:k8s, {:placement_required, name}}}`, for the same reason
+`egress` has no default: posture is never inferred.
+
+| `placement` | Objects created | `egress: :allow` | Sees the capture | Floor |
+|---|---|---|---|---|
+| `:pod` | none of its own: a native sidecar (`restartPolicy: Always`) in the sandbox Pod's `initContainers`, after `cc-init` | refused, `{:k8s, {:pod_sidecar_egress_forbidden, name}}` — it shares the sandbox's network namespace | yes, through a `read_only: true` mount of the capture directory | Kubernetes 1.29 |
+| `:separate` | Pod, ClusterIP Service (when it has `ports`) and NetworkPolicy, all `cc-<session_key>-<name>` | allowed, on a network the sandbox is not on | no | — |
+| `{:external, target}` | nothing; peers sharing its network get an egress rule to the `target` selector or `ip_block` | n/a | n/a | — |
+
+A `:separate` name is at most 27 characters (the object name must fit a 63-char
+DNS label), and `cc`, `cc-init`, `deny-all` and `sandbox` are reserved. Using
+`:services` or `:sandbox_ports` requires an explicit `:network`, and any
+`:separate` service runs the enforcement probe whatever `:network` says.
+
+### Edges come from `networks:`, as on Compose
+
+The sandbox is on `sbx`, and so is a service that names no network. Two parties
+sharing a network may reach each other's declared `ports` — the sandbox's are
+`:sandbox_ports`, which also creates a `cc-<session_key>-sandbox` Service so a
+browser can open a dev server under test as `sandbox:<port>`. Nothing else is
+allowed in or out. An `egress: :allow` service only answers peers (no
+in-session edge starts from it, so a compromised proxy cannot turn into the
+browser), may share no network with the sandbox
+(`{:k8s, {:sandbox_shares_network_with_egress, {name, "sbx"}}}`, invariant 1 in
+Kubernetes form), and gets kube-dns plus TCP 443 to the internet minus RFC 1918,
+link-local, CGNAT and ULA. An external's `sbx` membership means the sandbox Pod
+alone, so a `:pod` log shipper's aggregator is not handed to a browser that also
+sits on `sbx`.
+
+An external is a hole in the sandbox's deny-all, so
+`CrowdControl.Backend.Kubernetes.Services.check_external/2` holds one the sandbox
+reaches to what it is for: an `ip_block` inside RFC 1918, CGNAT or ULA space or at
+least a /24 (IPv4) or /56 (IPv6), else `{:k8s, {:external_too_broad, {name, cidr}}}`;
+no `egress: :allow` (`{:k8s, {:external_egress_forbidden, name}}`); and no port 53
+or `kube-system` selector without `allow_dns: true` in the target
+(`{:k8s, {:external_dns_not_declared, {name, 53 | "kube-system"}}}`). The DNS check
+is best-effort. It matches namespace-selector values only, so a selector reaching
+`kube-system` by another label, or an `ip_block` covering the DNS Pods, goes
+undetected. It also knows only port 53, so it misses a resolver on 5353 (OpenShift).
+A service container with no `user:` runs with `runAsNonRoot: true` unless
+`weaken: [:user]` says otherwise. A `host_config.tmpfs` entry becomes an in-memory
+`emptyDir` sized by its `size=`, and its other options are dropped. `noexec,nosuid`
+cannot be expressed, so the browser preset's `/tmp` is executable on Kubernetes.
+
+### No DNS: `hostAliases` instead
+
+No policy allows kube-dns to the sandbox or to an `egress: :none` service —
+a recursive resolver is an exfiltration channel. Every Pod instead gets
+`hostAliases` mapping each peer's name to its Service ClusterIP, read back off
+the created Service, so `browser:8931` and `ws://browser:3000/…` resolve exactly
+as on Compose. An external with `host` and `ip` becomes an alias too; one named
+only by a hostname is unreachable from a Pod with no DNS, which is why
+`CrowdControl.Preset.LogShipper` requires the aggregator's ClusterIP as `ip:`.
+
+### Create order, rollback and the orphan sweep
+
+`provision/1` validates every spec and checks the version floors before its first
+request, then creates ConfigMaps (`:files`) → Secrets (`env`) → NetworkPolicies →
+Services (their ClusterIPs read back) → service Pods → one shared
+`:provision_timeout` for every service Pod's readiness → under `network: :deny_all`,
+a re-check that `<pod>-deny-all` still exists (`{:k8s, {:policy_missing, name}}`
+if not) → the sandbox Pod. A service that never becomes ready is
+`{:error, {:k8s, {:service_not_ready, {name, reason}}}}`. Any failure runs
+`destroy/1`, which derives every object name from the sandbox Pod's
+`crowd_control.services` annotation and deletes each, 404 being success; with a
+drained `:pod` sidecar it deletes with a grace of `drain + shutdown_limit + 5`
+seconds and the sidecar carries a `preStop` sleep (Kubernetes 1.30). A drained Pod
+keeps running through its grace, so `destroy/1` waits for it to be gone (grace plus
+10 s) before deleting its NetworkPolicies; one still there at the deadline keeps
+its policy for the sweep. The same holds for a drained `:separate` service Pod and
+its own policy. The order follows reach. A `:separate` Pod on `sbx`, which the
+sandbox Pod can reach and a drained `:pod` shipper may still be sending to, is
+deleted only once the sandbox Pod's wait is over. Every other `:separate` Pod is
+deleted alongside the sandbox Pod, and all the waits overlap, each against its own
+deadline. The derived Services, ConfigMaps and Secrets go after every wait. A
+sandbox Pod whose own DELETE failed and that may still be running (phase
+`Running` or `Unknown`, or unreadable) keeps its `sbx` services — Pod, Service
+and NetworkPolicy, logged in one warning — since it may still reach them. For
+a Pending or finished one (or one already gone) they are deleted as for a
+deleted sandbox: its agent isn't running, and although a Pending Pod's in-Pod
+sidecars may already be up, losing their peers fails closed, while keeping
+them would leave them for good behind a Pod stuck Pending. A later
+`destroy/1` (the reaper's orphan pass) or the sweep removes kept ones once the
+sandbox Pod is gone. Their ConfigMaps and Secrets are deleted as usual: a kept
+`:separate` Pod (`restartPolicy: Never`) keeps the env it loaded, and the
+sandbox's in-Pod sidecars can't restart once their Secret is gone, which fails
+closed.
+
+A service's `env` never reaches a Pod spec. Each service with a non-empty `env`
+gets a per-session Secret, `cc-<session_key>-<service>-env`, labelled
+`crowd_control.session`, `crowd_control.owner_hash`, `crowd_control.service` and
+`crowd_control.role=service-secret`, with one key per variable; its container reads
+each through `valueFrom.secretKeyRef`, `:pod` sidecars included, and the
+`crowd_control.services` annotation holds no values. Env names must match
+`[A-Za-z_][A-Za-z0-9_]*`, as on Compose, or the spec is `{:k8s, {:bad_service, {name, :env}}}` before any
+request. The Secret is deleted with the session's other objects, needs `secrets`
+RBAC (`create, get, list, delete`), and is readable by anyone with `get secrets` in
+the namespace. `:files` stay configuration: the ConfigMap's payload, binary content
+counted base64-encoded, must fit `CrowdControl.Service.max_files_bytes/0`
+(`{:k8s, {:files_too_large, {name, size}}}`).
+
+A node dying between the first service object and the sandbox Pod leaves objects
+nothing names. `CrowdControl.Backend.Kubernetes.sweep_orphans/1`, which the
+reaper calls after a successful `list_live/1`, finds them by label
+(`crowd_control.role` `service`, `service-config` or `service-secret`, this
+owner's hash), re-checks the raw owner annotation, and deletes only those whose
+session has no live Pod (a terminating one counts as live) and that are past both
+`:provision_timeout` plus `:orphan_margin_ms` (default a minute) and their own
+`crowd_control.sweep_after_ms` annotation — the provisioning session's
+`:provision_timeout` plus margin, stamped as wall-clock milliseconds just before
+its objects are created. The same pass deletes a finished (`Succeeded` or
+`Failed`) sandbox Pod that isn't terminating, under the same owner and
+`sweep_after_ms` checks, a full `:provision_timeout` plus `:orphan_margin_ms`
+after it finished (its latest container `finishedAt`, else its creation), so a
+session still reading the exit code has the whole floor. The reaper reports the
+count as `swept`. `list_live/1` itself now selects `crowd_control.role!=service`,
+so a service Pod is never mistaken for a sandbox.
+
+### Version floors
+
+Checked by `CrowdControl.VersionGate` before anything is created, and only when
+the feature is in use; a failure is `{:error, {:version, component, have, need}}`.
+
+| Feature | Needs |
+|---|---|
+| `placement: :pod` sidecars | Kubernetes 1.29 |
+| `preStop` sleep on a drained sidecar | Kubernetes 1.30 |
+| Compose per-service networks, `egress: :allow` sidecars | Docker Engine 25.0.5 (CVE-2024-29018) |
 
 ## Choosing one
 

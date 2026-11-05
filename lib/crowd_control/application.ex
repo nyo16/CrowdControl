@@ -13,10 +13,15 @@ defmodule CrowdControl.Application do
     {store, store_opts} = CrowdControl.Store.resolve()
 
     # Order matters. The store must be up before any session can persist to it,
-    # and the reaper comes last because its boot reconciliation starts sessions
-    # under the session supervisor.
+    # callbacks need their supervisor before a session can dispatch one, and the
+    # reaper comes last because its boot reconciliation starts sessions under
+    # the session supervisor.
     children = [
       {store, store_opts},
+      # Control-protocol callbacks (tool approval, hooks, SDK MCP tool calls) run
+      # here rather than inside the session: one may block on a human, and the
+      # session must keep reading the CLI's output meanwhile.
+      {Task.Supervisor, name: CrowdControl.CallbackSupervisor},
       {DynamicSupervisor,
        name: CrowdControl.SessionSupervisor, strategy: :one_for_one, max_children: max_sessions},
       CrowdControl.Reaper

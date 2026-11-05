@@ -1,7 +1,16 @@
 defmodule CrowdControlTest do
   use ExUnit.Case, async: false
 
+  alias CrowdControl.Backend.Mock
   alias CrowdControl.{Session, TestHelpers}
+  alias CrowdControl.Session.Control
+
+  # A permission callback that takes longer than the run's :timeout, like a
+  # human taking their time.
+  def slow_allow(request, _context, ms) do
+    Process.sleep(ms)
+    {:allow, request["input"]}
+  end
 
   describe "start_session/1" do
     test "returns {:ok, pid} for a valid session" do
@@ -161,15 +170,12 @@ defmodule CrowdControlTest do
                )
     end
 
-    test "times out on an absolute deadline under a steady non-result stream" do
+    test "times out at the session's deadline under a steady non-result stream" do
       # A continuous stream of assistant (non-result) messages must not keep
-      # pushing the deadline out. Discrimination window:
-      #   * fixed (absolute) deadline  -> returns at ~1000ms (1x the timeout)
-      #   * regressed resetting window -> the session self-expires at 1000ms and
-      #     stops the stream; the last timer reset is that expiry message, so the
-      #     stale window fires ~1000ms later, i.e. ~2000ms (2x).
-      # Both are real monotonic timers (no large drift), so the 1500ms midpoint
-      # cleanly separates correct (<1500ms) from regressed (~2000ms).
+      # pushing the deadline out: the session's turn timer is not refreshed by
+      # output, so it expires at ~1000ms and run/2 returns on that expiry. A
+      # regression (a wait restarted per message, or a session timer refreshed
+      # by output) would return much later; 1500ms separates the two.
       {elapsed_us, result} =
         :timer.tc(fn ->
           CrowdControl.run("go",
@@ -183,6 +189,109 @@ defmodule CrowdControlTest do
 
       assert div(elapsed_us, 1_000) < 1_500,
              "expected timeout near the 1000ms deadline, took #{div(elapsed_us, 1_000)}ms"
+    end
+
+    test "a can_use_tool held longer than :timeout still returns the result (W-4)" do
+      frame = %{
+        "type" => "control_request",
+        "request_id" => "slow-1",
+        "request" => %{"subtype" => "can_use_tool", "tool_name" => "Bash", "input" => %{}}
+      }
+
+      ctl = start_supervised!({Mock, events: [{:stdout_data, JSON.encode!(frame) <> "\n"}]})
+
+      task =
+        Task.async(fn ->
+          CrowdControl.run("go",
+            backend: {Mock, mock: ctl},
+            executable: "claude",
+            timeout: 300,
+            can_use_tool: {__MODULE__, :slow_allow, [600]}
+          )
+        end)
+
+      # The session's turn timer is paused while the request waits, so the
+      # turn still has time left once the answer is written.
+      TestHelpers.wait_until(fn ->
+        Enum.any?(Mock.writes(ctl), &(&1 =~ ~s("behavior":"allow")))
+      end)
+
+      result = JSON.encode!(%{"type" => "result", "subtype" => "success", "is_error" => false})
+      Mock.push_events(ctl, [{:stdout_data, result <> "\n"}])
+
+      assert {:result, "success", _map} = Task.await(task, 5_000)
+    end
+
+    # Asserting this through run/2 would need a session answering later than
+    # :timeout + 30 s + the margin, so the backstop's grace is unit-tested.
+    test "the backstop grace is the one the session resolves, backend: config included (S-A2)" do
+      ctl = start_supervised!({Mock, events: []})
+
+      opts = [
+        backend: {Mock, mock: ctl, interrupt_grace: 45_000},
+        executable: "claude",
+        timeout: 60_000,
+        can_use_tool: {__MODULE__, :slow_allow, [0]}
+      ]
+
+      assert CrowdControl.run_grace(opts) == 45_000
+
+      {:ok, pid} = Session.start_link(opts)
+      assert :sys.get_state(pid).control.interrupt_grace == CrowdControl.run_grace(opts)
+      TestHelpers.stop_session(pid)
+    end
+
+    test "the backstop grace: backend: config over top level, then the default (S-A2)" do
+      default = Control.default_interrupt_grace()
+
+      assert CrowdControl.run_grace([]) == default
+      assert CrowdControl.run_grace(interrupt_grace: 45_000) == 45_000
+      assert CrowdControl.run_grace(backend: {Mock, interrupt_grace: 45_000}) == 45_000
+
+      assert CrowdControl.run_grace(
+               interrupt_grace: 1_000,
+               backend: {Mock, interrupt_grace: 45_000}
+             ) == 45_000
+
+      assert CrowdControl.run_grace(interrupt_grace: 45_000, backend: Mock) == 45_000
+    end
+  end
+
+  describe "run!/2" do
+    test "returns the bare result map for a successful turn" do
+      assert %{"result" => "done:hi"} =
+               CrowdControl.run!("hi", executable: TestHelpers.fake_cli_path(), timeout: 5_000)
+    end
+
+    test "raises the classified error for an error result" do
+      error =
+        assert_raise CrowdControl.Error, fn ->
+          CrowdControl.run!("hi",
+            executable: TestHelpers.fake_cli_path(),
+            env: %{"FAKE_CLI_ERROR_SUBTYPE" => "error_max_turns", "FAKE_CLI_SESSION_ID" => "s-1"},
+            timeout: 5_000
+          )
+        end
+
+      assert %CrowdControl.Error{
+               kind: :max_turns_exceeded,
+               subtype: "error_max_turns",
+               session_id: "s-1",
+               reason: %{num_turns: 1}
+             } = error
+    end
+
+    test "raises :session_error when no result arrives" do
+      error =
+        assert_raise CrowdControl.Error, fn ->
+          CrowdControl.run!("slow",
+            executable: TestHelpers.fake_cli_path(),
+            env: %{"FAKE_CLI_SLEEP" => "5"},
+            timeout: 300
+          )
+        end
+
+      assert %CrowdControl.Error{kind: :session_error, reason: :timeout} = error
     end
   end
 

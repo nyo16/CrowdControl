@@ -61,32 +61,75 @@ defmodule CrowdControl.Provider.Compose do
     * `:forwarder_service` — the name the forwarder is given, default
       `"forwarder"`. Always synthesised; see `:forwarder_image`.
     * `:forwarder_image` — default `"alpine/socat:1.8.1.3"`. Any image with
-      `socat` on `PATH` works; the provider sets `Entrypoint` itself.
+      `socat` on `PATH` works; the provider sets `Entrypoint` itself, and runs
+      it as `nobody` (`User: "65534:65534"`), so that `socat` must be
+      executable by uid 65534.
     * `:network` — `[internal: true, driver: "bridge", options: %{}]`. See the
       warning below.
+    * `:networks` — extra **internal** networks, `[%{name: "brw"}]`. Created
+      as `<project>-<name>` with `Internal: true` and destroyed with the stack.
+      A service joins one by naming it in its own `networks:`; see "Per-service
+      networks" below. `sbx`, `pub` and `egress` are reserved.
     * `:volumes` — named volume *declarations*, `[%{name: "workspace"}]`.
       Created as `<project>-<name>` and destroyed with the stack. Note this is
       a declaration list, not a mount list: a service mounts one by naming it
       in its own `:volumes`, and only Compose creates the storage it mounts —
       Docker and Kubernetes expect it to exist already.
-    * `:ready` — per-service healthchecks, `%{"db" => %{test: [...]}}`.
+    * `:ready` — per-service healthchecks, `%{"db" => %{test: [...]}}`. A
+      service's own `ready: %{test: [...]}` is used when this has no entry.
     * `:project_name` — default `"cc-<session_key>"`.
     * `:proxy_service` — the sidecar fronting the egress proxy. See below.
     * `:health_timeout` — deadline for the healthcheck poll, default `60_000`.
 
   Agent, exactly as `CrowdControl.Provider.Docker` takes them: `:image`,
   `:agent_port`, `:capture_path`, `:ready_timeout`, `:req_adapter`,
-  `:docker_host`, `:timeout`.
+  `:docker_host`, `:timeout`. `:agent_port` is an integer in `1..65_535`;
+  anything else is `{:error, {:compose, {:bad_agent_port, {forwarder, port}}}}`.
+  `:image` and `:forwarder_image` must be image references (see
+  "Posture is never inferred"), as every service's `image:` must.
 
   Hardening (`:cpus`, `:memory`, `:cap_drop`, `:security_opt`, `:pids_limit`,
-  `:user`, `:readonly_rootfs`, `:tmpfs`) comes from these top-level options and
-  applies to **every** container in the stack, through
-  `CrowdControl.Backend.Docker.HostConfig`. There are deliberately no
-  per-service overrides: one posture per stack is the whole reason that module
-  exists, and a sidecar quietly weaker than the sandbox it shares a network
-  with is not a useful thing to be able to express.
+  `:user`, `:readonly_rootfs`, `:tmpfs`, `:shm_size`, `:init`) comes from
+  these top-level options and is the **default for every container** in the
+  stack, through `CrowdControl.Backend.Docker.HostConfig`.
+
+  ### Hardened by default, per-service overrides, weakening explicit
+
+  A service may override the stack's HostConfig with `host_config:`. Resource
+  keys (`:shm_size`, `:init`, `:pids_limit`, `:memory`, `:cpus`, `:tmpfs`)
+  need no declaration — a browser needs a large `/dev/shm` and an init, and
+  neither weakens anything. A key that *weakens* the hardened default —
+  `:cap_add`, `no_new_privileges: false`, `readonly_rootfs: false`, a root
+  `user:` (or, on a sidecar with no `user:`, an image whose default user is
+  not a numeric uid in `1..2147483647` (and a gid, if given, in
+  `0..2147483647`) — see "Posture is never inferred"), a
+  `host_path` mount on a sidecar (`:host_path`), or a `tmpfs` without
+  `noexec,nosuid` (`:tmpfs_exec`) — must also be named in the
+  service's `weaken: [...]` list (see `CrowdControl.Service`), or
+  `acquire/1` refuses with
+  `{:error, {:compose, {:weakening_not_declared, {service, key}}}}`. `privileged`
+  is refused outright (`{:privileged_refused, service}`), declared or not.
+
+  This replaces the earlier "one posture per stack" rule, and the risk it
+  accepts is specific: in the two-tier browser layout the browser shares a
+  network with the sandbox *and* has a path to the egress proxy, so a weakened
+  browser (root, added capabilities, no `no-new-privileges`) is the most
+  valuable target a compromised sandbox can reach. Hence per key, written
+  down, never inferred.
+
+  ### The capture file is the sandbox's alone
+
+  A sidecar that reads the transcript (a log shipper) mounts the volume the
+  sandbox mounts at `Path.dirname(:capture_path)`. It must mount it
+  `read_only: true`: a writable mount of the same source (named volume or host
+  path) could append to, truncate or rotate the capture and break every
+  persisted byte offset. Nor may any service stage `:files` into it, since a
+  pre-seeded capture is a forged transcript. Either is refused with
+  `{:error, {:compose, {:capture_mount_writable, service}}}`.
 
   ### Service spec
+
+  Validated by `CrowdControl.Service`, the shape Kubernetes shares:
 
       %{
         name: "proxy",                      # required, unique, DNS-safe
@@ -99,13 +142,62 @@ defmodule CrowdControl.Provider.Compose do
           %{name: "cache", target: "/cache", read_only: false},
           %{host_path: "/srv/in", target: "/in", read_only: true}
         ],
+        files: [%{path: "/cfg/acl.yaml", content: "...", mode: 0o444}],
         depends_on: ["db"],                 # optional, topologically ordered
         user: "1000:1000",                  # optional
-        port: 8080                          # only read for :proxy_service
+        port: 8080,                         # only read for :proxy_service
+        networks: ["brw"],                  # default ["sbx"]
+        host_config: %{shm_size: 1_073_741_824, init: true},
+        weaken: [:host_path],               # for the host_path mount; see above
+        drain: 3_000,                       # ms; log shippers, see "Teardown"
+        shutdown_limit: 20                  # s; with :drain
       }
 
-  Every service gets its `name` as an alias on the sandbox network, so services
-  address each other by name and nothing has to learn an IP.
+  `placement:` is Kubernetes-only and ignored here with a warning.
+
+  Every service gets its `name` as an alias on each network it joins, so
+  services address each other by name and nothing has to learn an IP.
+
+  ### `:files`
+
+  Staged between `POST /containers/create` and `start` with
+  `PUT /containers/{id}/archive`, as an in-memory tar carrying each file's
+  `mode`, `uid` and `gid`. The daemon refuses an archive into a read-only
+  rootfs unless the destination is inside a volume, so a file must sit under a
+  writable mount of that service or on a writable rootfs, and not under a
+  tmpfs (which would hide it at start); anything else is
+  `{:error, {:compose, {:files_not_writable, {service, path}}}}` before any
+  request. Paths are absolute and `..`-free, at most 1 MiB in total.
+  **`:files` is for configuration, never credentials** — those go through
+  `env:`.
+
+  ### Per-service networks
+
+  A service's first membership is its create-time endpoint; the rest are
+  connected after create. `egress: :allow` still adds the NAT bridge, so
+  posture comes from `egress`, never from a membership list. The sandbox must
+  stay on `sbx`, which the forwarder reaches it across.
+
+  Once a stack uses per-service networks (a `:networks` declaration or any
+  `networks:` membership), the sandbox may share **no** network with an
+  `egress: :allow` service other than the `:proxy_service`, which is exempt
+  because the sandbox reaches the Anthropic API only through it:
+  `{:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}`.
+  A stack using neither keeps the single-network `sbx` model this module has
+  always built, where an `egress: :allow` sidecar on `sbx` is the declared
+  relay: with one network there is nowhere else to put it. Declaring
+  `:networks` opts into the strict model. Its two-tier browser layout is the
+  sandbox on `sbx`, the browser on `sbx` and `brw`, and the forward proxy on
+  `brw` with `egress: :allow`.
+
+  ### Minimum Docker version
+
+  Per-service networks and any `egress: :allow` sidecar need Docker Engine
+  25.0.5 or 26.0.0+: before that, the embedded DNS on an internal network
+  forwarded queries upstream (CVE-2024-29018), an exfiltration path out of a
+  network with no route. `GET /version` is asked once per `:docker_host`, only
+  when one of those is in use, and an older daemon is
+  `{:error, {:version, :docker, have, {25, 0, 5}}}` before anything is created.
 
   ## Posture is never inferred
 
@@ -123,6 +215,33 @@ defmodule CrowdControl.Provider.Compose do
       bridge and full internet. It is the one option here that throws away the
       module's reason to exist, so it exists only as an explicit, typed-out
       act.
+    * Every image is a reference in the distribution/reference grammar
+      (`[domain[:port]/]path[:tag][@digest]`, or a bare `sha256:<64 hex>`
+      Id); anything else is `{:error, {:compose, {:bad_service, {name,
+      :image}}}}`, naming the service, the sandbox or the forwarder.
+    * Every distinct image — the sandbox's, the forwarder's and each
+      sidecar's — is inspected once (`GET /images/{image}/json`, read-only,
+      after every other option check and before anything is created). The
+      providers never pull, so an image the daemon does not have is
+      `{:error, {:compose, {:image_not_found, {name, image}}}}`, naming the
+      first service that uses it, rather than a create failure after the
+      networks exist.
+    * A sidecar with no `user:` runs as its image's default user, so that
+      default is part of its posture. Unless the service names `:user` in
+      `weaken:`, the default passes only when it is a numeric uid in
+      `1..2147483647` (and a gid, if given, in `0..2147483647`): `"1000"`,
+      `"1000:1000"`. Anything else — `""` (no `USER`), a name such as `node`,
+      a spelling Docker still runs as uid 0 (`"00"`, `"+0"`, `":1000"`), or an
+      id outside that range — is refused with `{:error, {:compose,
+      {:weakening_not_declared, {name, :user}}}}`. Such a sidecar is then
+      created from the inspected image Id rather than its name, so the image
+      whose user was checked is the image that runs. The sandbox is exempt, as
+      on Kubernetes, where its `runAsNonRoot` is opt-in (`:run_as_user`); the
+      forwarder always runs as `nobody`.
+    * An explicit `user:` name is trusted as written. Docker resolves it
+      against the image's `/etc/passwd`, and only `root` or a numeric uid 0
+      needs `weaken: [:user]`, so a name the image maps to uid 0 runs as root
+      undeclared. Kubernetes refuses a named `user:`.
 
   ## Egress proxy
 
@@ -148,12 +267,25 @@ defmodule CrowdControl.Provider.Compose do
   no-proxy posture — the sandbox holds a real provider credential — and it is
   what makes the removal above observable rather than notional. `:api_key` and
   `:session_token` are both in `CrowdControl.Store.secret_keys/0`, so neither
-  survives `scrub/1` into a Store record.
+  survives `scrub/1` into a Store record. A caller-supplied `:session_token`
+  must start with `ccst_`, the prefix `CrowdControl.Preset.LogShipper` redacts,
+  or `acquire/1` refuses with `{:error, {:compose, {:bad_session_token, :prefix}}}`.
 
   Unlike `CrowdControl.Backend.Docker`, this provider needs no explicit
   `:network_mode` to make the proxy enforcing. There is no `bridge` to
   accidentally choose: the sandbox network is created by this module, is
   internal by default, and lives and dies with the session.
+
+  ## Teardown
+
+  `release/1` force-removes every container, then the networks, then the
+  named volumes. A service with `drain:` set (a log shipper) is first given a
+  graceful stop, because a force-remove SIGKILLs it mid-flush and loses the
+  transcript's tail: wait the longest `drain` (ms) once, so its file source
+  reaches EOF, then `POST /containers/{id}/stop?t=<shutdown_limit + 5>`. The
+  drain budget is also a container label, so a stack rebuilt by `list_live/1`
+  drains the same way. A failed stop is logged and never blocks the
+  force-remove; a rolled-back `acquire/1` does not drain at all.
 
   ## The published port is never persisted
 
@@ -177,15 +309,27 @@ defmodule CrowdControl.Provider.Compose do
   alias CrowdControl.Provider.Docker
   alias CrowdControl.Provider.Endpoint
   alias CrowdControl.ReqAdapter
+  alias CrowdControl.Service
   alias CrowdControl.Store
+  alias CrowdControl.VersionGate
 
   @default_agent_port 8080
   @default_capture "/var/log/cc/out.jsonl"
+  @session_token_prefix "ccst_"
   @default_ready_timeout 30_000
   @default_health_timeout 60_000
   @default_sandbox_service "sandbox"
   @default_forwarder_service "forwarder"
   @default_proxy_port 8080
+
+  # `nobody`: the forwarder holds nothing and needs no privilege. It can still
+  # listen on any `:agent_port`: Docker Engine 20.10 or later sets
+  # `net.ipv4.ip_unprivileged_port_start` to 0 in each container's network
+  # namespace.
+  @forwarder_user "65534:65534"
+
+  # Docker's uid range is `0..2147483647`; see `numeric_non_root?/1`.
+  @max_uid 2_147_483_647
 
   # Pinned, and only the *command* is load-bearing: any image with socat on
   # PATH works, which is what :forwarder_image is for on an air-gapped
@@ -210,6 +354,12 @@ defmodule CrowdControl.Provider.Compose do
   @project_label "com.docker.compose.project"
   @service_label "com.docker.compose.service"
 
+  # The drain budget of a `drain:` service, on its container, so a handle
+  # `list_live/1` rebuilt from labels still drains it. Not compose's own
+  # vocabulary, so no `com.docker.compose.` prefix.
+  @drain_label "crowd_control.drain_ms"
+  @stop_timeout_label "crowd_control.stop_timeout_s"
+
   defstruct [
     :project,
     :session_key,
@@ -224,8 +374,13 @@ defmodule CrowdControl.Provider.Compose do
     capture_path: @default_capture,
     containers: [],
     volumes: [],
+    networks: [],
+    drained: [],
     config: []
   ]
+
+  @typedoc "A drained service as teardown needs it: `{service, drain_ms, stop_timeout_s}`."
+  @type drained :: {String.t(), non_neg_integer(), pos_integer()}
 
   @type t :: %__MODULE__{
           project: String.t() | nil,
@@ -241,6 +396,8 @@ defmodule CrowdControl.Provider.Compose do
           capture_path: String.t(),
           containers: [{String.t(), String.t()}],
           volumes: [String.t()],
+          networks: [String.t()],
+          drained: [drained()],
           config: keyword()
         }
 
@@ -250,17 +407,29 @@ defmodule CrowdControl.Provider.Compose do
   def acquire(opts) do
     # Every gate runs before a single byte reaches the daemon, k8s-style. A
     # stack is N resources, and discovering an invalid service spec after four
-    # of them exist means rolling back four resources to report a typo.
+    # of them exist means rolling back four resources to report a typo. The
+    # image and version gates come last: they are the only gates that make
+    # requests, and both are read-only.
     with :ok <- ensure_req!(),
+         :ok <- validate_session_token(opts),
          {:ok, session_key} <- fetch_session_key(opts),
          {:ok, project} <- fetch_project(opts, session_key),
          {:ok, network} <- fetch_network(opts),
          {:ok, volumes} <- fetch_volumes(opts, project),
+         {:ok, networks} <- fetch_networks(opts, project),
+         :ok <- validate_agent_port(opts),
          {:ok, services} <- build_services(opts),
          :ok <- validate_mounts(services, volumes),
+         :ok <- validate_memberships(opts, services, networks),
+         :ok <- validate_files(opts, services),
+         :ok <- validate_capture(opts, services),
          :ok <- validate_ready(opts, services),
          :ok <- validate_proxy(opts, services),
-         {:ok, ordered} <- order_services(services) do
+         {:ok, ordered} <- order_services(services),
+         {:ok, image_ids} <- validate_images(opts, services),
+         :ok <- ensure_versions(opts, services, networks) do
+      warn_placement(services)
+
       handle = %__MODULE__{
         project: project,
         session_key: session_key,
@@ -274,23 +443,34 @@ defmodule CrowdControl.Provider.Compose do
         agent_port: opts[:agent_port] || @default_agent_port,
         capture_path: opts[:capture_path] || @default_capture,
         volumes: Enum.map(volumes, & &1.full_name),
+        networks: Enum.map(networks, & &1.full_name),
+        drained: drained_specs(services),
         config: opts
       }
 
-      start_stack(handle, ordered, network, volumes, credentials(opts, services))
+      start_stack(
+        handle,
+        ordered,
+        network,
+        volumes,
+        networks,
+        credentials(opts, services),
+        image_ids
+      )
     end
   end
 
   # Every resource name is derived from the project *before* any HTTP happens,
   # so `handle` is already complete when the first call is made and rollback can
   # never be looking at a half-populated struct. Only container ids accumulate,
-  # and `launch/3` is shaped around that.
-  defp start_stack(handle, services, network, volumes, creds) do
+  # and `launch/4` is shaped around that.
+  defp start_stack(handle, services, network, volumes, networks, creds, image_ids) do
     with {:ok, _} <- create_sandbox_network(handle, network),
          {:ok, _} <- create_publish_network(handle),
          :ok <- create_egress_network(handle, services),
+         :ok <- create_service_networks(handle, networks),
          :ok <- create_volumes(handle, volumes) do
-      launch(handle, services, creds)
+      launch(handle, services, creds, image_ids)
     else
       # An `else` is safe here only because nothing above it rebinds `handle` —
       # see the comment on `bring_up/3`.
@@ -298,15 +478,15 @@ defmodule CrowdControl.Provider.Compose do
     end
   end
 
-  defp launch(handle, services, creds) do
-    case Enum.reduce_while(services, {:ok, handle}, &launch_one(&1, &2, creds)) do
+  defp launch(handle, services, creds, image_ids) do
+    case Enum.reduce_while(services, {:ok, handle}, &launch_one(&1, &2, creds, image_ids)) do
       {:ok, handle} -> finish(handle)
       {:error, handle, reason} -> rollback(handle, reason)
     end
   end
 
-  defp launch_one(service, {:ok, handle}, creds) do
-    case create_container(handle, service, creds) do
+  defp launch_one(service, {:ok, handle}, creds, image_ids) do
+    case create_container(handle, service, creds, image_ids) do
       {:ok, id} -> bring_up(add_container(handle, service.name, id), service, id)
       {:error, reason} -> {:halt, {:error, handle, reason}}
     end
@@ -317,8 +497,12 @@ defmodule CrowdControl.Provider.Compose do
   # obvious way, the rollback below would run against a handle that still had
   # `containers: []` and would delete the networks while leaking every
   # container — silently, since `release/1` returns `:ok` either way.
+  #
+  # Files are staged after every endpoint is attached and before `start`, so the
+  # process never runs without its configuration.
   defp bring_up(handle, service, id) do
     with :ok <- connect_networks(handle, service, id),
+         :ok <- stage_files(handle, service, id),
          :ok <- start_container(handle, id),
          :ok <- await_healthy(handle, service, id) do
       {:cont, {:ok, handle}}
@@ -337,9 +521,10 @@ defmodule CrowdControl.Provider.Compose do
   # Unconditional, not best-effort-on-some-paths. A leaked stack is N resources
   # rather than one, and a leaked network is worse than untidy: its name is
   # derived from the session key, so the next acquire for that session inherits
-  # it.
+  # it. No drain here: a stack that never finished coming up has shipped
+  # nothing worth waiting for.
   defp rollback(handle, reason) do
-    _ = release(handle)
+    _ = teardown(handle, @teardown_attempts)
     {:error, reason}
   end
 
@@ -387,6 +572,25 @@ defmodule CrowdControl.Provider.Compose do
     end
   end
 
+  # Extra stack networks are always internal: they exist to connect services
+  # to each other (a browser to its proxy) without a route anywhere. The only
+  # way out of a stack stays the `-egress` bridge, reached by `egress: :allow`.
+  defp create_service_networks(handle, networks) do
+    each_ok(networks, fn network ->
+      body = %{
+        "Name" => network.full_name,
+        "Driver" => "bridge",
+        "Internal" => true,
+        "Labels" => network_labels(handle, network.name)
+      }
+
+      case create_network(handle, body) do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end)
+  end
+
   defp create_network(handle, body) do
     case API.request(handle.config, :post, "/networks/create", json: body) do
       {:ok, response} ->
@@ -418,12 +622,25 @@ defmodule CrowdControl.Provider.Compose do
     end)
   end
 
+  # A service's first membership is its create-time endpoint, the rest are
+  # connected after create, and `egress: :allow` always adds the NAT bridge
+  # last — posture comes from `egress`, never from a membership list.
   defp primary_network(handle, %{role: :forwarder}), do: handle.publish_network
-  defp primary_network(handle, _service), do: handle.sandbox_network
+  defp primary_network(handle, service), do: hd(memberships(handle, service))
 
   defp secondary_networks(handle, %{role: :forwarder}), do: [handle.sandbox_network]
-  defp secondary_networks(handle, %{egress: :allow}), do: [handle.egress_network]
-  defp secondary_networks(_handle, _service), do: []
+
+  defp secondary_networks(handle, service) do
+    tl(memberships(handle, service)) ++
+      if service.egress == :allow, do: [handle.egress_network], else: []
+  end
+
+  defp memberships(handle, service) do
+    Enum.map(Service.networks(service), &network_full_name(handle, &1))
+  end
+
+  defp network_full_name(handle, "sbx"), do: handle.sandbox_network
+  defp network_full_name(handle, name), do: "#{handle.project}-#{name}"
 
   # --- volumes ---
 
@@ -442,12 +659,12 @@ defmodule CrowdControl.Provider.Compose do
 
   # --- containers ---
 
-  defp create_container(handle, service, creds) do
+  defp create_container(handle, service, creds, image_ids) do
     name = container_name(handle, service)
 
     case API.request(handle.config, :post, "/containers/create",
            params: [name: name],
-           json: container_body(handle, service, creds)
+           json: container_body(handle, service, creds, image_ids)
          ) do
       {:ok, %{"Id" => id}} ->
         {:ok, id}
@@ -467,9 +684,11 @@ defmodule CrowdControl.Provider.Compose do
     end
   end
 
-  defp container_body(handle, service, creds) do
+  # A sidecar whose image default user was checked is created from that image's
+  # Id (see `validate_images/2`); every other container from its name.
+  defp container_body(handle, service, creds, image_ids) do
     %{
-      "Image" => service.image,
+      "Image" => Map.get(image_ids, service.name, service.image),
       "Labels" => container_labels(handle, service),
       "Env" => env(handle, service, creds),
       "HostConfig" => host_config(handle, service),
@@ -504,23 +723,26 @@ defmodule CrowdControl.Provider.Compose do
 
   defp host_config(handle, service) do
     handle.config
-    |> HostConfig.build(network_mode: primary_network(handle, service))
+    |> HostConfig.build(
+      network_mode: primary_network(handle, service),
+      overrides: service.host_config
+    )
     |> maybe_put("Binds", presence(binds(handle, service)))
     |> maybe_put("PortBindings", port_bindings(handle, service))
   end
 
   defp binds(handle, service) do
-    Enum.map(service.mounts, fn mount ->
+    Enum.map(service.volumes, fn mount ->
       suffix = if mount.read_only, do: ":ro", else: ""
-
-      # A named volume is namespaced by the project, because the stack created
-      # it and destroys it. A host path is the host's, and prefixing it would
-      # name a directory that does not exist.
-      source = mount.host_path || "#{handle.project}-#{mount.name}"
-
-      "#{source}:#{mount.target}#{suffix}"
+      "#{bind_source(handle.project, mount)}:#{mount.target}#{suffix}"
     end)
   end
+
+  # A named volume is namespaced by the project, because the stack created it
+  # and destroys it. A host path is the host's, and prefixing it would name a
+  # directory that does not exist.
+  defp bind_source(project, %{kind: :volume, source: name}), do: "#{project}-#{name}"
+  defp bind_source(_project, %{kind: :host_path, source: path}), do: path
 
   defp start_container(handle, id) do
     case API.request(handle.config, :post, "/containers/#{id}/start") do
@@ -528,6 +750,131 @@ defmodule CrowdControl.Provider.Compose do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # --- files ---
+
+  # One `PUT /containers/{id}/archive` per destination root, between create and
+  # start. The root is the writable mount a file lives under, else `/`: the
+  # daemon refuses an archive into a read-only rootfs with 403 *unless* the
+  # destination is inside a volume, and it must already exist — a mount target
+  # does, an arbitrary directory may not. Intermediate directories inside the
+  # root are created by the daemon from the tar entries.
+  defp stage_files(_handle, %{files: []}, _id), do: :ok
+
+  defp stage_files(handle, service, id) do
+    service
+    |> file_groups()
+    |> each_ok(fn {root, files} ->
+      case API.request(handle.config, :put, "/containers/#{id}/archive",
+             params: [path: root],
+             headers: [{"content-type", "application/x-tar"}],
+             body: archive(root, files)
+           ) do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end)
+  end
+
+  defp file_groups(service) do
+    service.files
+    |> Enum.group_by(&file_root(service, &1.path))
+    |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp file_root(service, path) do
+    case covering_mount(service, path) do
+      nil -> "/"
+      mount -> mount.target
+    end
+  end
+
+  # The deepest mount whose target contains `path`, so a file under a nested
+  # mount lands in the inner one, which is where the container will see it.
+  defp covering_mount(service, path) do
+    service.volumes
+    |> Enum.filter(&under?(path, &1.target))
+    |> Enum.max_by(&byte_size(&1.target), fn -> nil end)
+  end
+
+  defp under?(path, dir), do: String.starts_with?(path, String.trim_trailing(dir, "/") <> "/")
+
+  @doc false
+  # An uncompressed tar of `files`, entry names relative to `root`, built in
+  # memory by `:erl_tar` with each file's owner, then each entry's mode set by
+  # `put_modes/2`. Public so the bytes can be round-tripped in a test without
+  # a daemon.
+  @spec archive(String.t(), [Service.file()]) :: binary()
+  def archive(root, files) do
+    {:ok, fd} = :file.open(<<>>, [:ram, :read, :write, :binary])
+
+    try do
+      {:ok, tar} = :erl_tar.init(fd, :write, &tar_io/2)
+
+      Enum.each(files, fn file ->
+        name = file.path |> Path.relative_to(root) |> String.to_charlist()
+        :ok = :erl_tar.add(tar, {name, file.content}, uid: file.uid, gid: file.gid, mtime: 0)
+      end)
+
+      :ok = :erl_tar.close(tar)
+      {:ok, size} = :file.position(fd, :eof)
+      # A RAM file opened `:binary` reads back a binary, never a charlist.
+      case :file.pread(fd, 0, size) do
+        {:ok, bytes} when is_binary(bytes) ->
+          bytes |> put_modes(Enum.map(files, & &1.mode)) |> IO.iodata_to_binary()
+      end
+    after
+      :file.close(fd)
+    end
+  end
+
+  # `:erl_tar.add/3` takes `{:mode, _}` only from OTP 29; OTP 28 ignores it
+  # and writes every in-memory entry as 0o644, so a `0o440` file would ship
+  # world-readable. So the mode is written here, into each regular entry's
+  # ustar header in entry order, and the header checksum recomputed. A PAX
+  # extended header (typeflag `x`, written ahead of a long name or a large
+  # id) is passed over. Header layout (POSIX ustar): mode at 100 (8 bytes),
+  # size at 124 (12), checksum at 148 (8), typeflag at 156; data is padded to
+  # 512 bytes; two zero blocks end the archive.
+  defp put_modes(<<header::binary-size(512), rest::binary>>, [mode | modes] = all) do
+    <<_::binary-size(124), size::binary-size(12), _::binary-size(20), type, _::binary>> = header
+    data_size = div(octal(size) + 511, 512) * 512
+    <<data::binary-size(^data_size), rest::binary>> = rest
+
+    if type in [?0, 0],
+      do: [set_mode(header, mode), data | put_modes(rest, modes)],
+      else: [header, data | put_modes(rest, all)]
+  end
+
+  defp put_modes(trailer, []), do: [trailer]
+
+  defp set_mode(header, mode) do
+    <<head::binary-size(100), _mode::binary-size(8), mid::binary-size(40), _sum::binary-size(8),
+      tail::binary>> = header
+
+    field = String.pad_leading(Integer.to_string(mode, 8), 7, "0") <> <<0>>
+    sum = checksum(head <> field <> mid <> "        " <> tail)
+    checksum_field = String.pad_leading(Integer.to_string(sum, 8), 6, "0") <> <<0, ?\s>>
+    head <> field <> mid <> checksum_field <> tail
+  end
+
+  defp checksum(header), do: for(<<byte <- header>>, reduce: 0, do: (acc -> acc + byte))
+
+  # A numeric header field: octal digits, padded, ended by NUL or space.
+  defp octal(field) do
+    case for(<<c <- field>>, c in ?0..?7, into: "", do: <<c>>) do
+      "" -> 0
+      digits -> String.to_integer(digits, 8)
+    end
+  end
+
+  # `:erl_tar.init/3`'s IO callback over a RAM file. `close` is a no-op because
+  # the bytes are read back after the archive is closed; `archive/2` closes the
+  # file itself.
+  defp tar_io(:write, {fd, data}), do: :file.write(fd, data)
+  defp tar_io(:position, {fd, position}), do: :file.position(fd, position)
+  defp tar_io(:read2, {fd, size}), do: :file.read(fd, size)
+  defp tar_io(:close, _fd), do: :ok
 
   # Compose's own shape, so `docker compose ps` renders these rows. One
   # container per service, so the replica number is always 1.
@@ -602,9 +949,10 @@ defmodule CrowdControl.Provider.Compose do
     end
   end
 
+  # The first declared port; `port:` is its single-port spelling.
   defp proxy_port(services, name) do
     case Enum.find(services, &(&1.name == name)) do
-      %{proxy_port: port} when is_integer(port) -> port
+      %{ports: [port | _]} -> port
       _ -> @default_proxy_port
     end
   end
@@ -613,8 +961,23 @@ defmodule CrowdControl.Provider.Compose do
   # so it is stripped from `config` on the way to disk, and it is not a struct
   # field. The sandbox and the proxy both hold it; nothing else needs to
   # remember it.
+  #
+  # The `ccst_` prefix is what lets a log shipper find it: 32 random bytes have
+  # no shape a redaction regex can match, and the sandbox prints its environment
+  # into the transcript as readily as anything else.
+  # `CrowdControl.Preset.LogShipper` redacts `ccst_` by default, which is why a
+  # caller-supplied token must carry the prefix too (`validate_session_token/1`).
   defp mint_session_token do
-    32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    @session_token_prefix <>
+      (32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false))
+  end
+
+  defp validate_session_token(opts) do
+    case opts[:session_token] do
+      nil -> :ok
+      @session_token_prefix <> _rest -> :ok
+      _other -> {:error, {:compose, {:bad_session_token, :prefix}}}
+    end
   end
 
   # --- labels ---
@@ -629,13 +992,26 @@ defmodule CrowdControl.Provider.Compose do
     }
   end
 
+  # A drained service also carries its drain budget, so a handle `list_live/1`
+  # rebuilt from labels alone still drains it before the force-remove.
   defp container_labels(handle, service) do
-    Map.merge(base_labels(handle), %{
+    base_labels(handle)
+    |> Map.merge(%{
       @service_label => service.name,
       "com.docker.compose.container-number" => "1",
       "com.docker.compose.oneoff" => "False"
     })
+    |> Map.merge(drain_labels(service))
   end
+
+  defp drain_labels(%Service{drain: drain} = service) when is_integer(drain) do
+    %{
+      @drain_label => to_string(drain),
+      @stop_timeout_label => to_string(Service.stop_timeout(service))
+    }
+  end
+
+  defp drain_labels(_service), do: %{}
 
   defp network_labels(handle, name) do
     Map.put(base_labels(handle), "com.docker.compose.network", name)
@@ -650,7 +1026,7 @@ defmodule CrowdControl.Provider.Compose do
   # Engine API durations are nanoseconds. The container config field is
   # `Healthcheck`; `HealthConfig` is the name of its type, not of the field.
   defp healthcheck(handle, service) do
-    case ready_spec(handle.config, service.name) do
+    case ready_spec(handle.config, service) do
       nil ->
         nil
 
@@ -666,7 +1042,7 @@ defmodule CrowdControl.Provider.Compose do
   end
 
   defp await_healthy(handle, service, id) do
-    case ready_spec(handle.config, service.name) do
+    case ready_spec(handle.config, service) do
       nil -> :ok
       _spec -> poll_health(handle, service.name, id, health_deadline(handle))
     end
@@ -754,8 +1130,45 @@ defmodule CrowdControl.Provider.Compose do
 
   @impl true
   def release(%__MODULE__{} = handle) do
+    drain(handle)
     teardown(handle, @teardown_attempts)
     :ok
+  end
+
+  # Services marked `drain:` (log shippers) get a graceful stop before the
+  # force-remove, which would otherwise SIGKILL them mid-flush and lose the
+  # transcript's tail. Wait the longest drain once — the shipper's file source
+  # needs time to reach EOF after the session's last byte — then
+  # `POST /stop?t=` each, giving it its graceful-shutdown limit plus a margin
+  # before the daemon's SIGKILL. The sandbox and forwarder are not drained.
+  #
+  # Best effort by design: a stop that fails is logged and the force-remove
+  # below still runs, because teardown must never leak a stack to save a log.
+  defp drain(handle) do
+    targets =
+      for {service, drain_ms, timeout} <- Map.get(handle, :drained, []),
+          {:ok, id} <- [container_id(handle, service)],
+          do: {service, id, drain_ms, timeout}
+
+    if targets != [] do
+      targets |> Enum.map(&elem(&1, 2)) |> Enum.max() |> Process.sleep()
+      Enum.each(targets, &stop_drained(handle, &1))
+    end
+  end
+
+  # The request blocks until the container exits, up to `t`, so its receive
+  # timeout must outlast `t` or a slow flush would read as a transport error.
+  defp stop_drained(handle, {service, id, _drain_ms, timeout}) do
+    case API.request(handle.config, :post, "/containers/#{id}/stop",
+           params: [t: timeout],
+           receive_timeout: (timeout + 10) * 1000
+         ) do
+      {:ok, _} -> :ok
+      # 304: already stopped; 404: already gone. Both are the desired state.
+      {:error, {:docker, {:http_status, 304, _}}} -> :ok
+      {:error, {:docker, {:not_found, _}}} -> :ok
+      {:error, reason} -> Logger.warning("compose drain of #{service} failed: #{inspect(reason)}")
+    end
   end
 
   # The order is forced, not stylistic:
@@ -803,29 +1216,35 @@ defmodule CrowdControl.Provider.Compose do
 
   defp container_ids(handle), do: Enum.map(handle.containers, &elem(&1, 1))
 
-  # All three names, unconditionally. A stack whose sidecars never asked for
-  # egress has no `-egress` network and the DELETE 404s, which is success — and
-  # a handle `list_live/1` rebuilt from container labels cannot know either way,
-  # so guessing "it probably doesn't exist" is how one gets leaked.
+  # The three fixed names, unconditionally. A stack whose sidecars never asked
+  # for egress has no `-egress` network and the DELETE 404s, which is success —
+  # and a handle `list_live/1` rebuilt from container labels cannot know either
+  # way, so guessing "it probably doesn't exist" is how one gets leaked. Extra
+  # `:networks` come from the same two sources as volumes, below.
   defp networks(%__MODULE__{project: nil}), do: []
 
   defp networks(handle) do
-    [handle.sandbox_network, handle.publish_network, handle.egress_network]
+    Enum.uniq(
+      [handle.sandbox_network, handle.publish_network, handle.egress_network] ++
+        Map.get(handle, :networks, []) ++ discovered(handle, "/networks")
+    )
   end
 
   # Two sources, for two different handles. The persisted list is what an
   # acquire-path or rolled-back handle knows; the label query is the only thing
   # that works for a handle `list_live/1` rebuilt from container labels, which
   # would otherwise leak every named volume the reaper reaps.
-  defp volumes(handle), do: Enum.uniq(handle.volumes ++ discovered_volumes(handle))
+  defp volumes(handle), do: Enum.uniq(handle.volumes ++ discovered(handle, "/volumes"))
 
-  defp discovered_volumes(%__MODULE__{session_key: nil}), do: []
+  defp discovered(%__MODULE__{session_key: nil}, _path), do: []
 
-  defp discovered_volumes(handle) do
+  defp discovered(handle, path) do
     filters = JSON.encode!(%{"label" => ["crowd_control.session=#{handle.session_key}"]})
 
-    case API.request(handle.config, :get, "/volumes", params: [filters: filters]) do
-      {:ok, %{"Volumes" => volumes}} when is_list(volumes) -> Enum.map(volumes, & &1["Name"])
+    case API.request(handle.config, :get, path, params: [filters: filters]) do
+      # `GET /volumes` wraps its list; `GET /networks` is a bare array.
+      {:ok, %{"Volumes" => items}} when is_list(items) -> Enum.map(items, & &1["Name"])
+      {:ok, items} when is_list(items) -> Enum.map(items, & &1["Name"])
       _ -> []
     end
   end
@@ -890,8 +1309,19 @@ defmodule CrowdControl.Provider.Compose do
       agent_port: opts[:agent_port] || @default_agent_port,
       capture_path: opts[:capture_path] || @default_capture,
       containers: Enum.map(containers, &{labels(&1)[@service_label], &1["Id"]}),
+      drained: Enum.flat_map(containers, &drained_from_labels(labels(&1))),
       config: opts
     }
+  end
+
+  defp drained_from_labels(labels) do
+    with service when is_binary(service) <- labels[@service_label],
+         drain when is_integer(drain) <- parse_int(labels[@drain_label]),
+         timeout when is_integer(timeout) <- parse_int(labels[@stop_timeout_label]) do
+      [{service, drain, timeout}]
+    else
+      _ -> []
+    end
   end
 
   defp labels(container), do: Map.get(container, "Labels") || %{}
@@ -910,24 +1340,14 @@ defmodule CrowdControl.Provider.Compose do
 
   @impl true
   def scrub(%__MODULE__{} = handle) do
-    # `Store.scrub_opts/1` drops the top-level credential keys. It cannot see
-    # into `:services`, and a service spec's `:env` is exactly where a proxy's
-    # upstream key or a database password lives — so the specs are stripped too.
-    # Store records are written to disk and outlive the VM, and reconnecting
-    # needs none of it: every container already holds the environment it was
-    # started with.
-    %{handle | config: handle.config |> Store.scrub_opts() |> scrub_services()}
+    # `Store.scrub_opts/1` drops the top-level credential keys and strips `:env`
+    # and `:files` from the `:services` specs: a service spec's `:env` is
+    # exactly where a proxy's upstream key or a database password lives. Store
+    # records are written to disk and outlive the VM, and reconnecting needs
+    # none of it: every container already holds the environment it was started
+    # with.
+    %{handle | config: Store.scrub_opts(handle.config)}
   end
-
-  defp scrub_services(config) do
-    case config[:services] do
-      specs when is_list(specs) -> Keyword.put(config, :services, Enum.map(specs, &drop_env/1))
-      _ -> config
-    end
-  end
-
-  defp drop_env(spec) when is_map(spec), do: Map.drop(spec, [:env])
-  defp drop_env(spec), do: spec
 
   # --- validation gates ---
 
@@ -985,6 +1405,34 @@ defmodule CrowdControl.Provider.Compose do
     end
   end
 
+  # The fixed networks' compose-relative names. Declaring one again would alias
+  # two memberships onto one network and, for `egress`, turn a membership list
+  # into a posture.
+  @reserved_networks ["sbx", "pub", "egress"]
+
+  defp fetch_networks(opts, project) do
+    with {:ok, specs} <- fetch_list(opts, :networks),
+         {:ok, networks} <- collect(specs, &normalize_stack_network(&1, project)) do
+      names = Enum.map(networks, & &1.name)
+
+      case names -- Enum.uniq(names) do
+        [] -> {:ok, networks}
+        [dup | _] -> {:error, {:compose, {:bad_stack_network, %{name: dup}}}}
+      end
+    end
+  end
+
+  defp normalize_stack_network(spec, project) do
+    with true <- is_map(spec),
+         name when is_binary(name) <- Map.get(spec, :name),
+         true <- name =~ ~r/^[a-z0-9][a-z0-9_-]*$/,
+         false <- name in @reserved_networks do
+      {:ok, %{name: name, full_name: "#{project}-#{name}"}}
+    else
+      _ -> {:error, {:compose, {:bad_stack_network, spec}}}
+    end
+  end
+
   # Enumerating a non-list here would raise a Protocol.UndefinedError out of a
   # validation gate, which is the one place in this module that must always
   # answer with a tagged tuple.
@@ -1007,9 +1455,12 @@ defmodule CrowdControl.Provider.Compose do
     with {:ok, specs} <- fetch_list(opts, :services),
          :ok <- validate_names(specs, sandbox, forwarder),
          {:ok, declared} <- normalize_specs(specs, sandbox),
-         {:ok, sandbox_spec} <- build_sandbox(opts, declared, sandbox) do
+         {:ok, sandbox_spec} <- build_sandbox(opts, declared, sandbox),
+         {:ok, forwarder_image} <-
+           checked_image(opts[:forwarder_image] || @default_forwarder_image, forwarder) do
       sidecars = Enum.reject(declared, &(&1.name == sandbox))
-      {:ok, [sandbox_spec | sidecars] ++ [build_forwarder(opts, sandbox, forwarder)]}
+      forwarder_spec = build_forwarder(opts, sandbox, forwarder, forwarder_image)
+      {:ok, [sandbox_spec | sidecars] ++ [forwarder_spec]}
     end
   end
 
@@ -1021,7 +1472,7 @@ defmodule CrowdControl.Provider.Compose do
         {:error, {:compose, {:duplicate_service, sandbox}}}
 
       # The forwarder is always synthesised, so a declared service of that name
-      # is a collision rather than an override — see `build_forwarder/3`.
+      # is a collision rather than an override — see `build_forwarder/4`.
       forwarder in names ->
         {:error, {:compose, {:duplicate_service, forwarder}}}
 
@@ -1042,177 +1493,58 @@ defmodule CrowdControl.Provider.Compose do
     end)
   end
 
+  # The shape rules live in `CrowdControl.Service`, shared with Kubernetes, so
+  # the two substrates cannot drift on what a service is. Its bare reasons get
+  # Compose's tag here, which keeps every error shape this module has always
+  # returned.
   defp normalize_specs(specs, sandbox) do
     collect(specs, fn spec ->
-      normalize_spec(spec, if(spec_name(spec) == sandbox, do: :sandbox, else: :sidecar))
-    end)
-  end
+      role = if spec_name(spec) == sandbox, do: :sandbox, else: :sidecar
 
-  defp normalize_spec(spec, role) when is_map(spec) do
-    with {:ok, name} <- spec_name!(spec),
-         {:ok, image} <- spec_image(spec, role),
-         {:ok, egress} <- spec_egress(spec, name, role),
-         {:ok, entrypoint} <- spec_strings(spec, :entrypoint, name),
-         {:ok, command} <- spec_strings(spec, :command, name),
-         {:ok, depends_on} <- spec_strings(spec, :depends_on, name),
-         {:ok, env} <- spec_env(spec, name),
-         {:ok, mounts} <- spec_mounts(spec, name) do
-      {:ok,
-       %{
-         name: name,
-         image: image,
-         role: role,
-         egress: egress,
-         entrypoint: entrypoint,
-         command: command,
-         env: env,
-         mounts: mounts,
-         depends_on: depends_on || [],
-         user: Map.get(spec, :user),
-         proxy_port: Map.get(spec, :port)
-       }}
-    end
-  end
+      case Service.normalize(spec, role) do
+        # An `{:external, _}` placement needs no image on Kubernetes, where it
+        # creates nothing. Here every service is a container, and placement is
+        # ignored, so an image-less one is the same mistake it always was.
+        {:ok, %Service{image: nil, role: :sidecar, name: name}} ->
+          {:error, {:compose, {:image_required, name}}}
 
-  # Maps only, and deliberately so: `scrub/1` has to strip `:env` out of the
-  # persisted specs without a second normalisation pass over a shape it can only
-  # guess at.
-  defp normalize_spec(spec, _role), do: {:error, {:compose, {:bad_service, spec}}}
+        {:ok, service} ->
+          {:ok, service}
 
-  # A service name is a DNS alias on the sandbox network, which is how every
-  # other service in the stack addresses it.
-  defp spec_name!(spec) do
-    case Map.get(spec, :name) do
-      name when is_binary(name) ->
-        if name =~ ~r/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/ and byte_size(name) <= 63 do
-          {:ok, name}
-        else
-          {:error, {:compose, {:bad_service_name, name}}}
-        end
-
-      other ->
-        {:error, {:compose, {:bad_service_name, other}}}
-    end
-  end
-
-  # The sandbox may inherit the top-level `:image`, which is the option
-  # `Provider.Docker` uses for exactly the same thing; a sidecar has no such
-  # fallback. `build_sandbox/3` fills the `nil` in.
-  defp spec_image(spec, :sandbox) do
-    case Map.get(spec, :image) do
-      image when is_binary(image) and image != "" -> {:ok, image}
-      _ -> {:ok, nil}
-    end
-  end
-
-  defp spec_image(spec, _role) do
-    case Map.get(spec, :image) do
-      image when is_binary(image) and image != "" -> {:ok, image}
-      _ -> {:error, {:compose, {:image_required, Map.get(spec, :name)}}}
-    end
-  end
-
-  # Never inferred. A sidecar on both networks can relay the internet into the
-  # sandbox, which is the entire purpose of an egress proxy and exactly why it
-  # has to be written down.
-  defp spec_egress(spec, _name, :sandbox) do
-    case Map.get(spec, :egress, :none) do
-      :none -> {:ok, :none}
-      _ -> {:error, {:compose, :sandbox_egress_forbidden}}
-    end
-  end
-
-  defp spec_egress(spec, name, _role) do
-    case Map.get(spec, :egress) do
-      egress when egress in [:none, :allow] -> {:ok, egress}
-      nil -> {:error, {:compose, {:egress_required, name}}}
-      other -> {:error, {:compose, {:bad_egress, {name, other}}}}
-    end
-  end
-
-  defp spec_strings(spec, key, name) do
-    case Map.get(spec, key) do
-      nil ->
-        {:ok, nil}
-
-      list when is_list(list) ->
-        if Enum.all?(list, &is_binary/1), do: {:ok, list}, else: bad(name, key)
-
-      _ ->
-        bad(name, key)
-    end
-  end
-
-  defp spec_env(spec, name) do
-    case Map.get(spec, :env, %{}) do
-      env when is_map(env) ->
-        if Enum.all?(env, &binary_pair?/1), do: {:ok, env}, else: bad(name, :env)
-
-      _ ->
-        bad(name, :env)
-    end
-  end
-
-  defp binary_pair?({key, value}), do: is_binary(key) and is_binary(value)
-
-  # The shape rules live in `CrowdControl.Volume` so Compose, Docker and
-  # Kubernetes cannot drift on what a mount is. What stays here is Compose's
-  # own vocabulary for a bad one, and the fact that a `:name` must be a volume
-  # this stack declared — see `validate_mounts/2`, which a host path skips
-  # because there is nothing to declare.
-  defp spec_mounts(spec, name) do
-    collect(Map.get(spec, :volumes, []), fn mount ->
-      case CrowdControl.Volume.normalize([volumes: [mount]], []) do
-        {:ok, [%{kind: :volume, source: volume, target: target, read_only: read_only}]} ->
-          {:ok, %{name: volume, host_path: nil, target: target, read_only: read_only}}
-
-        {:ok, [%{kind: :host_path, source: path, target: target, read_only: read_only}]} ->
-          {:ok, %{name: nil, host_path: path, target: target, read_only: read_only}}
-
-        {:error, _reason} ->
-          {:error, {:compose, {:bad_mount, {name, mount}}}}
+        {:error, reason} ->
+          {:error, {:compose, reason}}
       end
     end)
   end
 
-  defp bad(name, key), do: {:error, {:compose, {:bad_service, {name, key}}}}
-
   defp build_sandbox(opts, declared, sandbox) do
     case Enum.find(declared, &(&1.name == sandbox)) do
       nil ->
-        with {:ok, image} <- fetch_image(opts) do
-          {:ok, synthesized_sandbox(opts, sandbox, image)}
+        with {:ok, image} <- fetch_image(opts, sandbox) do
+          {:ok, %Service{name: sandbox, image: image, role: :sandbox, user: opts[:user]}}
         end
 
       %{image: nil} = spec ->
-        with {:ok, image} <- fetch_image(opts), do: {:ok, %{spec | image: image}}
+        with {:ok, image} <- fetch_image(opts, sandbox), do: {:ok, %{spec | image: image}}
 
       spec ->
         {:ok, spec}
     end
   end
 
-  defp synthesized_sandbox(opts, name, image) do
-    %{
-      name: name,
-      image: image,
-      role: :sandbox,
-      egress: :none,
-      entrypoint: nil,
-      command: nil,
-      env: %{},
-      mounts: [],
-      depends_on: [],
-      user: opts[:user],
-      proxy_port: nil
-    }
-  end
-
-  defp fetch_image(opts) do
+  defp fetch_image(opts, sandbox) do
     case opts[:image] do
-      image when is_binary(image) and image != "" -> {:ok, image}
+      image when is_binary(image) and image != "" -> checked_image(image, sandbox)
       _ -> {:error, {:compose, :image_required}}
     end
+  end
+
+  # The same reference rule a service's `image:` meets in `Service.normalize/2`,
+  # for the two images that come from top-level options instead.
+  defp checked_image(image, name) do
+    if Service.image_reference?(image),
+      do: {:ok, image},
+      else: {:error, {:compose, {:bad_service, {name, :image}}}}
   end
 
   # Always synthesised, image aside. A caller-supplied forwarder command is
@@ -1225,22 +1557,32 @@ defmodule CrowdControl.Provider.Compose do
   # The sandbox is addressed by alias, never by IP: IPs are reassigned on every
   # start, and the alias is what Docker's embedded DNS resolves on the internal
   # network.
-  defp build_forwarder(opts, sandbox, forwarder) do
+  defp build_forwarder(opts, sandbox, forwarder, image) do
     port = opts[:agent_port] || @default_agent_port
 
-    %{
+    %Service{
       name: forwarder,
-      image: opts[:forwarder_image] || @default_forwarder_image,
+      image: image,
       role: :forwarder,
-      egress: :none,
+      user: @forwarder_user,
       entrypoint: ["socat"],
       command: ["TCP-LISTEN:#{port},fork,reuseaddr", "TCP:#{sandbox}:#{port}"],
-      env: %{},
-      mounts: [],
-      depends_on: [sandbox],
-      user: nil,
-      proxy_port: nil
+      depends_on: [sandbox]
     }
+  end
+
+  # Any TCP port: the forwarder runs as `nobody`, but Docker lets an
+  # unprivileged process bind below 1024 (see `@forwarder_user`). A non-integer
+  # or out-of-range port is refused here rather than discovered as a forwarder
+  # that never comes up.
+  defp validate_agent_port(opts) do
+    case opts[:agent_port] || @default_agent_port do
+      port when is_integer(port) and port in 1..65_535 ->
+        :ok
+
+      port ->
+        {:error, {:compose, {:bad_agent_port, {forwarder_name(opts), port}}}}
+    end
   end
 
   # --- cross-service validation ---
@@ -1252,15 +1594,187 @@ defmodule CrowdControl.Provider.Compose do
       # A host path has nothing to declare; only a named volume must exist in
       # the stack, because the stack is what creates and destroys it.
       undeclared =
-        Enum.find(service.mounts, fn mount ->
-          mount.name != nil and not MapSet.member?(declared, mount.name)
+        Enum.find(service.volumes, fn mount ->
+          mount.kind == :volume and not MapSet.member?(declared, mount.source)
         end)
 
       case undeclared do
         nil -> :ok
-        mount -> {:error, {:compose, {:unknown_volume, mount.name}}}
+        mount -> {:error, {:compose, {:unknown_volume, mount.source}}}
       end
     end)
+  end
+
+  # Membership names must be `sbx` or a declared `:networks` entry, and the
+  # sandbox must stay on `sbx`, the network the forwarder reaches it across.
+  defp validate_memberships(opts, services, networks) do
+    declared = ["sbx" | Enum.map(networks, & &1.name)]
+    members = Enum.reject(services, &(&1.role == :forwarder))
+
+    with :ok <- each_ok(members, &known_networks(&1, declared)),
+         :ok <- sandbox_on_sbx(members) do
+      sandbox_isolated(opts, members, networks)
+    end
+  end
+
+  defp known_networks(service, declared) do
+    case Enum.find(Service.networks(service), &(&1 not in declared)) do
+      nil -> :ok
+      network -> {:error, {:compose, {:unknown_network, {service.name, network}}}}
+    end
+  end
+
+  defp sandbox_on_sbx(services) do
+    sandbox = Enum.find(services, &(&1.role == :sandbox))
+
+    if "sbx" in Service.networks(sandbox),
+      do: :ok,
+      else: {:error, {:compose, {:sandbox_needs_network, "sbx"}}}
+  end
+
+  # Invariant 1: the sandbox never gets egress, so it may share no network with
+  # an `egress: :allow` service — anything on both could relay the internet in.
+  # The one sanctioned relay is `:proxy_service`, whose SECURITY.md contract
+  # (credential substitution, upstream API only) is the reason it exists.
+  #
+  # Enforced once a stack opts into per-service networks (a `:networks`
+  # declaration or any `networks:` membership). A stack using neither keeps
+  # the single-network shape this module has always built, where an `:allow`
+  # sidecar on `sbx` is the documented, typed-out relay.
+  defp sandbox_isolated(opts, services, networks) do
+    if per_service_networks?(services, networks) do
+      sandbox = Enum.find(services, &(&1.role == :sandbox))
+
+      relays =
+        Enum.filter(services, &(&1.egress == :allow and &1.name != opts[:proxy_service]))
+
+      shared =
+        for network <- Service.networks(sandbox),
+            relay <- relays,
+            network in Service.networks(relay),
+            do: {network, relay.name}
+
+      case shared do
+        [] ->
+          :ok
+
+        [{network, service} | _] ->
+          {:error, {:compose, {:sandbox_shares_network_with_egress, {service, network}}}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp per_service_networks?(services, networks) do
+    networks != [] or Enum.any?(services, &(&1.networks != nil))
+  end
+
+  # Decided against the HostConfig the container will actually get, so the
+  # rule cannot drift from the rendering: the daemon answers 403 for an archive
+  # into a read-only rootfs unless the destination is inside a volume, a file
+  # under a read-only mount cannot be written at all, and one under a tmpfs is
+  # written to the layer *beneath* the tmpfs and is invisible once it mounts.
+  defp validate_files(opts, services) do
+    each_ok(services, fn service ->
+      host = HostConfig.build(opts, network_mode: "none", overrides: service.host_config)
+      readonly? = host["ReadonlyRootfs"] == true
+      tmpfs = Map.keys(host["Tmpfs"] || %{})
+
+      case Enum.find(service.files, &(not writable?(service, &1.path, readonly?, tmpfs))) do
+        nil -> :ok
+        file -> {:error, {:compose, {:files_not_writable, {service.name, file.path}}}}
+      end
+    end)
+  end
+
+  defp writable?(service, path, readonly?, tmpfs) do
+    not Enum.any?(tmpfs, &under?(path, &1)) and
+      case covering_mount(service, path) do
+        nil -> not readonly?
+        mount -> not mount.read_only
+      end
+  end
+
+  # Invariant 6: the capture file is never written by a sidecar. The capture
+  # source is whatever the sandbox mounts over the capture file (a named
+  # volume or a host path); every other mount of that source must be
+  # read-only, and no service may stage files into it. With no such mount the
+  # capture lives in the sandbox's own filesystem, out of every sidecar's
+  # reach, and only the sandbox's own `:files` could pre-seed it.
+  defp validate_capture(opts, services) do
+    capture_path = opts[:capture_path] || @default_capture
+    sandbox = Enum.find(services, &(&1.role == :sandbox))
+
+    case covering_mount(sandbox, capture_path) do
+      nil ->
+        capture_dir = Path.dirname(capture_path)
+
+        if Enum.any?(sandbox.files, &under?(&1.path, capture_dir)),
+          do: {:error, {:compose, {:capture_mount_writable, sandbox.name}}},
+          else: :ok
+
+      capture ->
+        each_ok(services, &capture_untouched(&1, sandbox, capture))
+    end
+  end
+
+  defp capture_untouched(service, sandbox, capture) do
+    writable_mount? =
+      service.name != sandbox.name and
+        Enum.any?(service.volumes, &(same_source?(&1, capture) and not &1.read_only))
+
+    staged? =
+      Enum.any?(service.files, fn file ->
+        case covering_mount(service, file.path) do
+          nil -> false
+          mount -> same_source?(mount, capture)
+        end
+      end)
+
+    if writable_mount? or staged?,
+      do: {:error, {:compose, {:capture_mount_writable, service.name}}},
+      else: :ok
+  end
+
+  defp same_source?(mount, capture),
+    do: {mount.kind, mount.source} == {capture.kind, capture.source}
+
+  # Docker's embedded DNS on internal networks forwarded queries upstream —
+  # an exfiltration path out of a network with no route — until 25.0.5 /
+  # 26.0.0 (CVE-2024-29018). Only the stacks that lean on internal networks
+  # for isolation alongside a NAT bridge pay the `/version` round trip.
+  defp ensure_versions(opts, services, networks) do
+    features =
+      if(per_service_networks?(services, networks), do: [:service_networks], else: []) ++
+        if Enum.any?(services, &(&1.egress == :allow)), do: [:egress_sidecars], else: []
+
+    case VersionGate.components(features) do
+      [] ->
+        :ok
+
+      _components ->
+        with {:ok, version} <- API.server_version(opts) do
+          VersionGate.check(features, %{docker: version})
+        end
+    end
+  end
+
+  defp warn_placement(services) do
+    for %{placement: placement, name: name} <- services, placement != nil do
+      Logger.warning(
+        "compose: service #{name} sets placement: #{inspect(placement)}, " <>
+          "which is Kubernetes-only and ignored here"
+      )
+    end
+
+    :ok
+  end
+
+  defp drained_specs(services) do
+    for service <- services, Service.drained?(service) do
+      {service.name, service.drain, Service.stop_timeout(service)}
+    end
   end
 
   defp validate_ready(opts, services) do
@@ -1298,9 +1812,12 @@ defmodule CrowdControl.Provider.Compose do
 
   defp valid_ready?(_spec), do: false
 
-  # Normalized in one place so `healthcheck/2` is a pure translation.
-  defp ready_spec(config, name) do
-    case config |> Keyword.get(:ready, %{}) |> Map.get(name) do
+  # Normalized in one place so `healthcheck/2` is a pure translation. The
+  # stack-level `:ready` entry wins; a service's own `ready:` is used when it
+  # carries a Docker `:test` (a `:tcp_port`-only spec is Kubernetes readiness,
+  # which Compose cannot express without a probe binary in the image).
+  defp ready_spec(config, service) do
+    case config |> Keyword.get(:ready, %{}) |> Map.get(service.name) || service_ready(service) do
       nil ->
         nil
 
@@ -1314,6 +1831,9 @@ defmodule CrowdControl.Provider.Compose do
         }
     end
   end
+
+  defp service_ready(%{ready: %{test: _} = ready}), do: ready
+  defp service_ready(_service), do: nil
 
   defp validate_proxy(opts, services) do
     case opts[:proxy_service] do
@@ -1329,6 +1849,95 @@ defmodule CrowdControl.Provider.Compose do
           # request were at fault.
           _ -> {:error, {:compose, {:proxy_needs_egress, name}}}
         end
+    end
+  end
+
+  # Every distinct image is inspected before anything is created: the providers
+  # never pull, so a missing one would otherwise fail its create after the
+  # networks, volumes and earlier containers exist. Sequential and in service
+  # order, one inspect per image, so a missing image is reported against the
+  # first service that uses it. Each inspect is one local round trip.
+  #
+  # The same inspect gives a sidecar with no `user:` its posture: it runs as
+  # its image's default user, so on Compose (unlike Kubernetes, where
+  # `runAsNonRoot` makes the kubelet check) that default is held here to the
+  # `weaken: [:user]` rule. Those sidecars are created from the inspected Id,
+  # returned as `%{name => id}`, so a tag re-pointed between this check and
+  # the create can't swap in an image nobody checked. The sandbox is exempt, as
+  # on Kubernetes; the forwarder has an explicit user.
+  defp validate_images(opts, services) do
+    result =
+      Enum.reduce_while(services, %{inspected: %{}, ids: %{}}, fn service, acc ->
+        with {:ok, image} <- inspect_image(opts, service, acc.inspected),
+             :ok <- check_image_user(service, image) do
+          {:cont,
+           %{
+             inspected: Map.put(acc.inspected, service.image, image),
+             ids: put_image_id(acc.ids, service, image)
+           }}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+
+    case result do
+      {:error, _reason} = error -> error
+      %{ids: ids} -> {:ok, ids}
+    end
+  end
+
+  defp inspect_image(_opts, %Service{image: image}, inspected)
+       when is_map_key(inspected, image),
+       do: {:ok, Map.fetch!(inspected, image)}
+
+  defp inspect_image(opts, %Service{name: name, image: image}, _inspected) do
+    case API.image_inspect(opts, image) do
+      {:ok, inspected} ->
+        {:ok, inspected}
+
+      {:error, {:docker, {:not_found, _}}} ->
+        {:error, {:compose, {:image_not_found, {name, image}}}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp checked_user?(%Service{role: :sidecar, user: nil, weaken: weaken}), do: :user not in weaken
+  defp checked_user?(%Service{}), do: false
+
+  defp check_image_user(service, %{user: user}) do
+    if checked_user?(service) and not numeric_non_root?(user),
+      do: {:error, {:compose, {:weakening_not_declared, {service.name, :user}}}},
+      else: :ok
+  end
+
+  defp put_image_id(ids, service, %{id: id}) do
+    if checked_user?(service), do: Map.put(ids, service.name, id), else: ids
+  end
+
+  # Deliberately narrower than `Service.root_user?/1`, whose contract is a
+  # `user:` that already passed `Service.normalize/2`. An image's `Config.User`
+  # is raw: Docker resolves a name against the image's own `/etc/passwd`, so
+  # `node` or `nginx` proves nothing from out here, and it runs `"+0"`, `"-0"`
+  # and `":1000"` as uid 0. Kubernetes' `runAsNonRoot` refuses any non-numeric
+  # user for the same reason. So only `uid` or `uid:gid`, all digits, with a
+  # uid that is numerically non-zero (`"00"` is root), passes.
+  #
+  # The uid, and the gid when given, must also be in Docker's own range,
+  # `0..2147483647`: the daemon refuses anything above at container start
+  # ("uids and gids must be in range 0-2147483647"), so refusing it here moves
+  # that failure to `acquire/1`, before anything is created.
+  defp numeric_non_root?(user) do
+    case Regex.run(~r/\A(\d+)(?::(\d+))?\z/, user, capture: :all_but_first) do
+      [uid] ->
+        String.to_integer(uid) in 1..@max_uid
+
+      [uid, gid] ->
+        String.to_integer(uid) in 1..@max_uid and String.to_integer(gid) in 0..@max_uid
+
+      nil ->
+        false
     end
   end
 

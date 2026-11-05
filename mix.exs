@@ -26,7 +26,9 @@ defmodule CrowdControl.MixProject do
       docs: docs(),
       test_coverage: [tool: ExCoveralls],
       dialyzer: [
-        plt_add_apps: [:mix],
+        # :ex_unit for test/support, which dialyzer sees under MIX_ENV=test
+        # (CI's env): `CrowdControl.K8sLive` reads ExUnit.configuration/0.
+        plt_add_apps: [:mix, :ex_unit],
         flags: [:error_handling, :unknown, :missing_return, :extra_return]
       ]
     ]
@@ -110,11 +112,18 @@ defmodule CrowdControl.MixProject do
         Guides: ~r/^docs\//
       ],
       groups_for_modules: [
-        Core: [CrowdControl, CrowdControl.Session],
+        Core: [
+          CrowdControl,
+          CrowdControl.Session,
+          CrowdControl.Result,
+          CrowdControl.Error,
+          CrowdControl.Telemetry
+        ],
         Agents: [
           CrowdControl.Agent,
           CrowdControl.Agent.ClaudeCode,
-          CrowdControl.Agent.Omp
+          CrowdControl.Agent.Omp,
+          CrowdControl.SdkMcp
         ],
         Backends: [
           CrowdControl.Backend,
@@ -128,7 +137,15 @@ defmodule CrowdControl.MixProject do
           CrowdControl.Provider.Endpoint,
           CrowdControl.Provider.Docker,
           CrowdControl.Provider.Compose,
-          CrowdControl.Provider.Gce
+          CrowdControl.Provider.Gce,
+          CrowdControl.Service
+        ],
+        # CrowdControl.Preset.YAML is @moduledoc false, so it stays out.
+        Presets: [
+          CrowdControl.Preset,
+          CrowdControl.Preset.Browser,
+          CrowdControl.Preset.EgressProxy,
+          CrowdControl.Preset.LogShipper
         ],
         Persistence: [
           CrowdControl.Store,
@@ -147,6 +164,10 @@ defmodule CrowdControl.MixProject do
           CrowdControl.Backend.Docker.Demux,
           CrowdControl.Backend.Docker.HostConfig,
           CrowdControl.Backend.Kubernetes.API,
+          CrowdControl.Backend.Kubernetes.Drain,
+          CrowdControl.Backend.Kubernetes.Files,
+          CrowdControl.Backend.Kubernetes.Services,
+          CrowdControl.VersionGate,
           CrowdControl.Backend.Sandboxd.API,
           CrowdControl.Provider.Gce.API,
           CrowdControl.Provider.Gce.Tunnel,
@@ -186,6 +207,11 @@ defmodule CrowdControl.MixProject do
       # inside it, so this still adds no runtime dep the tree lacks. It is also
       # the reason the Elixir lower bound moved to ~> 1.19.
       {:gcp_compute, "~> 0.3", optional: true},
+      # Optional, for the same one-runtime-dep reason. Every emit goes through
+      # CrowdControl.Telemetry, which no-ops when it is absent; a caller who
+      # attaches a handler has it by definition. It is already in the tree
+      # transitively via :req and :gcp_compute.
+      {:telemetry, "~> 1.0", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:stream_data, "~> 1.1", only: :test},
       {:excoveralls, "~> 0.18", only: :test},

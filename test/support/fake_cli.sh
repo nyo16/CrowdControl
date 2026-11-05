@@ -15,6 +15,7 @@
 #   FAKE_CLI_STREAM_NORESULT=<n>  emit <n> assistant messages (50ms apart) and
 #                              never a result (exercises wait_for_result's
 #                              absolute deadline under a steady message stream)
+#   FAKE_CLI_ERROR_SUBTYPE=<s> emit an is_error result with subtype <s>
 
 # JSON-escape a string so the emitted line is always valid JSON: backslash and
 # double quote, the named control escapes (\b \t \n \f \r), and \u00NN for any
@@ -51,7 +52,7 @@ if [ "${FAKE_CLI_GARBAGE:-}" = "1" ]; then
   echo "not-json-but-newline-terminated"
 fi
 
-printf '{"type":"system","subtype":"init","session_id":"%s","tools":[]}\n' "$SESSION_ID"
+printf '{"type":"system","subtype":"init","session_id":"%s","tools":[]}\n' "$(json_escape "$SESSION_ID")"
 
 while IFS= read -r line; do
   # Crude, deliberately limited content extraction: grabs the first
@@ -80,7 +81,9 @@ while IFS= read -r line; do
     sleep "$FAKE_CLI_SLEEP"
   fi
 
-  if [ -n "${FAKE_CLI_ECHO_ENV:-}" ]; then
+  if [ -n "${FAKE_CLI_ERROR_SUBTYPE:-}" ]; then
+    printf '{"type":"result","subtype":"%s","is_error":true,"num_turns":1,"session_id":"%s","total_cost_usd":0}\n' "$(json_escape "$FAKE_CLI_ERROR_SUBTYPE")" "$(json_escape "$SESSION_ID")"
+  elif [ -n "${FAKE_CLI_ECHO_ENV:-}" ]; then
     # Read the env var named by FAKE_CLI_ECHO_ENV without evaluating anything.
     # NOT `${!FAKE_CLI_ECHO_ENV}`: bash evaluates array subscripts inside
     # indirect expansion arithmetically, so a value like 'x[$(touch /tmp/pwned)]'

@@ -279,6 +279,247 @@ defmodule CrowdControl.Backend.DockerUnitTest do
     end
   end
 
+  describe "write/2 ordering (blocker: a detached exec lets control frames reorder)" do
+    test "each write's exec is inspected until it has exited before the next is created" do
+      # e1 is still running on its first inspect; e2 is done at once. Were write/2
+      # to return on a detached start, e2 would be created while e1 still runs.
+      {handle, agent} =
+        stub_daemon(%{
+          "e1" => [running(), done(0)],
+          "e2" => [done(0)]
+        })
+
+      assert :ok = Docker.write(handle, "first\n")
+      assert :ok = Docker.write(handle, "second\n")
+
+      assert [
+               {:create, "e1", first},
+               {:start, "e1", %{"Detach" => true}},
+               {:inspect, "e1"},
+               {:inspect, "e1"},
+               {:create, "e2", second},
+               {:start, "e2", %{"Detach" => true}},
+               {:inspect, "e2"}
+             ] = events(agent)
+
+      assert first =~ "printf %s 'first\n' >> '/var/run/cc.fifo'"
+      assert second =~ "printf %s 'second\n' >> '/var/run/cc.fifo'"
+    end
+
+    test "an exec that exits non-zero is a failed write, not a delivered frame" do
+      {handle, _agent} = stub_daemon(%{"e1" => [done(1)]})
+
+      assert {:error, {:docker, {:exit_status, 1}}} = Docker.write(handle, "lost\n")
+    end
+
+    test "a null ExitCode means not finished yet, even when Running reads false" do
+      {handle, agent} =
+        stub_daemon(%{"e1" => [%{"Running" => false, "ExitCode" => nil}, done(0)]})
+
+      assert :ok = Docker.write(handle, "hi\n")
+      assert [{:inspect, "e1"}, {:inspect, "e1"}] = Enum.filter(events(agent), &inspect?/1)
+    end
+
+    test "an exec still running when the budget runs out is indeterminate" do
+      {handle, _agent} = stub_daemon(%{"e1" => [running()]}, write_timeout: 30)
+
+      assert {:error, {:docker, :write_indeterminate}} = Docker.write(handle, "maybe\n")
+    end
+  end
+
+  describe "write/2 frame size (blocker: a frame past MAX_ARG_STRLEN)" do
+    test "a frame over 120 KiB is refused before any exec is created" do
+      {handle, agent} = stub_daemon(%{})
+
+      assert {:error, :frame_too_large} =
+               Docker.write(handle, String.duplicate("x", 120 * 1024 + 1))
+
+      assert events(agent) == []
+    end
+
+    test "the limit applies to the escaped script, which is what the kernel sees" do
+      {handle, agent} = stub_daemon(%{})
+
+      # 40 KiB of quotes escapes to 160 KiB (each `'` becomes `'\\''`).
+      assert {:error, :frame_too_large} = Docker.write(handle, String.duplicate("'", 40 * 1024))
+      assert events(agent) == []
+    end
+
+    test "a large frame under the limit is written" do
+      {handle, _agent} = stub_daemon(%{"e1" => [done(0)]})
+
+      assert :ok = Docker.write(handle, String.duplicate("x", 100 * 1024))
+    end
+  end
+
+  describe "list_live/1 scope (blocker: a reaper that tears down sandboxd's containers)" do
+    test "a container labelled agent=sandboxd is not listed; the owner filter stays" do
+      {handle, agent} =
+        stub_daemon(%{},
+          containers: [
+            %{
+              "Id" => "mine",
+              "Image" => "img",
+              "Labels" => %{"crowd_control.owner" => "o1", "crowd_control.session" => "s1"}
+            },
+            %{
+              "Id" => "theirs",
+              "Image" => "img",
+              "Labels" => %{"crowd_control.owner" => "o1", "crowd_control.agent" => "sandboxd"}
+            }
+          ]
+        )
+
+      assert {:ok, [%Docker{container_id: "mine", session_key: "s1"}]} =
+               Docker.list_live(Keyword.put(handle.config, :owner, "o1"))
+
+      assert [{:list, %{"label" => ["crowd_control.owner=o1"]}}] = events(agent)
+    end
+
+    test "a container labelled agent=docker with owner and session is listed" do
+      {handle, _agent} =
+        stub_daemon(%{},
+          containers: [
+            %{
+              "Id" => "mine",
+              "Image" => "img",
+              "Labels" => %{
+                "crowd_control.owner" => "o1",
+                "crowd_control.session" => "s1",
+                "crowd_control.agent" => "docker"
+              }
+            }
+          ]
+        )
+
+      assert {:ok, [%Docker{container_id: "mine", session_key: "s1", owner: "o1"}]} =
+               Docker.list_live(Keyword.put(handle.config, :owner, "o1"))
+    end
+
+    test "provision stamps agent=docker so an image's agent label cannot override it" do
+      {handle, agent} = stub_daemon(%{})
+
+      assert {:ok, %Docker{container_id: "ctr"}} =
+               Docker.provision(handle.config ++ [image: "img", session_key: "s1", owner: "o1"])
+
+      assert [{:create_container, %{"Labels" => labels}} | _] = events(agent)
+
+      assert %{
+               "crowd_control.agent" => "docker",
+               "crowd_control.owner" => "o1",
+               "crowd_control.session" => "s1"
+             } = labels
+    end
+  end
+
+  describe "API.server_version/1 (blocker: a gate that cannot see the daemon's version)" do
+    alias CrowdControl.Backend.Docker.API
+
+    test "parses real-world version strings" do
+      assert API.parse_version(%{"Version" => "26.1.4"}) == {:ok, {26, 1, 4}}
+      assert API.parse_version(%{"Version" => "25.0.5-ce"}) == {:ok, {25, 0, 5}}
+      assert API.parse_version(%{"Version" => "28.0.0-rc.1"}) == {:ok, {28, 0, 0}}
+      assert API.parse_version(%{"Version" => "27.1"}) == {:ok, {27, 1, 0}}
+
+      assert {:error, {:docker, {:unparseable_version, "dev"}}} =
+               API.parse_version(%{"Version" => "dev"})
+
+      assert {:error, {:docker, {:unparseable_version, nil}}} = API.parse_version(%{})
+    end
+
+    test "asks GET /version once per docker_host, then answers from the cache" do
+      test_pid = self()
+
+      adapter = fn req ->
+        send(test_pid, {:path, req.url.path})
+        {req, Req.Response.new(status: 200, body: %{"Version" => "26.0.0"})}
+      end
+
+      config = [docker_host: unique_host(), req_adapter: adapter]
+
+      assert API.server_version(config) == {:ok, {26, 0, 0}}
+      assert_received {:path, "/version"}
+
+      assert API.server_version(config) == {:ok, {26, 0, 0}}
+      refute_received {:path, _}
+    end
+
+    test "a failed lookup is not cached" do
+      failing = fn req -> {req, Req.Response.new(status: 500, body: %{"message" => "boom"})} end
+      host = unique_host()
+
+      assert {:error, {:docker, {:http_status, 500, "boom"}}} =
+               API.server_version(docker_host: host, req_adapter: failing)
+
+      working = fn req -> {req, Req.Response.new(status: 200, body: %{"Version" => "27.0.1"})} end
+      assert API.server_version(docker_host: host, req_adapter: working) == {:ok, {27, 0, 1}}
+    end
+  end
+
+  describe "HostConfig per-service overrides (blocker: a weakening nobody wrote down)" do
+    alias CrowdControl.Backend.Docker.HostConfig
+
+    test "ShmSize and Init are rendered from config and from an override" do
+      assert %{"ShmSize" => 1024, "Init" => true} =
+               HostConfig.build([shm_size: 1024, init: true], network_mode: "none")
+
+      host = HostConfig.build([], network_mode: "none", overrides: %{shm_size: 2048, init: true})
+      assert host["ShmSize"] == 2048
+      assert host["Init"] == true
+    end
+
+    test "no override leaves the hardened defaults byte-identical" do
+      assert HostConfig.build([], network_mode: "none", overrides: %{}) ==
+               HostConfig.build([], network_mode: "none")
+    end
+
+    test "resource overrides replace the stack's values" do
+      host =
+        HostConfig.build([pids_limit: 64, memory: 10],
+          network_mode: "none",
+          overrides: %{pids_limit: 1024, memory: 2048, cpus: 0.5}
+        )
+
+      assert host["PidsLimit"] == 1024
+      assert host["Memory"] == 2048
+      assert host["NanoCpus"] == 500_000_000
+    end
+
+    test "a tmpfs override merges over the read-only defaults" do
+      host =
+        HostConfig.build([readonly_rootfs: true],
+          network_mode: "none",
+          overrides: %{tmpfs: %{"/tmp" => "rw,size=512m"}}
+        )
+
+      assert host["Tmpfs"]["/tmp"] == "rw,size=512m"
+      assert host["Tmpfs"]["/var/log"] == HostConfig.default_tmpfs()["/var/log"]
+    end
+
+    test "weakening overrides render exactly what they say" do
+      host =
+        HostConfig.build([readonly_rootfs: true],
+          network_mode: "none",
+          overrides: %{cap_add: ["SYS_ADMIN"], no_new_privileges: false, readonly_rootfs: false}
+        )
+
+      assert host["CapAdd"] == ["SYS_ADMIN"]
+      assert host["CapDrop"] == ["ALL"]
+      assert host["SecurityOpt"] == []
+      refute Map.has_key?(host, "ReadonlyRootfs")
+      refute Map.has_key?(host, "Tmpfs")
+    end
+
+    test "a hardening override can tighten a lax stack" do
+      host = HostConfig.build([], network_mode: "none", overrides: %{readonly_rootfs: true})
+
+      assert host["ReadonlyRootfs"] == true
+      assert host["Tmpfs"] == HostConfig.default_tmpfs()
+    end
+  end
+
+  defp unique_host, do: "tcp://docker-#{System.unique_integer([:positive])}.test:2375"
+
   defp relay_loop(test_pid) do
     receive do
       {:"$gen_cast", msg} ->
@@ -286,4 +527,80 @@ defmodule CrowdControl.Backend.DockerUnitTest do
         relay_loop(test_pid)
     end
   end
+
+  defp running, do: %{"Running" => true, "ExitCode" => nil}
+  defp done(code), do: %{"Running" => false, "ExitCode" => code}
+
+  defp inspect?({:inspect, _}), do: true
+  defp inspect?(_event), do: false
+
+  defp events(agent), do: Agent.get(agent, &Enum.reverse(&1.events))
+
+  # A stub Engine API that records every exec create, start and inspect in
+  # order. `inspects` maps an exec id to the answers its inspects get, in turn;
+  # the last answer repeats. Exec ids are handed out as e1, e2, ...
+  defp stub_daemon(inspects, config \\ []) do
+    {containers, config} = Keyword.pop(config, :containers, [])
+
+    {:ok, agent} =
+      Agent.start_link(fn ->
+        %{events: [], next: 1, inspects: inspects, containers: containers}
+      end)
+
+    adapter = fn req ->
+      path = URI.parse(to_string(req.url)).path
+      {status, body} = Agent.get_and_update(agent, &route(&1, req.method, path, req))
+      {req, Req.Response.new(status: status, body: body)}
+    end
+
+    handle = %Docker{
+      container_id: "ctr",
+      fifo_path: "/var/run/cc.fifo",
+      config: [req_adapter: adapter] ++ config
+    }
+
+    {handle, agent}
+  end
+
+  defp route(state, :get, "/containers/json", req) do
+    filters = URI.decode_query(URI.parse(to_string(req.url)).query || "")["filters"]
+    {{200, state.containers}, record(state, {:list, filters && JSON.decode!(filters)})}
+  end
+
+  defp route(state, :post, "/containers/create", req) do
+    {{201, %{"Id" => "ctr"}}, record(state, {:create_container, decoded_body(req)})}
+  end
+
+  defp route(state, :post, "/containers/ctr/start", _req) do
+    {{204, ""}, record(state, {:start_container, "ctr"})}
+  end
+
+  defp route(state, :post, "/containers/ctr/exec", req) do
+    id = "e#{state.next}"
+    [_sh, "-c", script] = decoded_body(req)["Cmd"]
+    {{201, %{"Id" => id}}, %{record(state, {:create, id, script}) | next: state.next + 1}}
+  end
+
+  defp route(state, :post, "/exec/" <> rest, req) do
+    [id, "start"] = String.split(rest, "/")
+    {{200, ""}, record(state, {:start, id, decoded_body(req)})}
+  end
+
+  defp route(state, :get, "/exec/" <> rest, _req) do
+    [id, "json"] = String.split(rest, "/")
+
+    {answer, remaining} =
+      case Map.fetch!(state.inspects, id) do
+        [last] -> {last, [last]}
+        [next | rest] -> {next, rest}
+      end
+
+    state = record(state, {:inspect, id})
+    {{200, answer}, %{state | inspects: Map.put(state.inspects, id, remaining)}}
+  end
+
+  defp record(state, event), do: %{state | events: [event | state.events]}
+
+  defp decoded_body(%{body: body}) when is_binary(body), do: JSON.decode!(body)
+  defp decoded_body(%{options: %{json: json}}), do: JSON.decode!(JSON.encode!(json))
 end

@@ -298,6 +298,28 @@ defmodule CrowdControl.Backend.KubernetesTest do
       Kubernetes.destroy(handle)
     end
 
+    test "a frame larger than one argv string is delivered whole", %{opts: opts} do
+      # Frames travel the exec stdin channel. In argv they were capped by
+      # MAX_ARG_STRLEN (128 KiB per string), and an SDK MCP tool result can
+      # exceed that.
+      {:ok, handle} = Kubernetes.provision(opts)
+      {:ok, handle} = Kubernetes.exec(handle, "/bin/sh", @echo_cli, %{})
+      Process.sleep(500)
+
+      line = String.duplicate("x", 200 * 1024)
+      assert :ok = Kubernetes.write(handle, line <> "\n")
+
+      # The echo CLI wraps each line as {"echo":"<line>"}\n: 12 bytes of framing.
+      expected = Integer.to_string(byte_size(line) + 12)
+
+      assert eventually(fn ->
+               String.trim(sh(handle, "wc -c < #{handle.tee_path}")) == expected
+             end),
+             "the tee file does not hold the whole frame"
+
+      Kubernetes.destroy(handle)
+    end
+
     test "a second exec/4 is refused and leaves the tee file and credential file alone",
          %{opts: opts} do
       # `tee` opens the tee file `O_TRUNC`, so a second launch silently truncated
@@ -346,7 +368,7 @@ defmodule CrowdControl.Backend.KubernetesTest do
 
       # Deliberately not `{:k8s, :exec_timeout}`. `bounded/2` brutal-kills the
       # exec task and the Mint socket dies with it, but the API server may
-      # already have run the `printf` — so the prompt may or may not be in the
+      # already have run the `head` — so the prompt may or may not be in the
       # FIFO. Reported as a generic timeout, the obvious response is a retry,
       # which delivers the prompt twice.
       assert {:error, {:k8s, :write_indeterminate}} = Kubernetes.write(starved, "maybe\n")
@@ -713,8 +735,9 @@ defmodule CrowdControl.Backend.KubernetesTest do
 
     test "destroy removes the Pod, is idempotent, and takes the managed policy with it",
          %{opts: opts, owner: owner} do
-      # network_probe: false because OrbStack does not enforce NetworkPolicy and
-      # the preflight would refuse to provision at all — see the :deny_all test.
+      # network_probe: false because OrbStack fails the enforcement probe (its
+      # policies do not cover the API-server path the probe tests) and the
+      # preflight would refuse to provision at all — see the :deny_all test.
       opts = opts ++ [network: :deny_all, network_probe: false]
       {:ok, handle} = Kubernetes.provision(opts)
       assert Kubernetes.alive?(handle)
@@ -884,11 +907,12 @@ defmodule CrowdControl.Backend.KubernetesTest do
   describe "network posture" do
     test "deny_all refuses to provision on a cluster that does not enforce NetworkPolicy",
          %{opts: opts} do
-      # OrbStack accepts NetworkPolicy objects and enforces none of them, so the
-      # D5 preflight must refuse rather than report a boundary that is not
-      # there. The result is cached in :persistent_term per cluster URL, so this
-      # may or may not actually run a probe Pod — the returned error is the
-      # assertion either way.
+      # OrbStack enforces pod-to-pod and internet policy but lets a deny-all
+      # Pod reach the API server, which is what the probe tests, so the D5
+      # preflight must refuse rather than vouch for a boundary that does not
+      # hold on every path. The result is cached in :persistent_term per
+      # cluster URL, so this may or may not actually run a probe Pod — the
+      # returned error is the assertion either way.
       assert {:error, {:k8s, :network_policy_not_enforced}} =
                Kubernetes.provision(opts ++ [network: :deny_all])
     end
@@ -918,11 +942,13 @@ defmodule CrowdControl.Backend.KubernetesTest do
                )
 
       # The same contract through the backend rather than through API. A FIFO
-      # path that does not exist makes the container's `printf` fail, and
-      # `collect_exec/1` used to drop channel 3 -- so write/2 read `{:ok, ""}` as
-      # a delivered prompt.
+      # path that does not exist makes the container's `>>` redirect fail, and
+      # dropping channel 3 used to make write/2 read that as a delivered prompt.
+      # The exact code is the shell's (a failed redirect before an external
+      # `head` is 1 or 2 depending on the sh), so only non-zero is asserted.
       lost = %{handle | fifo_path: "/no-such-dir/cc.fifo"}
-      assert {:error, {:k8s, {:exit_status, 1}}} = Kubernetes.write(lost, "lost\n")
+      assert {:error, {:k8s, {:exit_status, code}}} = Kubernetes.write(lost, "lost\n")
+      assert code != 0
 
       Kubernetes.destroy(handle)
     end

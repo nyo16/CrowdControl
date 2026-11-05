@@ -87,8 +87,8 @@ COPY --from=sandboxd-build /opt/sandboxd /sandboxd
 # integration test runs against, so that test exercises the transport rather
 # than a node install.
 #
-# A real sandbox image additionally needs the agent CLI; the default runtime
-# stage below is that image.
+# A real sandbox image additionally needs the agent CLI; the runtime stage
+# below is that image.
 FROM debian:bookworm-slim AS sandbox-dev
 
 # libssl3 is REQUIRED, not optional: the release embeds ERTS, but ERTS's crypto
@@ -113,7 +113,11 @@ ENTRYPOINT ["/opt/sandboxd/bin/sandboxd"]
 CMD ["start"]
 
 # --- Runtime ---
-FROM ${ELIXIR_IMAGE}
+#
+# The default build output. It is named so that sandbox-browser can extend it,
+# and re-selected by the final stage at the end of this file, which keeps a
+# plain `docker build .` producing exactly this image.
+FROM ${ELIXIR_IMAGE} AS runtime
 
 ARG CLAUDE_CODE_VERSION
 
@@ -175,3 +179,62 @@ USER crowdctl
 # CrowdControl.Provider.Docker does exactly that, so nothing but the image name
 # is normally needed.
 ENTRYPOINT ["iex", "-S", "mix"]
+
+# --- Sandbox with the Playwright client side ---
+#
+#     docker build --target sandbox-browser -t crowd_control/sandbox-browser:dev .
+#
+# The runtime image plus playwright and @playwright/test at the single pin, a
+# `playwright-cli` shim and the playwright-cli skill for `crowdctl`. No
+# browsers: they live in the browser sidecar (examples/images/browser), which
+# the agent reaches over ws://browser:3000/<token> or http://browser:8931/mcp.
+# A separate stage so the default image does not carry the npm packages.
+#
+# The single Playwright pin is the PLAYWRIGHT_VERSION file at the repository
+# root; the example browser image is built from the same file, because a
+# run-server rejects a client of a different minor with 428. A
+# --build-arg PLAYWRIGHT_VERSION is not needed, and is refused if it disagrees.
+FROM runtime AS sandbox-browser
+
+ARG PLAYWRIGHT_VERSION
+
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# npm -g installs to /usr/lib/node_modules, which Node does not search from
+# the agent's workspace: without this `require('playwright')` and
+# `playwright test` (which needs @playwright/test) fail with MODULE_NOT_FOUND.
+ENV NODE_PATH=/usr/lib/node_modules
+
+# The runtime image's HEALTHCHECK probes a self-hosted CrowdControl, which a
+# sandbox never runs: inherited, it marks every sandbox unhealthy.
+HEALTHCHECK NONE
+
+USER root
+
+COPY PLAYWRIGHT_VERSION /tmp/PLAYWRIGHT_VERSION
+
+# The shim lets the skill's literal `playwright-cli …` commands run on the
+# pinned core rather than the alpha-cored @playwright/cli package.
+RUN pin="$(cat /tmp/PLAYWRIGHT_VERSION)" && rm /tmp/PLAYWRIGHT_VERSION \
+    && test -n "${pin}" \
+    && if [ -n "${PLAYWRIGHT_VERSION}" ] && [ "${PLAYWRIGHT_VERSION}" != "${pin}" ]; then \
+         echo "--build-arg PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION} disagrees with the PLAYWRIGHT_VERSION file (${pin})" >&2; \
+         exit 1; \
+       fi \
+    && npm install -g "playwright@${pin}" "@playwright/test@${pin}" \
+    && npm cache clean --force \
+    && printf '#!/bin/sh\nexec playwright cli "$@"\n' > /usr/local/bin/playwright-cli \
+    && chmod 0755 /usr/local/bin/playwright-cli
+
+USER crowdctl
+
+# Installs to ~/.claude/skills/playwright-cli/, where Claude Code loads
+# personal skills from.
+RUN cd /home/crowdctl && playwright-cli install --skills -g \
+    && test -f /home/crowdctl/.claude/skills/playwright-cli/SKILL.md
+
+# --- Default target ---
+#
+# `docker build` without --target builds the last stage. This one adds nothing
+# to runtime, so the default output stays the runtime image.
+FROM runtime
