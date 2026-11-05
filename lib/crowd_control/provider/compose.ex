@@ -801,8 +801,9 @@ defmodule CrowdControl.Provider.Compose do
 
   @doc false
   # An uncompressed tar of `files`, entry names relative to `root`, built in
-  # memory by `:erl_tar` with each file's mode and owner. Public so the bytes
-  # can be round-tripped in a test without a daemon.
+  # memory by `:erl_tar` with each file's owner, then each entry's mode set by
+  # `put_modes/2`. Public so the bytes can be round-tripped in a test without
+  # a daemon.
   @spec archive(String.t(), [Service.file()]) :: binary()
   def archive(root, files) do
     {:ok, fd} = :file.open(<<>>, [:ram, :read, :write, :binary])
@@ -812,18 +813,58 @@ defmodule CrowdControl.Provider.Compose do
 
       Enum.each(files, fn file ->
         name = file.path |> Path.relative_to(root) |> String.to_charlist()
-        opts = [mode: file.mode, uid: file.uid, gid: file.gid, mtime: 0]
-        :ok = :erl_tar.add(tar, {name, file.content}, opts)
+        :ok = :erl_tar.add(tar, {name, file.content}, uid: file.uid, gid: file.gid, mtime: 0)
       end)
 
       :ok = :erl_tar.close(tar)
       {:ok, size} = :file.position(fd, :eof)
       # A RAM file opened `:binary` reads back a binary, never a charlist.
       case :file.pread(fd, 0, size) do
-        {:ok, bytes} when is_binary(bytes) -> bytes
+        {:ok, bytes} when is_binary(bytes) ->
+          bytes |> put_modes(Enum.map(files, & &1.mode)) |> IO.iodata_to_binary()
       end
     after
       :file.close(fd)
+    end
+  end
+
+  # `:erl_tar.add/3` takes `{:mode, _}` only from OTP 29; OTP 28 ignores it
+  # and writes every in-memory entry as 0o644, so a `0o440` file would ship
+  # world-readable. So the mode is written here, into each regular entry's
+  # ustar header in entry order, and the header checksum recomputed. A PAX
+  # extended header (typeflag `x`, written ahead of a long name or a large
+  # id) is passed over. Header layout (POSIX ustar): mode at 100 (8 bytes),
+  # size at 124 (12), checksum at 148 (8), typeflag at 156; data is padded to
+  # 512 bytes; two zero blocks end the archive.
+  defp put_modes(<<header::binary-size(512), rest::binary>>, [mode | modes] = all) do
+    <<_::binary-size(124), size::binary-size(12), _::binary-size(20), type, _::binary>> = header
+    data_size = div(octal(size) + 511, 512) * 512
+    <<data::binary-size(^data_size), rest::binary>> = rest
+
+    if type in [?0, 0],
+      do: [set_mode(header, mode), data | put_modes(rest, modes)],
+      else: [header, data | put_modes(rest, all)]
+  end
+
+  defp put_modes(trailer, []), do: [trailer]
+
+  defp set_mode(header, mode) do
+    <<head::binary-size(100), _mode::binary-size(8), mid::binary-size(40), _sum::binary-size(8),
+      tail::binary>> = header
+
+    field = String.pad_leading(Integer.to_string(mode, 8), 7, "0") <> <<0>>
+    sum = checksum(head <> field <> mid <> "        " <> tail)
+    checksum_field = String.pad_leading(Integer.to_string(sum, 8), 6, "0") <> <<0, ?\s>>
+    head <> field <> mid <> checksum_field <> tail
+  end
+
+  defp checksum(header), do: for(<<byte <- header>>, reduce: 0, do: (acc -> acc + byte))
+
+  # A numeric header field: octal digits, padded, ended by NUL or space.
+  defp octal(field) do
+    case for(<<c <- field>>, c in ?0..?7, into: "", do: <<c>>) do
+      "" -> 0
+      digits -> String.to_integer(digits, 8)
     end
   end
 

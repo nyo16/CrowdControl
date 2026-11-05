@@ -1577,16 +1577,40 @@ defmodule CrowdControl.Provider.ComposeUnitTest do
       refute Map.has_key?(spec, :files)
     end
 
-    test "archive/2 round-trips through :erl_tar" do
+    test "archive/2 round-trips through :erl_tar, each entry with its own mode" do
+      # A last segment past ustar's 100-byte name field, which its 155-byte
+      # prefix can't absorb, so :erl_tar writes a PAX header ahead of the
+      # entry, which the mode pass must step over.
+      long = "x/" <> String.duplicate("c", 120) <> ".yaml"
+
       files = [
         %{path: "/w/a.txt", content: "alpha", mode: 0o600, uid: 1, gid: 2},
+        %{path: "/w/" <> long, content: "gamma", mode: 0o440, uid: 65_532, gid: 0},
         %{path: "/w/deep/b.bin", content: <<0, 255, 1>>, mode: 0o755, uid: 0, gid: 0}
       ]
 
       bytes = Compose.archive("/w", files)
 
       assert {:ok, entries} = :erl_tar.extract({:binary, bytes}, [:memory])
-      assert Enum.sort(entries) == [{~c"a.txt", "alpha"}, {~c"deep/b.bin", <<0, 255, 1>>}]
+
+      assert Enum.sort(entries) == [
+               {~c"a.txt", "alpha"},
+               {~c"deep/b.bin", <<0, 255, 1>>},
+               {String.to_charlist(long), "gamma"}
+             ]
+
+      # The mode is set by archive/2 itself: OTP 28's :erl_tar.add/3 ignores
+      # `:mode` and would write 0o644 for every entry.
+      assert {:ok, table} = :erl_tar.table({:binary, bytes}, [:verbose])
+
+      assert Enum.sort(
+               for {name, :regular, _, _, mode, uid, gid} <- table, do: {name, mode, uid, gid}
+             ) ==
+               [
+                 {~c"a.txt", 0o600, 1, 2},
+                 {~c"deep/b.bin", 0o755, 0, 0},
+                 {String.to_charlist(long), 0o440, 65_532, 0}
+               ]
 
       # Deterministic: a body is a function of its inputs.
       assert Compose.archive("/w", files) == bytes
