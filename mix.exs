@@ -26,7 +26,9 @@ defmodule CrowdControl.MixProject do
       docs: docs(),
       test_coverage: [tool: ExCoveralls],
       dialyzer: [
-        plt_add_apps: [:mix],
+        # :ex_unit for test/support, which dialyzer sees under MIX_ENV=test
+        # (CI's env): `CrowdControl.K8sLive` reads ExUnit.configuration/0.
+        plt_add_apps: [:mix, :ex_unit],
         flags: [:error_handling, :unknown, :missing_return, :extra_return]
       ]
     ]
