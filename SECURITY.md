@@ -410,16 +410,27 @@ held back. A Pod still there at the deadline, or one whose DELETE failed, keeps
 its policy, and the orphan sweep, which counts a terminating Pod as live,
 removes it later. If the sandbox Pod is not confirmed gone by its own deadline,
 the `sbx` services are still deleted then, and only the sandbox's policy stays.
-If the sandbox Pod's own DELETE failed, it may run on indefinitely, so its
+If the sandbox Pod's own DELETE failed and it may still be running (phase
+`Running` or `Unknown`, or unreadable), it may run on indefinitely, so its
 `sbx` services stay as well — their Pods, Services and NetworkPolicies, with a
-warning naming them — and a later `destroy/1` (the reaper's orphan pass) or
-the sweep removes them once the sandbox Pod is gone. Their ConfigMaps and
-Secrets are still deleted: a running Pod keeps the env it loaded and the last
-files it was given.
+warning naming them — and a later `destroy/1` (the reaper's orphan pass) or the
+sweep removes them once the sandbox Pod is gone. For a Pending or finished one
+they are deleted: its agent isn't running, and a Pending Pod's in-Pod sidecars,
+which may already be up, only lose their peers, which fails closed — while
+keeping them would leave them for good behind a Pod stuck Pending. If a Pending
+one starts later, it runs without them and keeps its deny-all. Their
+ConfigMaps and Secrets are deleted in every case:
+a kept `:separate` Pod (`restartPolicy: Never`) keeps the env it loaded and the
+last files it was given, and the sandbox's in-Pod sidecars can't restart once
+their Secret is gone, which fails closed.
 Every object carries
 a `crowd_control.sweep_after_ms` annotation (provision time plus the session's
 `:provision_timeout` plus `:orphan_margin_ms`, default a minute), and the sweep
-leaves it alone until then, so an in-flight provision is never swept. Under
+leaves it alone until then, so an in-flight provision is never swept. The sweep
+also deletes a finished (`Succeeded` or `Failed`), non-terminating sandbox Pod
+under the same owner checks, a full `:provision_timeout` plus
+`:orphan_margin_ms` after it finished, so a sandbox whose teardown failed
+doesn't linger once nothing names it. Under
 `network: :deny_all`, `<pod>-deny-all` is fetched again just before the
 sandbox Pod is created, and a missing one fails the provision with
 `{:k8s, {:policy_missing, name}}`.
@@ -441,7 +452,9 @@ also knows port 53 only, so it misses a resolver on another port (OpenShift's
 
 **Services run as non-root unless declared.** A service with no `user:` gets
 `runAsNonRoot: true`, and a root uid (`"0"`, `"00"`, `"0:1000"`) needs
-`weaken: [:user]`, as on Compose.
+`weaken: [:user]`. Root is decided numerically here and on Compose, but a named
+`user:` is refused here and trusted as written on Compose (see the Compose
+section).
 
 **One place this backend is stricter than Docker.** The sandbox container keeps
 `capabilities.drop: ["ALL"]` with *nothing* added. Creating the FIFO needs
@@ -685,8 +698,9 @@ service that uses it, rather than a create failure after the networks exist.
 
 **A sidecar's image default user is part of its posture.** A sidecar with no
 `user:` runs as whatever its image declares, so that inspect also reads the
-image's default user. It passes only as a numeric uid in `1..2147483647`
-(`1000`, `1000:1000`); Docker itself refuses a uid above that range, so this
+image's default user. It passes only as a numeric uid in `1..2147483647`, with
+a gid, if given, in `0..2147483647` (`1000`, `1000:1000`); Docker itself refuses
+an id above that range, so this
 refusal only comes earlier. Anything else — no `USER`, a name such as `node` or
 `nginx`, or a spelling Docker still runs as uid 0 (`00`, `+0`, `:1000`) — is
 refused with `{:error, {:compose, {:weakening_not_declared, {name, :user}}}}`

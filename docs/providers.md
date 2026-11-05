@@ -317,9 +317,12 @@ destroying the wrong thing:
 
 `crowd_control.stack=single` exists as a *positive* discriminator because Docker
 label filters cannot express label absence. The agent scope holds the other way
-too: `Backend.Docker.list_live/1` drops containers labelled
-`crowd_control.agent=sandboxd` (client-side, for the same reason), so its reaper
-never tears down a `Backend.Sandboxd` sandbox or stack.
+too: `Backend.Docker` labels its containers `crowd_control.agent=docker`, set at
+create so an image's own `crowd_control.agent` label can't override it, and its
+`list_live/1` drops containers labelled `crowd_control.agent=sandboxd`
+(client-side, for the same reason), so its reaper never tears down a
+`Backend.Sandboxd` sandbox or stack. Containers without a `crowd_control.agent`
+label, created before it, are still listed.
 
 `release/1` deletes the container before the network, in that order, because a
 network `DELETE` answers `403` while a container is still attached. `404` is
@@ -483,8 +486,9 @@ stack's HostConfig with `host_config:`:
   lacks is `{:error, {:compose, {:image_not_found, {service, image}}}}`, naming
   the first service that uses it.
 * **A sidecar's image default user** counts as its `user:` when it sets none, and
-  passes only as a numeric uid in `1..2147483647` (`1000`, `1000:1000`; Docker
-  refuses a larger one itself). No `USER`, a name (`node`, `nginx`), or a spelling
+  passes only as a numeric uid in `1..2147483647`, with a gid, if given, in
+  `0..2147483647` (`1000`, `1000:1000`; Docker refuses a larger one itself). No
+  `USER`, a name (`node`, `nginx`), or a spelling
   Docker runs as uid 0 (`00`, `+0`, `:1000`) is held to the `weaken: [:user]`
   rule, `{:error, {:compose, {:weakening_not_declared, {service, :user}}}}`; set a
   numeric `user:` or declare the weakening. Such a sidecar is created from the
@@ -1002,10 +1006,18 @@ sandbox Pod can reach and a drained `:pod` shipper may still be sending to, is
 deleted only once the sandbox Pod's wait is over. Every other `:separate` Pod is
 deleted alongside the sandbox Pod, and all the waits overlap, each against its own
 deadline. The derived Services, ConfigMaps and Secrets go after every wait. A
-sandbox Pod whose own DELETE fails keeps its `sbx` services — Pod, Service and
-NetworkPolicy, logged in one warning — since it may still reach them; a later
-`destroy/1` (the reaper's orphan pass) or the sweep removes them once it is gone.
-Their ConfigMaps and Secrets are deleted as usual.
+sandbox Pod whose own DELETE failed and that may still be running (phase
+`Running` or `Unknown`, or unreadable) keeps its `sbx` services — Pod, Service
+and NetworkPolicy, logged in one warning — since it may still reach them. For
+a Pending or finished one (or one already gone) they are deleted as for a
+deleted sandbox: its agent isn't running, and although a Pending Pod's in-Pod
+sidecars may already be up, losing their peers fails closed, while keeping
+them would leave them for good behind a Pod stuck Pending. A later
+`destroy/1` (the reaper's orphan pass) or the sweep removes kept ones once the
+sandbox Pod is gone. Their ConfigMaps and Secrets are deleted as usual: a kept
+`:separate` Pod (`restartPolicy: Never`) keeps the env it loaded, and the
+sandbox's in-Pod sidecars can't restart once their Secret is gone, which fails
+closed.
 
 A service's `env` never reaches a Pod spec. Each service with a non-empty `env`
 gets a per-session Secret, `cc-<session_key>-<service>-env`, labelled
@@ -1029,9 +1041,13 @@ session has no live Pod (a terminating one counts as live) and that are past bot
 `:provision_timeout` plus `:orphan_margin_ms` (default a minute) and their own
 `crowd_control.sweep_after_ms` annotation — the provisioning session's
 `:provision_timeout` plus margin, stamped as wall-clock milliseconds just before
-its objects are created. The reaper reports the count as `swept`. `list_live/1`
-itself now selects `crowd_control.role!=service`, so a service Pod is never
-mistaken for a sandbox.
+its objects are created. The same pass deletes a finished (`Succeeded` or
+`Failed`) sandbox Pod that isn't terminating, under the same owner and
+`sweep_after_ms` checks, a full `:provision_timeout` plus `:orphan_margin_ms`
+after it finished (its latest container `finishedAt`, else its creation), so a
+session still reading the exit code has the whole floor. The reaper reports the
+count as `swept`. `list_live/1` itself now selects `crowd_control.role!=service`,
+so a service Pod is never mistaken for a sandbox.
 
 ### Version floors
 

@@ -203,8 +203,9 @@
   failure after the networks exist.
 - **Compose refuses a sidecar whose image default user isn't a numeric
   non-root uid.** A sidecar with no `user:` runs as its image's default user,
-  which passes only as `uid` or `uid:gid` with a uid in `1..2147483647` (Docker
-  refuses a larger one at container start). No `USER`, `root`, any name
+  which passes only as `uid` or `uid:gid` with a uid in `1..2147483647` and a
+  gid in `0..2147483647` (Docker refuses a larger one at container start). No
+  `USER`, `root`, any name
   (`node`, `nginx`), and spellings Docker runs as uid 0 (`00`, `+0`, `-0`,
   `:1000`) need `weaken: [:user]`, as an explicit root `user:` does, or
   `{:compose, {:weakening_not_declared, {name, :user}}}`. This can refuse a
@@ -231,13 +232,27 @@
 - **A Kubernetes sandbox whose DELETE failed keeps the services it can
   reach.** `destroy/1` no longer deletes the Pods, Services and
   NetworkPolicies of the `sbx` services when the sandbox Pod's own DELETE
-  fails (anything but a 404), and logs one warning naming them; a later
-  `destroy/1` from the reaper's orphan pass, or the orphan sweep, removes them
-  once the sandbox Pod is gone.
+  fails (anything but a 404) and the Pod may still be running (phase
+  `Running` or `Unknown`, or a GET of it that fails with anything but a 404),
+  and logs one warning naming them. For a Pending or finished sandbox Pod they
+  are deleted as usual: its agent isn't running, and losing them fails closed,
+  where keeping them would leave them for good behind a Pod stuck Pending. A
+  later `destroy/1` from the reaper's orphan pass, or the orphan sweep,
+  removes kept ones once the sandbox Pod is gone. Their ConfigMaps and Secrets
+  are still deleted; a kept `:separate` Pod keeps the env it loaded.
+- **The Kubernetes orphan sweep deletes a finished sandbox Pod.** A
+  `Succeeded` or `Failed` sandbox Pod that isn't terminating, owned by this
+  node and past its `crowd_control.sweep_after_ms`, is deleted a full
+  `:provision_timeout` plus `:orphan_margin_ms` after it finished, so one whose
+  teardown failed no longer lingers once its record is gone.
 - **`Backend.Docker.list_live/1` no longer lists sandboxd containers.**
   Containers labelled `crowd_control.agent=sandboxd` belong to
   `Backend.Sandboxd`'s providers; a `Backend.Docker` reaper on the same owner
   would have torn their stacks apart from under live sessions.
+  `Backend.Docker` now labels its own containers `crowd_control.agent=docker`,
+  set at create so an image's `crowd_control.agent` label can't override it;
+  containers without a `crowd_control.agent` label (created before it) are
+  still listed.
 
 ## 0.3.0 — 2026-09-01
 
