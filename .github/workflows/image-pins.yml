@@ -44,7 +44,7 @@ jobs:
   image_pins:
     name: Image digest pins
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
 
@@ -52,11 +52,14 @@ jobs:
         run: |
           set -euo pipefail
           # A registry that is briefly down is not drift: three tries, 2 s and
-          # 4 s apart, before the pin is reported as "(inspect failed)".
+          # 4 s apart, each capped at 30 s (KILLed 5 s after that if it ignores
+          # the TERM), before the pin is reported as "(inspect failed)". A try's
+          # output is printed only if it succeeded with a non-empty digest.
           inspect() {
-            local delay
+            local delay out
             for delay in 2 4 0; do
-              if timeout 30 docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}' | tr -d '"'; then
+              if out=$(timeout -k 5 30 docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}' | tr -d '"') && [ -n "$out" ]; then
+                printf '%s\n' "$out"
                 return 0
               fi
               if [ "$delay" -gt 0 ]; then
