@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-05
 
 ### Added
 
@@ -159,8 +159,10 @@
 - **`Backend.Local` always scrubs the release environment.** `RELEASE_*`,
   `BINDIR`, `ROOTDIR`, `EMU`, `PROGNAME` and the release's `PATH` entries no
   longer reach the CLI, nor its `--version` probe; an explicit `:env` still
-  wins. Pass `release_env: :inherit` for the old behaviour. `sandboxd` scrubs
-  the same way.
+  wins. Pass `release_env: :inherit` for the old behaviour. The `sandboxd`
+  agent scrubs the same way from 0.2.0 (`sandboxd-v0.2.0`, also attached to
+  this release); the `sandboxd-v0.1.0` tarball does not, so point
+  `:sandboxd_url` at the new one.
 - **`Backend.Docker` writes are synchronous.** `write/2` waits for its exec to
   exit, so frames arrive in order; past `:write_timeout` it returns
   `{:error, {:docker, :write_indeterminate}}`, a non-zero exit
