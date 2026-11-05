@@ -262,7 +262,12 @@ defmodule CrowdControl.Backend.Kubernetes do
   sandbox Pod claims their session and they are past both the reaper's
   `:provision_timeout` plus `:orphan_margin_ms` and their own
   `crowd_control.sweep_after_ms` annotation (the provisioning session's
-  `:provision_timeout` plus its margin, as wall-clock milliseconds).
+  `:provision_timeout` plus its margin, as wall-clock milliseconds). The
+  sweep also deletes a finished sandbox Pod (`Succeeded` or `Failed`, and
+  not already being deleted) of this owner, on the same owner and window
+  checks but timed from when its last container finished, so a session
+  still reading its exit code keeps the whole window: once the reaper has
+  dropped a record whose `destroy/1` failed, nothing else names it again.
 
   A Pod with a drained sidecar is deleted with a grace period, and it keeps
   running for it. Its NetworkPolicy is what keeps it isolated, so `destroy/1`
@@ -278,9 +283,16 @@ defmodule CrowdControl.Backend.Kubernetes do
   wait plus the longest wait of a drained service on `sbx`, or the wait of
   any drained service off `sbx`. A Pod whose DELETE fails (anything but a
   404) keeps its policy too, whatever its grace. A sandbox Pod whose DELETE
-  fails keeps its `sbx` services as well — their Pods, Services and
+  failed and that may still be running (phase `Running` or `Unknown`, or
+  unreadable) keeps its `sbx` services as well — their Pods, Services and
   NetworkPolicies, since it may still reach them — and a later `destroy/1`
-  (the reaper's orphan pass) or the sweep removes them once it is gone.
+  (the reaper's orphan pass) or the sweep removes them once it is gone. One
+  that is finished or gone loses them as a deleted sandbox would. So does
+  one still `Pending`: its in-Pod sidecars may already run, but its agent
+  has not started, and deleting the services fails closed — it loses
+  reachability, never posture, and its deny-all stays — while keeping them
+  would leave them for good beside a Pod stuck `Pending` (an
+  `ImagePullBackOff`, say), which nothing else reaps.
 
   A service's `env` goes in a per-session Secret, `cc-<key>-<name>-env`
   (`crowd_control.role=service-secret`), which its container reads by
@@ -1985,10 +1997,18 @@ defmodule CrowdControl.Backend.Kubernetes do
   # drain, so a `:separate` Pod on `sbx` is DELETEd only once the sandbox
   # Pod's wait is over (its 404, or its deadline: as before, a sandbox not
   # confirmed gone keeps only its own policy). A sandbox whose own DELETE
-  # failed may still run for as long as it likes, so its `sbx` services are
-  # not DELETEd at all — Pod, Service and NetworkPolicy, which share a name —
-  # and a later `destroy/1` (the reaper's orphan pass, which reads the refs
-  # off the sandbox Pod again) or the sweep removes them once it is gone.
+  # failed and that may still be running (phase `Running` or `Unknown`, or a
+  # GET that failed) may run for as long as it likes, so its `sbx` services
+  # are not DELETEd at all — Pod, Service and NetworkPolicy, which share a
+  # name — and a later `destroy/1` (the reaper's orphan pass, which reads the
+  # refs off the sandbox Pod again) or the sweep removes them once it is
+  # gone. A failed DELETE of a sandbox that is finished or gone deletes them
+  # as for a deleted one, and so does one of a sandbox still `Pending` (or
+  # with no phase yet): its in-Pod sidecars may already run, but its agent
+  # has not started, and losing the services fails closed — reachability,
+  # never posture; its deny-all stays — while keeping them would leave them
+  # for good beside a Pod stuck `Pending` (`ImagePullBackOff`), which
+  # nothing else reaps.
   # Every other `:separate` Pod is DELETEd with the sandbox Pod, and all the
   # waits overlap: each runs against its own deadline from its own DELETE. A
   # NetworkPolicy goes only once its own Pod is gone, and the derived
@@ -2009,10 +2029,7 @@ defmodule CrowdControl.Backend.Kubernetes do
     unreached = start_pod_deletes(config, unreached)
     running? = still_running?(config, name, state, gone_deadline(config, started, grace))
 
-    {reached, kept} =
-      if state == :running,
-        do: {[], keep_reached(name, reached)},
-        else: {start_pod_deletes(config, reached), MapSet.new()}
+    {reached, kept} = reached_after(config, name, state, reached)
 
     running =
       for {pod, pod_state, deadline} <- unreached ++ reached,
@@ -2039,6 +2056,38 @@ defmodule CrowdControl.Backend.Kubernetes do
       {name, start_pod_delete(config, name, grace), gone_deadline(config, started, grace)}
     end
   end
+
+  # The `sbx` services once the sandbox's DELETE is sent: kept, with their
+  # names, only while a sandbox whose DELETE failed may still be running and
+  # reaching them; otherwise DELETEd as for a deleted sandbox. One read of
+  # its phase, no wait, and none at all when there is nothing to keep.
+  defp reached_after(_config, _sandbox, _state, []), do: {[], MapSet.new()}
+
+  defp reached_after(config, sandbox, :running, reached) do
+    case API.get_pod(config, sandbox) do
+      {:ok, pod} ->
+        reached_by_phase(config, sandbox, phase(pod), reached)
+
+      {:error, {:k8s, {:not_found, _}}} ->
+        {start_pod_deletes(config, reached), MapSet.new()}
+
+      {:error, _unreadable} ->
+        {[], keep_reached(sandbox, reached)}
+    end
+  end
+
+  defp reached_after(config, _sandbox, _state, reached),
+    do: {start_pod_deletes(config, reached), MapSet.new()}
+
+  # Not started yet, or done: its agent cannot reach them. `Running`,
+  # `Unknown` (its node is unreachable, so it may well run on) and any phase
+  # this code does not know keep them.
+  defp reached_by_phase(config, _sandbox, phase, reached)
+       when phase in [nil, "Pending", "Succeeded", "Failed"],
+       do: {start_pod_deletes(config, reached), MapSet.new()}
+
+  defp reached_by_phase(_config, sandbox, _phase, reached),
+    do: {[], keep_reached(sandbox, reached)}
 
   # `:gone` when the Pod no longer exists, or was deleted with no grace (the
   # kubelet SIGKILLs it at once, and its objects go straight after, as they
@@ -2100,17 +2149,18 @@ defmodule CrowdControl.Backend.Kubernetes do
     )
   end
 
-  # ConfigMaps and Secrets are not kept: a running Pod keeps the env it
-  # loaded, and the kubelet keeps a deleted ConfigMap's last projection.
-  defp keep_reached(_sandbox, []), do: MapSet.new()
-
+  # ConfigMaps and Secrets are not kept: a kept `:separate` Pod
+  # (`restartPolicy: Never`) keeps the env it loaded, and the kubelet keeps a
+  # deleted ConfigMap's last projection. The sandbox's own `:pod` sidecars
+  # (`restartPolicy: Always`) cannot restart once their Secret is gone, which
+  # fails closed.
   defp keep_reached(sandbox, pods) do
     names = for {:pod, pod, _grace, _reach} <- pods, do: pod
 
     Logger.warning(
-      "Kubernetes destroy: #{sandbox} could not be deleted, so the services it can " <>
-        "reach stay (#{Enum.join(names, ", ")}); the reaper's next destroy or its " <>
-        "orphan sweep removes them once it is gone"
+      "Kubernetes destroy: #{sandbox} could not be deleted and may still be running, " <>
+        "so the services it can reach stay (#{Enum.join(names, ", ")}); the reaper's " <>
+        "next destroy or its orphan sweep removes them once it is gone"
     )
 
     MapSet.new(names)
@@ -2258,9 +2308,18 @@ defmodule CrowdControl.Backend.Kubernetes do
   `:provision_timeout` plus its margin, which may be longer — so an
   in-flight provision is never swept from under itself.
 
+  It also deletes a finished sandbox Pod (any role but `service`, phase
+  `Succeeded` or `Failed`, and not already being deleted), held to the same
+  owner, session and window checks, but with its age counted from when it
+  finished — the latest `finishedAt` of its containers and init containers,
+  else its creation — so a session still reading its exit code has the
+  whole floor after the Pod ends. A sandbox Pod the reaper's `destroy/1`
+  failed on, and whose record it then dropped, is named by nothing else.
+
   All five lists must succeed before anything is deleted; any failure is
-  returned and nothing is touched. Returns how many objects were deleted
-  (404 included: something else got there first).
+  returned and nothing is touched. Returns how many objects, finished
+  sandbox Pods included, were deleted (404 included: something else got
+  there first).
   """
   @spec sweep_orphans(keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
   def sweep_orphans(config) do
@@ -2274,14 +2333,16 @@ defmodule CrowdControl.Backend.Kubernetes do
          {:ok, config_maps} <- API.list_config_maps(config, by_role.("service-config")),
          {:ok, secrets} <- API.list_secrets(config, by_role.("service-secret")) do
       {service_pods, sandboxes} = Enum.split_with(pods, &(role(&1) == "service"))
-
-      live =
-        Enum.filter(sandboxes, &live_sandbox?/1) ++ Enum.filter(service_pods, &terminating?/1)
-
+      {live_sandboxes, finished} = Enum.split_with(sandboxes, &live_sandbox?/1)
+      live = live_sandboxes ++ Enum.filter(service_pods, &terminating?/1)
       live = MapSet.new(live, &session_of/1)
       floor = (config[:provision_timeout] || @default_provision_timeout) + orphan_margin(config)
       now = System.system_time(:millisecond)
 
+      # Finished sandbox Pods last: while one exists, a new provision reusing
+      # its session key cannot create its own Pod (a 409), so nothing this
+      # pass listed earlier — the session's deny-all, its services — can
+      # belong to a Pod that runs while it is deleted.
       swept =
         (Enum.map(service_pods, &{:pod, &1}) ++
            Enum.map(services, &{:service, &1}) ++
@@ -2290,8 +2351,9 @@ defmodule CrowdControl.Backend.Kubernetes do
              &{:network_policy, &1}
            ) ++
            Enum.map(config_maps, &{:config_map, &1}) ++
-           Enum.map(secrets, &{:secret, &1}))
-        |> Enum.filter(fn {_kind, object} -> orphan?(object, live, owner, floor, now) end)
+           Enum.map(secrets, &{:secret, &1}) ++
+           Enum.map(finished, &{:sandbox, &1}))
+        |> Enum.filter(&orphan?(&1, live, owner, floor, now))
         |> Enum.count(&sweep_object(config, &1))
 
       {:ok, swept}
@@ -2304,15 +2366,16 @@ defmodule CrowdControl.Backend.Kubernetes do
   # A Pod with no phase yet has only just been created: live, not terminal. A
   # Pod being deleted is live too, until it is gone: it is still running out
   # its grace period, and deleting its NetworkPolicy now would hand it the
-  # cluster's default allow-all for the rest of it.
+  # cluster's default allow-all for the rest of it. A finished sandbox Pod
+  # that is not being deleted is the sweep's to delete.
   defp live_sandbox?(pod), do: terminating?(pod) or phase(pod) not in ["Succeeded", "Failed"]
 
   defp terminating?(pod), do: get_in(pod, ["metadata", "deletionTimestamp"]) != nil
 
-  defp orphan?(object, live, owner, floor, now) do
+  defp orphan?({kind, object}, live, owner, floor, now) do
     session = session_of(object)
     annotated = get_in(object, ["metadata", "annotations", "crowd_control.owner"])
-    age = object_age(object)
+    age = orphan_age(kind, object)
 
     cond do
       not is_binary(session) or MapSet.member?(live, session) ->
@@ -2334,6 +2397,22 @@ defmodule CrowdControl.Backend.Kubernetes do
       true ->
         age >= floor and now >= stamped_sweep_after(object)
     end
+  end
+
+  # A finished sandbox Pod counts from when it finished, not from when it was
+  # created: after a long session its creation is far past the floor, while
+  # the session may still be reading its exit code.
+  defp orphan_age(:sandbox, pod), do: finished_age(pod) || object_age(pod)
+  defp orphan_age(_kind, object), do: object_age(object)
+
+  # Since the last of its containers, init containers included, terminated;
+  # `nil` when none says when.
+  defp finished_age(pod) do
+    ["containerStatuses", "initContainerStatuses"]
+    |> Enum.flat_map(&(pod |> get_in(["status", &1]) |> List.wrap()))
+    |> Enum.map(&timestamp_age(get_in(&1, ["state", "terminated", "finishedAt"])))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.min(fn -> nil end)
   end
 
   # The provisioning session's own window, stamped on the object: the
@@ -2394,9 +2473,10 @@ defmodule CrowdControl.Backend.Kubernetes do
   defp sweep_object(config, {kind, object}) do
     name = get_in(object, ["metadata", "name"])
 
+    # A finished sandbox Pod runs nothing, so grace 0 costs it nothing.
     target =
       case kind do
-        :pod -> {:pod, name, 0}
+        pod when pod in [:pod, :sandbox] -> {:pod, name, 0}
         other -> {other, name}
       end
 

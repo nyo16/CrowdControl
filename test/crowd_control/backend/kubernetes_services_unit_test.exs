@@ -3,6 +3,8 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
   # are answered by a `:req_adapter` recorder; the manifests are pure.
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias CrowdControl.Backend.Kubernetes
   alias CrowdControl.Backend.Kubernetes.API
   alias CrowdControl.Backend.Kubernetes.Drain
@@ -16,6 +18,10 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
   doctest CrowdControl.Backend.Kubernetes.Files
   doctest CrowdControl.Backend.Kubernetes.Secrets
   doctest CrowdControl.Backend.Kubernetes.Services
+
+  # Teardown and sweep tests log warnings by design; the ones that matter are
+  # asserted with capture_log/1.
+  @moduletag :capture_log
 
   @key "0123456789abcdef0123456789abcdef"
 
@@ -1003,7 +1009,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
         object("cc-new-browser", "new", "service", young),
         # The hash matched, the raw owner did not.
         object("cc-foreign-browser", "foreign", "service", old, owner: "node-b"),
-        # A finished sandbox does not keep its services alive.
+        # A finished sandbox does not keep its services alive, and it goes too.
         object("cc-done", "done", "sandbox", old, phase: "Succeeded"),
         object("cc-done-browser", "done", "service", old)
       ]
@@ -1035,7 +1041,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
             {200, %{}}
         end)
 
-      assert {:ok, 7} =
+      assert {:ok, 8} =
                Kubernetes.sweep_orphans([owner: "node-a", provision_timeout: 1_000] ++ config)
 
       requests = log.()
@@ -1048,6 +1054,7 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
                {:networkpolicies, "cc-dead-browser"},
                {:networkpolicies, "cc-dead-deny-all"},
                {:pods, "cc-dead-browser"},
+               {:pods, "cc-done"},
                {:pods, "cc-done-browser"},
                {:secrets, "cc-dead-browser-env"},
                {:services, "cc-dead-browser"}
@@ -1066,6 +1073,80 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       assert {:configmaps, "crowd_control.owner_hash=#{hash},crowd_control.role=service-config"} in lists
 
       assert {:secrets, "crowd_control.owner_hash=#{hash},crowd_control.role=service-secret"} in lists
+    end
+
+    test "a finished sandbox Pod goes a full floor after it finished, owned and unclaimed" do
+      old = System.system_time(:millisecond) - 120_000
+      recent = System.system_time(:millisecond) - 5_000
+      succeeded = [phase: "Succeeded", finished: old]
+      failed = [phase: "Failed", finished: old]
+      late_main = [phase: "Failed", init_finished: old, finished: recent]
+      init_only = [phase: "Failed", init_finished: old]
+      stamped = [sweep_after: System.system_time(:millisecond) + 60_000] ++ failed
+
+      pods = [
+        # Finished long ago, owned, not being deleted: swept, after its policy.
+        object("cc-ended", "ended", "sandbox", old, failed),
+        # Created long ago but only just finished: its session may still be
+        # reading the exit code.
+        object("cc-just-ended", "just-ended", "sandbox", old, phase: "Failed", finished: recent),
+        # The latest finish counts, whichever list it is in.
+        object("cc-late-main", "late-main", "sandbox", old, late_main),
+        # Young by its label, but its init container finished long ago and
+        # nothing later did: the finish is what counts.
+        object("cc-init-only", "init-only", "sandbox", recent, init_only),
+        # Old by its finish, but its own session's window is still open.
+        object("cc-stamped", "stamped", "sandbox", old, stamped),
+        # Finished and already being deleted: still live, and so its services.
+        object("cc-closing", "closing", "sandbox", old, [deleting: true] ++ succeeded),
+        object("cc-closing-browser", "closing", "service", old),
+        # Running: never the sweep's.
+        object("cc-running", "running", "sandbox", old, phase: "Running"),
+        # The hash matched, the raw owner did not.
+        object("cc-foreign", "foreign", "sandbox", old, [owner: "node-b"] ++ succeeded)
+      ]
+
+      by_kind = %{
+        pods: pods,
+        services: [],
+        networkpolicies: [
+          object("cc-ended-deny-all", "ended", "sandbox", nil, created: old),
+          object("cc-closing-deny-all", "closing", "sandbox", nil, created: old)
+        ],
+        configmaps: [],
+        secrets: []
+      }
+
+      {config, log} =
+        recorder(fn
+          %{method: :get, path: path} ->
+            {200, %{"items" => by_kind[kind(path)], "metadata" => %{}}}
+
+          %{method: :delete} ->
+            {200, %{}}
+        end)
+
+      assert {:ok, 3} =
+               Kubernetes.sweep_orphans([owner: "node-a", provision_timeout: 1_000] ++ config)
+
+      deletes = for %{method: :delete} = req <- log.(), do: req
+
+      deleted = for req <- deletes, do: {kind(req.path), Path.basename(req.path)}
+
+      assert Enum.sort(deleted) == [
+               {:networkpolicies, "cc-ended-deny-all"},
+               {:pods, "cc-ended"},
+               {:pods, "cc-init-only"}
+             ]
+
+      for %{path: path, query: query} <- deletes, kind(path) == :pods do
+        assert query["gracePeriodSeconds"] == "0", "a finished Pod runs nothing to drain"
+      end
+
+      at = indexes(log.())
+      assert [policy_delete] = at.({:delete, :networkpolicies, "cc-ended-deny-all"})
+      assert [pod_delete] = at.({:delete, :pods, "cc-ended"})
+      assert policy_delete < pod_delete, "the finished Pod goes last, holding its name"
     end
 
     test "a failed list deletes nothing (fail open)" do
@@ -1365,35 +1446,11 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
       end
     end
 
-    test "a sandbox Pod whose delete failed keeps its deny-all and its sbx services" do
-      {:ok, seen} = Agent.start_link(fn -> MapSet.new() end)
+    test "a failed sandbox delete, Running: deny-all and sbx services kept, one warning" do
       sandbox = "cc-#{@key}"
+      {at, log} = destroy_after_failed_delete({200, ready_pod(sandbox)})
 
-      {config, log} =
-        recorder(fn
-          %{method: :delete, path: "/api/v1/namespaces/ns1/pods/" <> ^sandbox} ->
-            {500, %{"message" => "etcd is unhappy"}}
-
-          %{method: :get, path: "/api/v1/namespaces/ns1/pods/" <> pod} ->
-            if Agent.get_and_update(seen, &{pod in &1, MapSet.put(&1, pod)}),
-              do: {404, %{"message" => "not found"}},
-              else: {200, terminating_pod(pod)}
-
-          %{method: :delete} ->
-            {200, %{}}
-        end)
-
-      refs = [
-        %{name: "vector", placement: :pod, grace: 1, sbx: true},
-        %{name: "aggregator", placement: :separate, grace: 30, sbx: true},
-        %{name: "proxy", placement: :separate, grace: 45, sbx: false}
-      ]
-
-      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
-
-      at = indexes(log.())
-
-      assert at.({:get, :pods, sandbox}) == [], "a failed DELETE has nothing to wait for"
+      assert [_] = at.({:get, :pods, sandbox}), "one read of its phase, no wait"
 
       assert at.({:delete, :networkpolicies, "#{sandbox}-deny-all"}) == [],
              "a Pod that may still run must keep its only NetworkPolicy"
@@ -1414,6 +1471,119 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
         assert [_] = at.({:delete, :configmaps, Files.config_map_name(@key, name)})
         assert [_] = at.({:delete, :secrets, Secrets.secret_name(@key, name)})
       end
+
+      assert [_] = Regex.scan(~r/the services it can reach stay/, log), "exactly one warning"
+      assert log =~ "#{sandbox}-aggregator"
+      refute log =~ "#{sandbox}-proxy", "the proxy is off sbx: nothing of it is kept"
+    end
+
+    test "a failed sandbox delete of a Pod that cannot run its agent deletes its sbx services" do
+      sandbox = "cc-#{@key}"
+      with_phase = &%{"metadata" => %{"name" => sandbox}, "status" => %{"phase" => &1}}
+
+      for answer <- [
+            {200, with_phase.("Pending")},
+            {200, %{"metadata" => %{"name" => sandbox}}},
+            {200, with_phase.("Succeeded")},
+            {200, with_phase.("Failed")},
+            {404, %{"message" => "not found"}}
+          ] do
+        {at, log} = destroy_after_failed_delete(answer)
+
+        assert [_] = at.({:get, :pods, sandbox})
+
+        assert at.({:delete, :networkpolicies, "#{sandbox}-deny-all"}) == [],
+               "#{inspect(answer)}: a Pod whose DELETE failed keeps its own policy"
+
+        assert [_] = at.({:delete, :pods, "#{sandbox}-aggregator"}), inspect(answer)
+        assert [_] = at.({:delete, :services, "#{sandbox}-aggregator"}), inspect(answer)
+        assert [_terminating, gone] = at.({:get, :pods, "#{sandbox}-aggregator"})
+        assert [policy_delete] = at.({:delete, :networkpolicies, "#{sandbox}-aggregator"})
+        assert gone < policy_delete, "#{inspect(answer)}: the policy went before its Pod"
+
+        refute log =~ "the services it can reach stay", inspect(answer)
+      end
+    end
+
+    test "a failed sandbox delete, Unknown or unreadable: sbx services kept" do
+      sandbox = "cc-#{@key}"
+      unknown = %{"metadata" => %{"name" => sandbox}, "status" => %{"phase" => "Unknown"}}
+
+      for answer <- [{200, unknown}, {500, %{"message" => "etcd is unhappy"}}] do
+        {at, log} = destroy_after_failed_delete(answer)
+
+        assert [_] = at.({:get, :pods, sandbox})
+        assert at.({:delete, :networkpolicies, "#{sandbox}-deny-all"}) == []
+
+        for kind <- [:pods, :services, :networkpolicies] do
+          assert at.({:delete, kind, "#{sandbox}-aggregator"}) == [],
+                 "#{inspect(answer)}: the sandbox may still reach the aggregator's #{kind}"
+        end
+
+        assert log =~ "the services it can reach stay", inspect(answer)
+        assert log =~ "#{sandbox}-aggregator"
+      end
+    end
+
+    test "a failed sandbox delete with no services keeps its deny-all, and reads nothing" do
+      sandbox = "cc-#{@key}"
+      {at, log} = destroy_after_failed_delete({200, ready_pod(sandbox)}, services: [])
+
+      assert at.({:get, :pods, sandbox}) == [], "nothing to keep, so nothing to read"
+      assert at.({:delete, :networkpolicies, "#{sandbox}-deny-all"}) == []
+      refute log =~ "the services it can reach stay"
+    end
+
+    test "a failed sandbox delete still deletes its own Service, not the ones it reaches" do
+      sandbox = "cc-#{@key}"
+      [{:service, sandbox_service}] = Services.derived_objects(@key, [], true)
+
+      {at, _log} = destroy_after_failed_delete({200, ready_pod(sandbox)}, sandbox_ports: [8080])
+
+      assert [_] = at.({:delete, :services, sandbox_service})
+      assert at.({:delete, :services, "#{sandbox}-aggregator"}) == []
+    end
+
+    test "a drained :separate service whose delete failed keeps its own policy" do
+      proxy = "cc-#{@key}-proxy"
+
+      {config, log} =
+        recorder(fn
+          %{method: :delete, path: "/api/v1/namespaces/ns1/pods/" <> ^proxy} ->
+            {500, %{"message" => "etcd is unhappy"}}
+
+          %{method: :get, path: "/api/v1/namespaces/ns1/pods/" <> _} ->
+            {404, %{"message" => "not found"}}
+
+          %{method: :delete} ->
+            {200, %{}}
+        end)
+
+      refs = [
+        %{name: "proxy", placement: :separate, grace: 45, sbx: false},
+        %{name: "browser", placement: :separate, grace: 0, sbx: true}
+      ]
+
+      assert Kubernetes.destroy(handle(config, services: refs)) == :ok
+      at = indexes(log.())
+
+      assert at.({:get, :pods, proxy}) == [], "a failed DELETE has nothing to wait for"
+
+      assert at.({:delete, :networkpolicies, proxy}) == [],
+             "a Pod that may still run must keep its only NetworkPolicy"
+
+      assert [_] = at.({:delete, :services, proxy})
+
+      for name <- ["proxy", "browser"] do
+        assert [_] = at.({:delete, :configmaps, Files.config_map_name(@key, name)})
+        assert [_] = at.({:delete, :secrets, Secrets.secret_name(@key, name)})
+      end
+
+      for kind <- [:pods, :services, :networkpolicies] do
+        assert [_] = at.({:delete, kind, "cc-#{@key}-browser"})
+      end
+
+      assert [_] = at.({:delete, :networkpolicies, "cc-#{@key}-deny-all"})
     end
 
     test "the sweep leaves every object of a session whose Pod is still terminating" do
@@ -1822,6 +1992,47 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
     end)
   end
 
+  # The sandbox Pod's DELETE fails (500) and its GET answers `sandbox_get`;
+  # every other Pod answers its first GET as terminating and every later one
+  # 404. Destroys a handle with an `sbx` aggregator, a `:pod` sidecar and an
+  # off-`sbx` proxy unless `extra` says otherwise, and returns the request
+  # positions and the log.
+  defp destroy_after_failed_delete(sandbox_get, extra \\ []) do
+    {:ok, seen} = Agent.start_link(fn -> MapSet.new() end)
+    sandbox = "cc-#{@key}"
+
+    {config, log} =
+      recorder(fn
+        %{method: :delete, path: "/api/v1/namespaces/ns1/pods/" <> ^sandbox} ->
+          {500, %{"message" => "etcd is unhappy"}}
+
+        %{method: :get, path: "/api/v1/namespaces/ns1/pods/" <> pod} ->
+          cond do
+            String.trim_trailing(pod, "/") == sandbox ->
+              sandbox_get
+
+            Agent.get_and_update(seen, &{pod in &1, MapSet.put(&1, pod)}) ->
+              {404, %{"message" => "not found"}}
+
+            true ->
+              {200, terminating_pod(pod)}
+          end
+
+        %{method: :delete} ->
+          {200, %{}}
+      end)
+
+    refs = [
+      %{name: "vector", placement: :pod, grace: 1, sbx: true},
+      %{name: "aggregator", placement: :separate, grace: 30, sbx: true},
+      %{name: "proxy", placement: :separate, grace: 45, sbx: false}
+    ]
+
+    handle = handle(config, Keyword.put_new(extra, :services, refs))
+    output = capture_log(fn -> assert Kubernetes.destroy(handle) == :ok end)
+    {indexes(log.()), output}
+  end
+
   # The positions of `{method, kind, name}` in the recorded requests.
   defp indexes(requests) do
     requests = Enum.map(requests, &{&1.method, kind(&1.path), Path.basename(&1.path)})
@@ -1884,7 +2095,17 @@ defmodule CrowdControl.Backend.KubernetesServicesUnitTest do
           else: &1
       )
 
-    %{"metadata" => metadata, "status" => %{"phase" => Keyword.get(opts, :phase, "Running")}}
+    # `finished:` and `init_finished:` write the first container's and the
+    # first init container's `terminated.finishedAt`.
+    status =
+      for {opt, list} <- [finished: "containerStatuses", init_finished: "initContainerStatuses"],
+          ms = opts[opt],
+          into: %{"phase" => Keyword.get(opts, :phase, "Running")} do
+        finished_at = ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601()
+        {list, [%{"state" => %{"terminated" => %{"finishedAt" => finished_at}}}]}
+      end
+
+    %{"metadata" => metadata, "status" => status}
   end
 
   defp kind(path) do
