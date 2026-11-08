@@ -580,10 +580,18 @@ jobs:
     needs:
       [compile, format, credo, test, coverage, sobelow, audit, docs, dialyzer, sandboxd, cli_contract]
     if: startsWith(github.ref, 'refs/tags/v')
+    # HEX_API_KEY lives in the `hex` environment, not in repo secrets, so only
+    # this job can read it. The environment admits `v*` tags only and waits for
+    # a required reviewer, so nothing reaches Hex without an approval.
+    environment: hex
+    # This job holds the Hex key: actions are pinned to commit SHAs (a moved
+    # tag cannot inject code here) and checkout leaves no token in .git.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
@@ -593,6 +601,10 @@ jobs:
           TAG_REF: ${{ github.ref }}
         run: |
           TAG_VERSION="${TAG_REF#refs/tags/v}"
+          if ! [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::refusing to publish: tag v${TAG_VERSION} is not a semantic version"
+            exit 1
+          fi
           sed -i "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
           grep '@version' mix.exs
 

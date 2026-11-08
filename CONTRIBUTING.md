@@ -80,7 +80,10 @@ Two independent channels. Pushing the wrong tag publishes the wrong thing, so th
 distinction is worth reading once.
 
 **`v*` — the Hex package.** Sets the version from the tag, publishes to Hex, and
-*also* attaches the agent tarballs to the GitHub release.
+*also* attaches the agent tarballs to the GitHub release. The publish job runs in
+the `hex` environment, which holds `HEX_API_KEY`, admits `v*` tags only, and
+waits for a required reviewer: approve the pending deployment on the workflow
+run once every other job is green.
 
 ```bash
 git tag v0.2.0 && git push origin v0.2.0
