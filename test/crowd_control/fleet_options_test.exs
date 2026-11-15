@@ -255,9 +255,15 @@ defmodule CrowdControl.FleetOptionsTest do
 
     test "a forged negative cost cannot offset the others' spend" do
       [{c1, p1}, {c2, p2}, {_c3, p3}] = started(3)
-      collect = Task.async(fn -> CrowdControl.collect([p1, p2, p3], 5_000, budget_usd: 1.0) end)
 
+      # p1's forged result is in its history before collect/3 starts, and
+      # collect/3 subscribes to p1 before p2, so it is counted first: the two
+      # mock readers are separate processes, and their order is not guaranteed.
       answer(c1, 1, ok(%{"total_cost_usd" => -1.0e12}))
+      Session.subscribe(p1)
+      assert_receive {:crowd_control, ^p1, {:result, _, _}}, 2_000
+
+      collect = Task.async(fn -> CrowdControl.collect([p1, p2, p3], 5_000, budget_usd: 1.0) end)
       answer(c2, 1, ok(%{"total_cost_usd" => 1.2}))
 
       assert {:budget_exceeded, [{^p1, _}, {^p2, _}]} = Task.await(collect, 10_000)
