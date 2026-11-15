@@ -156,6 +156,36 @@ part of the `pods/exec` request URI, which an API server audit policy covering
 `pods/exec` records even at the `Metadata` level. Keep credentials in a config
 file or the environment, never in an inline map.
 
+## Results, rate limits and spend read the same capture
+
+Turn attribution, `:retry`, `:budget_usd` and `:idle_timeout` act on result
+and `rate_limit_event` lines, which come from the same sandbox-writable
+output as control requests. None of them can be authenticated either, so
+each is bounded rather than trusted:
+
+- **Turn attribution.** A result's `user_message_uuid(s)` only selects among
+  this session's own prompt uuids (recomputed from the session key, never read
+  back from the line), and `"turn"`/`"turns"` on the line are replaced by the
+  session's own. A forged echo can mislabel which of the session's turns a
+  result answers; it cannot name another session's, and a huge uuid list costs
+  one pass over it.
+- **`:retry`.** A forged `529` result from a turn with `num_turns: 1` makes
+  `run/2` re-send the prompt, so "tool-safe" holds only for results the CLI
+  wrote. A forged `rejected` rate limit can delay a re-send by at most
+  `:max_delay_ms` (a whole `run_many/3` round), or stop it. Every re-send is
+  bounded by `:max_retries` and emits `[:crowd_control, :retry]`.
+- **`:budget_usd`.** A recorded cost only ever goes up: a negative
+  `total_cost_usd` is ignored, and each session (each omp turn) keeps the
+  highest value seen, so a forged cost can end a `run_many/3` fan-out early
+  but not lower what the others have spent. A forged *result* can still stand
+  in for a session's real one, which then goes uncounted, so the fleet cap is
+  a budget for well-behaved sessions, not a bound against a hostile one. The
+  CLI's own `:max_budget_usd` is the per-session ceiling a forged line cannot
+  move.
+- **`:idle_timeout`.** Any output byte restarts it, so a sandbox can hold it
+  off by writing; it detects a hung CLI, not a hostile one. `:timeout`, which
+  output does not refresh, is the bound against the sandbox.
+
 ## Remote sandbox backends
 
 `CrowdControl.Backend.Docker` runs a CLI inside a container. Two properties

@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Seven Claude Code flags as options**, each under the CLI contract check:
+  `:disallowed_tools` (one comma-joined `--disallowed-tools` token, like
+  `:allowed_tools`), `:append_system_prompt`, `:max_turns` (positive integer;
+  a hidden flag, proven by the parser probe), `:effort` (`:low` … `:max`, atom
+  or binary), `:fallback_model`, `:fork_session` (raises without `:resume` or
+  `:continue`), `:json_schema` (a map, or a string that must be a JSON object)
+  and `:exclude_dynamic_system_prompt_sections`. omp rejects each with a
+  pointer to its own equivalent where it has one.
+- **`:hermetic` preset** (`:full | :project`) for Claude Code:
+  `--setting-sources ""` (or `user`), `--strict-mcp-config`,
+  `--exclude-dynamic-system-prompt-sections` and
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`; an explicit `:setting_sources` or `:env`
+  entry wins, and it never sets `:bare`. The empty `--setting-sources` token
+  survives every backend's argv path.
+- **Structured output.** `CrowdControl.Result.structured_output/1` and
+  `decode_structured/1` (`{:ok, map | list}` or a classified error), and two
+  `CrowdControl.Error` kinds: `:structured_output_failed`
+  (`error_max_structured_output_retries`) and `:no_structured_output`.
+- **`CrowdControl.Result.usage/1`**: a turn's token counts,
+  `%{input, output, cache_creation, cache_read}`, from Claude Code's or omp's
+  `usage`, and `usage` (plus `turns`) in `[:crowd_control, :turn, :stop]`
+  metadata.
+- **`rate_limit_event`** is classified as `{:rate_limit, frame}` (broadcast and
+  kept in history), typed by the new `CrowdControl.RateLimit.from_event/1`
+  (`status`, `rate_limit_type`, `resets_at`, `utilization`,
+  `unified_windows`), and emitted as `[:crowd_control, :rate_limit]`.
+- **`:idle_timeout`** session option (off by default): a turn that produces no
+  output at all, `keep_alive` included, for that long is interrupted and then
+  expired with `{:timeout, :idle_expired}`. Armed only while a prompt awaits
+  its result; stopped while a permission request is pending.
+- **Typed control helpers** on `CrowdControl.Session`: `mcp_status/1`,
+  `mcp_toggle/3`, `mcp_reconnect/2` (`{:error, :sdk_server}` for an in-BEAM
+  server), `rewind_files/3` (by turn number), `stop_task/2` and
+  `get_settings/1`; `{:error, :unsupported}` on omp.
+- **`:retry`** on `run/2` and the new `run_many/3`: a transient API failure
+  (429, 529, 5xx, connection) from a turn that ran no tools is re-sent into the
+  same session with jittered backoff, or after a rejected rate limit's reset;
+  `retry_on: {m, f, a}` widens the rule (checked to exist before any session
+  starts). Policy in the new `CrowdControl.Retry`; each re-send emits
+  `[:crowd_control, :retry]`. The sessions are stopped however the call ends.
+- **`:budget_usd`** on the new `collect/3` and `run_many/3`: once the sessions'
+  spend (Claude Code's cumulative `total_cost_usd`, omp's per-turn costs
+  summed) reaches the cap before every result is in, the call returns
+  `{:budget_exceeded, partial_results}` (`run_many/3` stops the sessions and
+  starts no retry round, `collect/3` leaves them running).
+- Every Claude Code prompt carries a `"uuid"` (`CrowdControl.Protocol.prompt_uuid/2`,
+  derived from the session key and turn), passed to adapters as the
+  `:prompt_uuid` option of `encode_prompt/3`. Claude Code 2.1.292 echoes it on
+  the result and also emits `command_lifecycle` frames for it; those are
+  classified as `{:command_lifecycle, map}` and dropped by the session, like
+  `keep_alive`.
+
+### Changed
+
+- An API-error result is classified from `terminal_reason: "api_error"` and
+  `api_error_status` first, the result text only when those are absent (older
+  CLIs, omp); `:api_error` reasons gain an `api_error` key.
+- `collect/3` and `run_many/3` return results in the order of the sessions
+  given, rather than in pid order.
+- A reattached session keeps its turn count (it restarted at 0).
+- The expiry log lines read `Session turn exceeded Nms; destroying it` and
+  `Session produced no output for Nms; destroying it` (was
+  `Session timed out after Nms`).
+
+### Fixed
+
+- A result that arrived after the next prompt had been written was stamped
+  with the newer turn, so `collect/2` waiting for that turn returned the
+  earlier answer. The turn now comes from the CLI's echo of the prompt's uuid;
+  a result answering several queued prompts lists them under `"turns"`, and a
+  late echo (after an interrupted turn's echo-less result) keeps its own turn.
+  `"turn"`/`"turns"` on a result line are always the session's own.
+
 ## 0.4.0 — 2026-11-05
 
 ### Added

@@ -53,6 +53,7 @@ defmodule FakeControlCli do
       waiting: nil,
       denials: [],
       outputs: [],
+      prompt_uuid: nil,
       exit_code: 0
     })
   end
@@ -86,7 +87,8 @@ defmodule FakeControlCli do
 
   # --- inbound frames ---
 
-  defp handle(%{"type" => "user"}, state), do: start_turn(state)
+  defp handle(%{"type" => "user"} = frame, state),
+    do: start_turn(%{state | prompt_uuid: frame["uuid"]})
 
   defp handle(%{"type" => "control_request", "request_id" => id, "request" => request}, state),
     do: host_request(id, request, state)
@@ -497,20 +499,31 @@ defmodule FakeControlCli do
   defp denial(tool_use_id, input),
     do: %{"tool_name" => "Bash", "tool_use_id" => tool_use_id, "tool_input" => input}
 
+  # Like claude 2.1.292, every result echoes the prompt's uuid in both fields.
   defp result(subtype, state, fields) do
-    Map.merge(
-      %{
-        "type" => "result",
-        "subtype" => subtype,
-        "is_error" => subtype != "success",
-        "num_turns" => state.turns,
-        "session_id" => state.session_id,
-        "total_cost_usd" => state.cost,
-        "permission_denials" => state.denials
-      },
-      fields
-    )
+    %{
+      "type" => "result",
+      "subtype" => subtype,
+      "is_error" => subtype != "success",
+      "num_turns" => state.turns,
+      "session_id" => state.session_id,
+      "total_cost_usd" => state.cost,
+      "permission_denials" => state.denials,
+      "usage" => %{
+        "input_tokens" => 10 * state.turns,
+        "output_tokens" => 2,
+        "cache_creation_input_tokens" => 0,
+        "cache_read_input_tokens" => 100
+      }
+    }
+    |> put_uuid_echo(state.prompt_uuid)
+    |> Map.merge(fields)
   end
+
+  defp put_uuid_echo(result, uuid) when is_binary(uuid),
+    do: Map.merge(result, %{"user_message_uuid" => uuid, "user_message_uuids" => [uuid]})
+
+  defp put_uuid_echo(result, _uuid), do: result
 
   defp emit(frame), do: IO.write(JSON.encode!(frame) <> "\n")
 

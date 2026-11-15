@@ -18,14 +18,22 @@ defmodule CrowdControl.Error do
   ## Kinds
 
     * `:api_error` - the model API failed. `reason` is
-      `%{category: category, status: integer | nil}`, where `category` is
-      `:rate_limit` (429), `:overloaded` (529), `:server_error` (other 5xx),
-      `:connection` (no HTTP response), or `:other` (any other status).
+      `%{category: category, status: integer | nil, api_error: term}`, where
+      `category` is `:rate_limit` (429), `:overloaded` (529), `:server_error`
+      (other 5xx), `:connection` (no HTTP response), or `:other` (any other
+      status), and `api_error` is the result's `api_error` field (`nil` when
+      the agent sent none).
     * `:auth` - the API rejected the credentials (401/403, invalid key, login
       required). `reason` is the error text.
     * `:max_turns_exceeded` - `error_max_turns`. `reason` is `%{num_turns: n}`.
     * `:max_budget_exceeded` - `error_max_budget_usd`. `reason` is
       `%{cap: number | nil, cost_usd: number | nil, num_turns: n | nil}`.
+    * `:structured_output_failed` - `error_max_structured_output_retries`: the
+      model never produced output matching `:json_schema`. `reason` is the
+      error text.
+    * `:no_structured_output` - built only by
+      `CrowdControl.Result.decode_structured/1`, for a successful turn without
+      `structured_output`. `reason` is `nil`.
     * `:execution_error` - `error_during_execution` for any reason other than
       aborted tools. `reason` is the error text.
     * `:aborted` - `error_during_execution` with `terminal_reason:
@@ -48,6 +56,8 @@ defmodule CrowdControl.Error do
           | :max_turns_exceeded
           | :max_budget_exceeded
           | :execution_error
+          | :structured_output_failed
+          | :no_structured_output
           | :aborted
           | :prompt_failed
           | :session_error
@@ -66,6 +76,8 @@ defmodule CrowdControl.Error do
     :auth,
     :max_turns_exceeded,
     :max_budget_exceeded,
+    :structured_output_failed,
+    :no_structured_output,
     :execution_error,
     :aborted,
     :prompt_failed,
@@ -96,6 +108,8 @@ defmodule CrowdControl.Error do
 
   defp detail(:max_budget_exceeded, %{cap: cap, cost_usd: cost}) when is_number(cost),
     do: "spent $#{cost}" <> if(is_number(cap), do: " of a $#{cap} cap", else: "")
+
+  defp detail(:no_structured_output, _reason), do: "the result has no structured_output"
 
   defp detail(:prompt_failed, %{message: message}) when is_binary(message), do: message
   defp detail(_kind, reason) when is_binary(reason) and reason != "", do: reason

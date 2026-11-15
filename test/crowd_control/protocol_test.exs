@@ -110,6 +110,48 @@ defmodule CrowdControl.ProtocolTest do
       assert {:user, %{"message" => %{"content" => "round-trip test ✓"}}} =
                Protocol.decode_line(line)
     end
+
+    test "carries the prompt uuid when one is given" do
+      uuid = Protocol.prompt_uuid("key", 3)
+      encoded = Protocol.encode_user_message("hi", uuid)
+
+      assert {:user, %{"uuid" => ^uuid, "message" => %{"content" => "hi"}}} =
+               Protocol.decode_line(String.trim_trailing(encoded))
+
+      refute Protocol.encode_user_message("hi") =~ "uuid"
+    end
+  end
+
+  describe "prompt_uuid/2" do
+    test "is a version 8 UUID, stable per key and turn, distinct across both" do
+      uuid = Protocol.prompt_uuid("key", 1)
+
+      assert uuid =~ ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/
+      assert uuid == Protocol.prompt_uuid("key", 1)
+
+      uuids = for key <- ["key", "other"], turn <- 1..50, do: Protocol.prompt_uuid(key, turn)
+      assert length(Enum.uniq(uuids)) == 100
+    end
+  end
+
+  describe "rate_limit_event" do
+    test "a string status is {:rate_limit, frame}" do
+      line =
+        ~s({"type":"rate_limit_event","session_id":"s","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":1762800000,"utilization":0.9}})
+
+      assert {:rate_limit, %{"rate_limit_info" => %{"status" => "allowed_warning"}}} =
+               Protocol.decode_line(line)
+    end
+
+    test "without a string status it stays unknown" do
+      for line <- [
+            ~s({"type":"rate_limit_event","rate_limit_info":{"status":3}}),
+            ~s({"type":"rate_limit_event","rate_limit_info":"x"}),
+            ~s({"type":"rate_limit_event"})
+          ] do
+        assert {:unknown, _} = Protocol.decode_line(line)
+      end
+    end
   end
 
   # Frames observed against claude 2.1.292, copied verbatim from
@@ -232,6 +274,13 @@ defmodule CrowdControl.ProtocolTest do
 
       assert {:unknown, %{"subtype" => "background_tasks_changed"}} =
                Protocol.decode_line(@background_tasks)
+    end
+
+    test "command_lifecycle, as 2.1.292 emits it for a uuid-carrying prompt" do
+      line =
+        ~s({"type":"command_lifecycle","command_uuid":"bd24723a-b694-802d-aff9-8184b9285080","state":"queued","uuid":"ba29b2db-02dd-45aa-a874-9768176805aa","session_id":"s"})
+
+      assert {:command_lifecycle, %{"state" => "queued"}} = Protocol.decode_line(line)
     end
 
     test "control frames with non-string ids stay unknown" do

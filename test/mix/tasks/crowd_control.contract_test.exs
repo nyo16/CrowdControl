@@ -27,7 +27,10 @@ defmodule Mix.Tasks.CrowdControl.ContractTest do
     listed =
       for %{flag: flag, hidden: false} <- CrowdControl.CLI.contract_flags(), do: flag
 
+    hidden = for %{flag: flag, hidden: true} <- CrowdControl.CLI.contract_flags(), do: flag
+
     System.put_env("FAKE_CONTRACT_FLAGS", Enum.join(listed, " "))
+    System.put_env("FAKE_CONTRACT_HIDDEN", Enum.join(hidden, " "))
     %{listed: listed}
   end
 

@@ -28,11 +28,25 @@ defmodule CrowdControl.Telemetry do
     * `[:crowd_control, :turn, :start]`: a prompt was written. Measurements
       `%{system_time, monotonic_time}`; metadata adds `%{turn}`.
     * `[:crowd_control, :turn, :stop]`: that prompt's result arrived.
-      Measurements `%{duration, monotonic_time}`; metadata adds `%{turn,
-      cost_usd, turn_cost_usd, subtype, error_kind}`. `cost_usd` is the CLI's
-      cumulative `total_cost_usd`, `turn_cost_usd` this turn's share of it, and
-      `error_kind` the `CrowdControl.Error` kind from
-      `CrowdControl.Result.classify/1` (`nil` for a successful turn).
+      Measurements `%{duration, monotonic_time}`; metadata adds `%{turn, turns,
+      cost_usd, turn_cost_usd, usage, subtype, error_kind}`. `turns` lists
+      every prompt the result answered (the `"turns"` of a result that
+      coalesced queued prompts, else `[turn]`). `cost_usd` is the CLI's
+      cumulative `total_cost_usd`, `turn_cost_usd` this turn's share of it,
+      `usage` the result's token counts (`CrowdControl.Result.usage/1`, `nil`
+      when the agent sent none), and `error_kind` the `CrowdControl.Error`
+      kind from `CrowdControl.Result.classify/1` (`nil` for a successful turn).
+    * `[:crowd_control, :rate_limit]`: Claude Code reported its rate-limit
+      state (a `rate_limit_event`), measurements `%{system_time}`, metadata
+      adds `%{rate_limit}`, a `CrowdControl.RateLimit`. `status: :rejected`
+      means the account is out of quota until `resets_at`; `:allowed_warning`
+      is the early alarm.
+    * `[:crowd_control, :retry]`: `CrowdControl.run/2` or
+      `CrowdControl.run_many/3` is about to re-send a prompt (`:retry`),
+      measurements `%{system_time, delay_ms}`, metadata `%{session, attempt,
+      category}` (not a session event: `session` is the pid; `attempt` counts
+      re-sends from 1; `category` is the `:api_error` category, or `nil` for a
+      result retried through `:retry_on`).
     * `[:crowd_control, :backend, :provision, :start | :stop | :exception]`: a
       `:telemetry.span/3` around `c:CrowdControl.Backend.provision/1`; stop
       metadata adds `%{result: :ok | :error}`.

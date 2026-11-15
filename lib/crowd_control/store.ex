@@ -98,11 +98,18 @@ defmodule CrowdControl.Store do
       while paused or disarmed
     * `:paused_remaining_ms` — what was left of the deadline when a pending
       permission request paused it
+    * `:gate` — what the SDK tool gate has learnt (permission mode, granted
+      tools, one-shot approvals)
+    * `:turns` — `%{prompt_seq, attributed}`: prompts written, and the newest
+      one a result was attributed to. Absent from older records, which
+      reattach at turn 0
   """
   @type control :: %{
-          pending: %{optional({String.t(), non_neg_integer() | nil}) => map()},
-          turn_deadline_at: integer() | nil,
-          paused_remaining_ms: non_neg_integer() | nil
+          required(:pending) => %{optional({String.t(), non_neg_integer() | nil}) => map()},
+          required(:turn_deadline_at) => integer() | nil,
+          required(:paused_remaining_ms) => non_neg_integer() | nil,
+          optional(:gate) => map(),
+          optional(:turns) => %{prompt_seq: non_neg_integer(), attributed: non_neg_integer()}
         }
 
   @doc "Insert or replace the record for `key`."

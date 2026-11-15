@@ -16,7 +16,9 @@ defmodule CrowdControl.TelemetryTest do
     [:crowd_control, :backend, :provision, :start],
     [:crowd_control, :backend, :provision, :stop],
     [:crowd_control, :backend, :provision, :exception],
-    [:crowd_control, :control, :decision]
+    [:crowd_control, :control, :decision],
+    [:crowd_control, :rate_limit],
+    [:crowd_control, :retry]
   ]
 
   setup do
@@ -126,6 +128,139 @@ defmodule CrowdControl.TelemetryTest do
                     %{store_key: ^key, status: :completed}}
 
     refute_received {:event, [:crowd_control, :session, :exception], _, %{store_key: ^key}}
+  end
+
+  test "a queued prompt's result closes its own span, stamped with its own turn" do
+    ctl = start_supervised!({Mock, events: []})
+
+    {:ok, pid} =
+      Session.start_link(
+        backend: {Mock, mock: ctl},
+        executable: "claude",
+        prompt: "one",
+        timeout: 10_000
+      )
+
+    key = :sys.get_state(pid).store_key
+    :ok = Session.send_prompt(pid, "two")
+    [u1, u2] = for turn <- [1, 2], do: CrowdControl.Protocol.prompt_uuid(key, turn)
+
+    Mock.push_events(ctl, [{:stdout_data, result("success", 0.1, %{"user_message_uuid" => u1})}])
+
+    assert_receive {:event, [:crowd_control, :turn, :stop], _,
+                    %{store_key: ^key, turn: 1, turns: [1], turn_cost_usd: 0.1}},
+                   2_000
+
+    Mock.push_events(ctl, [{:stdout_data, result("success", 0.3, %{"user_message_uuid" => u2})}])
+
+    assert_receive {:event, [:crowd_control, :turn, :stop], _,
+                    %{store_key: ^key, turn: 2, turns: [2], turn_cost_usd: cost}},
+                   2_000
+
+    assert_in_delta cost, 0.2, 1.0e-9
+    TestHelpers.stop_session(pid)
+  end
+
+  test "turn stop carries the result's usage, and a coalesced result closes every span" do
+    ctl = start_supervised!({Mock, events: []})
+
+    {:ok, pid} =
+      Session.start_link(
+        backend: {Mock, mock: ctl},
+        executable: "claude",
+        prompt: "one",
+        timeout: 10_000
+      )
+
+    key = :sys.get_state(pid).store_key
+    :ok = Session.send_prompt(pid, "two")
+
+    usage = %{
+      "input_tokens" => 7,
+      "output_tokens" => 3,
+      "cache_creation_input_tokens" => 1,
+      "cache_read_input_tokens" => 40
+    }
+
+    uuids = for turn <- [1, 2], do: CrowdControl.Protocol.prompt_uuid(key, turn)
+
+    Mock.push_events(ctl, [
+      {:stdout_data, result("success", 0.1, %{"usage" => usage, "user_message_uuids" => uuids})}
+    ])
+
+    assert_receive {:event, [:crowd_control, :turn, :stop], _,
+                    %{store_key: ^key, turn: 2, turns: [1, 2]} = stop},
+                   2_000
+
+    assert stop.usage == %{input: 7, output: 3, cache_creation: 1, cache_read: 40}
+
+    # Both spans are closed: the next prompt's turn starts fresh and its
+    # result, without usage, closes it with usage nil.
+    :ok = Session.send_prompt(pid, "three")
+    Mock.push_events(ctl, [{:stdout_data, result("success", 0.2)}])
+
+    assert_receive {:event, [:crowd_control, :turn, :stop], _,
+                    %{store_key: ^key, turn: 3, turns: [3], usage: nil}},
+                   2_000
+
+    assert %{turn_span: nil} = :sys.get_state(pid)
+    TestHelpers.stop_session(pid)
+  end
+
+  test "a rate_limit_event emits [:crowd_control, :rate_limit] with a typed RateLimit" do
+    frame = %{
+      "type" => "rate_limit_event",
+      "rate_limit_info" => %{"status" => "allowed_warning", "utilization" => 0.85}
+    }
+
+    ctl = start_supervised!({Mock, events: [{:stdout_data, line(frame)}]})
+
+    {:ok, pid} =
+      Session.start_link(backend: {Mock, mock: ctl}, executable: "claude", timeout: 10_000)
+
+    key = :sys.get_state(pid).store_key
+
+    assert_receive {:event, [:crowd_control, :rate_limit], %{system_time: _},
+                    %{store_key: ^key, backend: Mock, rate_limit: rate_limit}},
+                   2_000
+
+    assert %CrowdControl.RateLimit{status: :allowed_warning, utilization: 0.85, raw: ^frame} =
+             rate_limit
+
+    TestHelpers.stop_session(pid)
+  end
+
+  test "a run/2 re-send emits [:crowd_control, :retry] with its delay and category" do
+    ctl = start_supervised!({Mock, events: []})
+
+    run =
+      Task.async(fn ->
+        CrowdControl.run("hi",
+          backend: {Mock, mock: ctl},
+          executable: "claude",
+          timeout: 10_000,
+          retry: [base_delay_ms: 5]
+        )
+      end)
+
+    user_frames = fn -> Enum.count(Mock.writes(ctl), &(&1 =~ ~s("type":"user"))) end
+    overloaded = %{"terminal_reason" => "api_error", "api_error_status" => 529, "num_turns" => 1}
+
+    TestHelpers.wait_until(fn -> user_frames.() == 1 end)
+
+    Mock.push_events(ctl, [
+      {:stdout_data, result("success", 0, Map.put(overloaded, "is_error", true))}
+    ])
+
+    TestHelpers.wait_until(fn -> user_frames.() == 2 end)
+    Mock.push_events(ctl, [{:stdout_data, result("success", 0)}])
+
+    assert {:result, "success", _} = Task.await(run)
+
+    assert_received {:event, [:crowd_control, :retry], %{delay_ms: delay},
+                     %{session: session, attempt: 1, category: :overloaded}}
+
+    assert is_pid(session) and delay in 0..5
   end
 
   @tag :capture_log

@@ -51,7 +51,9 @@ defmodule CrowdControl.Agent do
   Encodes a user prompt as a stdin frame.
 
   `seq` is a per-session counter starting at 0, so adapters that need request
-  ids can mint stable ones without extra state.
+  ids can mint stable ones without extra state. The session adds
+  `:prompt_uuid` to the options: the `CrowdControl.Protocol.prompt_uuid/2` of
+  this prompt, for a wire format that can carry it and echo it on the result.
   """
   @callback encode_prompt(prompt :: binary(), seq :: non_neg_integer(), keyword()) :: binary()
 

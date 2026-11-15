@@ -10,10 +10,19 @@ defmodule CrowdControl.Session do
 
   Subscribers receive messages of the form `{:crowd_control, session_pid, payload}`
   where `payload` is one of `t:CrowdControl.Protocol.message/0`,
-  `{:exit, exit_status}`, `{:timeout, :session_expired}`, or `{:error, reason}`
+  `{:exit, exit_status}`, `{:timeout, :session_expired}` (the turn deadline),
+  `{:timeout, :idle_expired}` (the `:idle_timeout`), or `{:error, reason}`
   (e.g. `{:error, :line_too_large}` when a single newline-free output line
   exceeds `:max_line_bytes`, or `{:error, {:write_failed, reason}}` when a
   prompt or control answer could not be written to the CLI).
+
+  Every `{:result, subtype, map}` carries the turn it answers under `"turn"`:
+  the number of the prompt, counting from 1. Claude Code echoes each prompt's
+  uuid (see `CrowdControl.Protocol.prompt_uuid/2`) on its result, so a result
+  that arrives after a later prompt was written is still stamped with its own
+  turn; a result that answers several queued prompts at once also lists them,
+  ascending, under `"turns"`. Without an echo (omp, an interrupted turn) the
+  result is stamped with the newest prompt written and has no `"turns"`.
 
   Control frames are the session's business, not the subscribers': answers to
   the session's own requests, `keep_alive` heartbeats and incoming control
@@ -43,6 +52,21 @@ defmodule CrowdControl.Session do
       the default. Use `:infinity` or `nil` to disable. Defaults to `300_000`.
       The timer is paused while a permission request (or a deferred hook) is
       waiting on an answer, and a reattached session keeps the deadline it had.
+    * `:idle_timeout` - ms a turn in flight may produce no output at all before
+      the session gives up on it, as the turn deadline does: `interrupt` first
+      (within `:interrupt_grace`), then destroy, broadcasting
+      `{:timeout, :idle_expired}`. Any output resets it, `keep_alive`
+      heartbeats included, so it catches a hung CLI, not a slow model. Armed
+      only while a prompt awaits its result, stopped while a permission request
+      is pending (and restarted in full once it is answered), and restarted in
+      full after a reattach. Off (`nil`) by default; a long silent tool call
+      (a build, a test suite) needs a value above its runtime. Which prompts
+      await a result is known from the CLI's uuid echo: a result without one
+      (omp, an interrupted Claude turn) counts as answering every prompt
+      written so far, so a prompt queued behind it is not watched -- the safe
+      side, since assuming otherwise would expire sessions that are merely
+      idle. Output from inside the sandbox also restarts it, so it detects a
+      hung CLI, not a hostile one; `:timeout` bounds that.
     * `:max_prompt_size` - reject prompts whose byte size exceeds this with
       `{:error, :prompt_too_large}` (optional; unbounded when unset)
     * `:max_line_bytes` - cap for a single newline-free output line. Exceeding it
@@ -160,7 +184,7 @@ defmodule CrowdControl.Session do
 
   require Logger
 
-  alias CrowdControl.{Agent, Backend, CLI, Protocol, Result, SdkMcp, Store, Telemetry}
+  alias CrowdControl.{Agent, Backend, CLI, Protocol, RateLimit, Result, SdkMcp, Store, Telemetry}
   alias CrowdControl.Backend.Shell
   alias CrowdControl.Session.Control
 
@@ -177,6 +201,9 @@ defmodule CrowdControl.Session do
   # falls back to the permission requests it persisted.
   @reattach_reply_timeout 60_000
   @version_check_timeout 10_000
+  # How far back an echoed uuid is looked up when it matches no open turn;
+  # Claude Code caps a result's `user_message_uuids` at 64.
+  @late_turns 64
 
   # Control opts a reattached session needs at top level of its record; see
   # persisted_opts/2.
@@ -227,11 +254,13 @@ defmodule CrowdControl.Session do
     messages: [],
     message_count: 0,
     prompt_seq: 0,
-    # Monotonic start of the turn in flight, and how many more prompts are
-    # queued behind it: a queued prompt's turn starts when the one before it
+    # The highest turn a result has been attributed to; prompts above it are
+    # still waiting for theirs. Persisted with `prompt_seq` (see persist/1).
+    attributed_seq: 0,
+    # `{monotonic start of the turn in flight, prompts queued behind it}`, or
+    # nil between turns: a queued prompt's turn starts when the one before it
     # ends. O(1) however many prompts never see a result.
-    turn_started_at: nil,
-    queued_turns: 0,
+    turn_span: nil,
     control: %Control{}
   ]
 
@@ -416,6 +445,89 @@ defmodule CrowdControl.Session do
       do: request(session, request, timeout, :control)
 
   @doc """
+  The CLI's MCP servers, each a map with `"name"`, `"status"` (`"connected"`,
+  `"pending"`, `"failed"`, `"disabled"`), `"transport"`, `"scope"`,
+  `"serverInfo"` and `"tools"` as the CLI reports them. See `control/3` for
+  the errors; a reply without an `mcpServers` list is
+  `{:error, {:invalid_reply, response}}`.
+  """
+  @spec mcp_status(session()) :: {:ok, [map()]} | {:error, term()}
+  def mcp_status(session) do
+    case request(session, %{"subtype" => "mcp_status"}, @control_timeout, :control) do
+      {:ok, %{"mcpServers" => servers}} when is_list(servers) -> {:ok, servers}
+      {:ok, response} -> {:error, {:invalid_reply, response}}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc "Enable or disable one of the CLI's MCP servers by name. See `control/3`."
+  @spec mcp_toggle(session(), String.t(), boolean()) :: {:ok, map()} | {:error, term()}
+  def mcp_toggle(session, server, enabled?) when is_binary(server) and is_boolean(enabled?) do
+    request(
+      session,
+      %{"subtype" => "mcp_toggle", "serverName" => server, "enabled" => enabled?},
+      @control_timeout,
+      :control
+    )
+  end
+
+  @doc """
+  Reconnect one of the CLI's MCP servers by name. See `control/3`.
+
+  An in-BEAM server from this session's `:sdk_mcp_servers` has no connection
+  for the CLI to restart; naming one returns `{:error, :sdk_server}` without
+  asking the CLI.
+  """
+  @spec mcp_reconnect(session(), String.t()) :: {:ok, map()} | {:error, term()}
+  def mcp_reconnect(session, server) when is_binary(server) do
+    request(
+      session,
+      %{"subtype" => "mcp_reconnect", "serverName" => server},
+      @control_timeout,
+      :control
+    )
+  end
+
+  @doc """
+  Restore the files the agent changed since prompt number `turn` (see
+  `current_turn/1`), or with `dry_run: true` only report what would change.
+
+  The CLI addresses the prompt by its uuid (`CrowdControl.Protocol.prompt_uuid/2`),
+  so a turn outside `1..current_turn(session)` is `{:error, :unknown_turn}`.
+  The reply is the CLI's map, `canRewind`, `filesChanged`, `insertions` and
+  `deletions`; without file checkpointing in the CLI it is `canRewind: false`
+  with an `error`. See `control/3` for the other errors.
+  """
+  @spec rewind_files(session(), pos_integer(), keyword()) :: {:ok, map()} | {:error, term()}
+  def rewind_files(session, turn, opts \\ []) when is_integer(turn) do
+    dry_run = Keyword.get(opts, :dry_run, false)
+
+    unless is_boolean(dry_run),
+      do: raise(ArgumentError, ":dry_run must be a boolean, got: #{inspect(dry_run)}")
+
+    request(session, {:rewind_files, turn, dry_run}, @control_timeout, :control)
+  end
+
+  @doc "Stop a background task (a `Task` subagent or a background shell) by id. See `control/3`."
+  @spec stop_task(session(), String.t()) :: {:ok, map()} | {:error, term()}
+  def stop_task(session, task_id) when is_binary(task_id) do
+    request(
+      session,
+      %{"subtype" => "stop_task", "task_id" => task_id},
+      @control_timeout,
+      :control
+    )
+  end
+
+  @doc """
+  The CLI's settings as it sees them: the reply map (`"applied"`,
+  `"effective"`). See `control/3`.
+  """
+  @spec get_settings(session()) :: {:ok, map()} | {:error, term()}
+  def get_settings(session),
+    do: request(session, %{"subtype" => "get_settings"}, @control_timeout, :control)
+
+  @doc """
   The CLI control requests not yet answered, oldest first, or
   `{:error, :unsupported}` for an agent without the `:control` capability.
   """
@@ -498,7 +610,13 @@ defmodule CrowdControl.Session do
 
       # :reattach_control runs before any stdout cast, so the `initialize` is
       # written and the replayed lines are deduped against the restored set.
-      {:ok, state |> restore_deadline() |> session_started(), {:continue, :reattach_control}}
+      state =
+        state
+        |> restore_turns(Map.get(record, :control))
+        |> restore_deadline()
+        |> sync_idle()
+
+      {:ok, session_started(state), {:continue, :reattach_control}}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -787,7 +905,8 @@ defmodule CrowdControl.Session do
   end
 
   def handle_call({:control, request, timeout, capability}, from, state) do
-    if Agent.capable?(state.agent, capability) do
+    with true <- Agent.capable?(state.agent, capability) || {:error, :unsupported},
+         {:ok, request} <- wire_request(state, request) do
       {id, control} = Control.next_request_id(state.control)
       state = put_control(state, control)
 
@@ -799,7 +918,7 @@ defmodule CrowdControl.Session do
         {:error, reason} -> {:reply, {:error, {:write_failed, reason}}, state}
       end
     else
-      {:reply, {:error, :unsupported}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
@@ -838,7 +957,10 @@ defmodule CrowdControl.Session do
             byte_offset: state.byte_offset + byte_size(data)
         }
 
+        # Any bytes are a sign of life, keep_alive included, which
+        # consume_lines/3 drops before anything else would see it.
         state
+        |> reset_idle()
         |> consume_lines(lines, line_offset)
         |> lines_consumed(byte_size(data))
     end
@@ -888,12 +1010,17 @@ defmodule CrowdControl.Session do
   end
 
   @impl true
-  def handle_info({:timeout, ref, :session_timeout}, %{timeout_ref: ref} = state),
-    do: on_deadline(%{state | timeout_ref: nil})
+  def handle_info({:timeout, ref, :session_timeout}, %{timeout_ref: ref} = state) do
+    state = put_control(%{state | timeout_ref: nil}, %{state.control | turn_deadline_at: nil})
+    on_deadline(state, :session_expired)
+  end
+
+  def handle_info({:timeout, ref, :idle_timeout}, %{control: %{idle_ref: ref}} = state),
+    do: on_deadline(put_control(state, %{state.control | idle_ref: nil}), :idle_expired)
 
   def handle_info({:timeout, ref, :interrupt_grace}, %{control: %{grace_ref: ref}} = state) do
     Logger.warning("Session produced no result within interrupt_grace after its deadline")
-    expire(state)
+    expire(state, state.control.deadline_reason)
   end
 
   def handle_info({:timeout, ref, {:permission_timeout, key}}, state) do
@@ -1010,12 +1137,17 @@ defmodule CrowdControl.Session do
   defp accept_prompt(state, prompt), do: state |> clear_grace() |> do_send_prompt(prompt)
 
   defp do_send_prompt(state, prompt) do
-    encoded = state.agent.encode_prompt(prompt, state.prompt_seq, state.agent_opts)
-    state = %{state | prompt_seq: state.prompt_seq + 1}
+    turn = state.prompt_seq + 1
+
+    opts =
+      Keyword.put(state.agent_opts, :prompt_uuid, Protocol.prompt_uuid(state.store_key, turn))
+
+    encoded = state.agent.encode_prompt(prompt, state.prompt_seq, opts)
+    state = %{state | prompt_seq: turn}
 
     case write_frame(state, encoded) do
       :ok ->
-        turn_started(state)
+        state |> turn_started() |> sync_idle()
 
       {:error, reason} ->
         Logger.error("Session could not write prompt: #{inspect(reason)}")
@@ -1066,10 +1198,22 @@ defmodule CrowdControl.Session do
         buffer: state.buffer,
         opts: state.opts,
         owner: state.owner,
-        control: Control.to_store(state.control)
+        control: state.control |> Control.to_store() |> Map.put(:turns, persisted_turns(state))
       )
     )
   end
+
+  # Turn numbers live on the session, not in Control, but ride in the same
+  # Map.get-tolerant control map: a record written before they existed
+  # restores as turn 0, as every reattach did before.
+  defp persisted_turns(state),
+    do: %{prompt_seq: state.prompt_seq, attributed: state.attributed_seq}
+
+  defp restore_turns(state, %{turns: %{prompt_seq: seq, attributed: attributed}})
+       when is_integer(seq) and is_integer(attributed),
+       do: %{state | prompt_seq: seq, attributed_seq: attributed}
+
+  defp restore_turns(state, _control), do: state
 
   defp forget(%{persist?: false}), do: :ok
   defp forget(state), do: Store.delete(state.store_key)
@@ -1159,6 +1303,12 @@ defmodule CrowdControl.Session do
   # :max_messages during a long-held control request.
   defp handle_message(state, :keep_alive, _offset), do: state
 
+  # Claude Code reports each uuid-carrying prompt's progress (queued, started,
+  # ...). The session sends every prompt with a uuid, so passing these on would
+  # add frames to every subscriber and to `:max_messages` that no caller asked
+  # for; the result is what ends a turn.
+  defp handle_message(state, {:command_lifecycle, _frame}, _offset), do: state
+
   defp handle_message(state, message, _offset), do: handle_message(state, message)
 
   defp handle_message(state, {:invalid_json, raw}) do
@@ -1180,12 +1330,28 @@ defmodule CrowdControl.Session do
 
   # Every result carries the turn it belongs to. `subscribe/1` replays history,
   # so without this a collector attaching during turn 2 matches turn 1's
-  # replayed result and returns stale data instantly. `prompt_seq` is the
-  # number of prompts written, which is exactly the turn number.
+  # replayed result and returns stale data instantly. The turn is the prompt
+  # whose uuid the CLI echoed; without an echo it is `prompt_seq`, the newest
+  # prompt written.
   defp handle_message(state, {:result, subtype, map}) do
-    msg = {:result, subtype, Map.put(map, "turn", state.prompt_seq)}
+    {state, map} = attribute(state, map)
+    msg = {:result, subtype, map}
     state = state |> clear_grace() |> end_turn() |> turn_stopped(msg)
     state = accumulate(%{state | status: :completed}, msg)
+    broadcast(state, msg)
+    state
+  end
+
+  defp handle_message(state, {:rate_limit, frame} = msg) do
+    {:ok, rate_limit} = RateLimit.from_event(frame)
+
+    Telemetry.execute(
+      [:crowd_control, :rate_limit],
+      %{system_time: System.system_time()},
+      Map.put(meta(state), :rate_limit, rate_limit)
+    )
+
+    state = accumulate(state, msg)
     broadcast(state, msg)
     state
   end
@@ -1194,6 +1360,64 @@ defmodule CrowdControl.Session do
     state = accumulate(state, msg)
     broadcast(state, msg)
     state
+  end
+
+  # Prompts written since the last attributed one are the candidates, so a
+  # session hashes one or two turns per result, not its whole history. An echo
+  # that matches none of them is a late answer to an earlier turn -- one an
+  # echo-less result (an interrupted turn) already counted as answered -- and
+  # is looked up among the last `@late_turns` turns before giving up. Only a
+  # result with no usable echo falls back to the newest prompt.
+  #
+  # The result comes from output the sandbox can write to: `"turn"` and
+  # `"turns"` are always the session's own, never whatever the line carried.
+  defp attribute(state, map) do
+    echoed = echoed_uuids(map)
+    open = attributed_turns(state, echoed, state.attributed_seq + 1, state.prompt_seq)
+
+    late =
+      if open == [] and MapSet.size(echoed) > 0,
+        do:
+          attributed_turns(
+            state,
+            echoed,
+            state.attributed_seq - @late_turns + 1,
+            state.attributed_seq
+          ),
+        else: []
+
+    case open ++ late do
+      [] ->
+        attributed = max(state.attributed_seq, state.prompt_seq)
+        map = map |> Map.delete("turns") |> Map.put("turn", state.prompt_seq)
+        {%{state | attributed_seq: attributed}, map}
+
+      turns ->
+        turn = List.last(turns)
+        attributed = max(state.attributed_seq, turn)
+
+        {%{state | attributed_seq: attributed},
+         Map.merge(map, %{"turn" => turn, "turns" => turns})}
+    end
+  end
+
+  # Claude Code 2.1.292 sends both fields; either may be the one an older or
+  # newer CLI keeps. One set, so a forged line with a huge list costs one pass.
+  defp echoed_uuids(map) do
+    list = if is_list(map["user_message_uuids"]), do: map["user_message_uuids"], else: []
+    single = map["user_message_uuid"]
+
+    for uuid <- [single | list], is_binary(uuid), into: MapSet.new(), do: uuid
+  end
+
+  defp attributed_turns(state, echoed, from, to) do
+    if MapSet.size(echoed) == 0 do
+      []
+    else
+      for turn <- max(from, 1)..to//1,
+          MapSet.member?(echoed, Protocol.prompt_uuid(state.store_key, turn)),
+          do: turn
+    end
   end
 
   # Only a session using control features depends on the protocol floor.
@@ -1691,7 +1915,7 @@ defmodule CrowdControl.Session do
   defp drop_entry(state, key) do
     control = state.control
     {task, tasks} = Map.pop(control.tasks, key)
-    stop_task(task)
+    stop_callback_task(task)
     {timer, timers} = Map.pop(control.permission_timers, key)
     cancel_timer(timer)
 
@@ -1703,9 +1927,9 @@ defmodule CrowdControl.Session do
     })
   end
 
-  defp stop_task(nil), do: :ok
+  defp stop_callback_task(nil), do: :ok
 
-  defp stop_task({pid, ref}) do
+  defp stop_callback_task({pid, ref}) do
     Process.demonitor(ref, [:flush])
     _ = Task.Supervisor.terminate_child(CrowdControl.CallbackSupervisor, pid)
     :ok
@@ -1748,6 +1972,30 @@ defmodule CrowdControl.Session do
     do: mode
 
   defp requested_mode(_request), do: nil
+
+  # The wire form of a host request, for the ones only the session can build
+  # (a turn's uuid needs the store key) or must refuse (the CLI rejects a
+  # reconnect of an SDK server, which has no connection to restart).
+  defp wire_request(state, {:rewind_files, turn, dry_run}) do
+    if turn in 1..state.prompt_seq//1 do
+      {:ok,
+       %{
+         "subtype" => "rewind_files",
+         "user_message_id" => Protocol.prompt_uuid(state.store_key, turn),
+         "dryRun" => dry_run
+       }}
+    else
+      {:error, :unknown_turn}
+    end
+  end
+
+  defp wire_request(state, %{"subtype" => "mcp_reconnect", "serverName" => name} = request) do
+    if Map.has_key?(state.control.sdk_servers, name),
+      do: {:error, :sdk_server},
+      else: {:ok, request}
+  end
+
+  defp wire_request(_state, request), do: {:ok, request}
 
   # Registers a written handshake frame's request id, so its reply is consumed
   # (and a rejection logged) rather than dropped unread.
@@ -1933,10 +2181,13 @@ defmodule CrowdControl.Session do
     put_control(%{state | timeout_ref: ref}, %{state.control | turn_deadline_at: now_ms() + ms})
   end
 
+  # Both turn timers follow the pending set.
+  defp sync_timer(state), do: state |> sync_deadline() |> sync_idle()
+
   # The turn timer stops while a human holds the turn, and resumes with what was
   # left once nothing blocks it. Driven only by the pending set, so it is
   # recomputed rather than counted.
-  defp sync_timer(%{control: control} = state) do
+  defp sync_deadline(%{control: control} = state) do
     blocked = Control.blocked?(control)
 
     cond do
@@ -1987,13 +2238,53 @@ defmodule CrowdControl.Session do
     end
   end
 
+  # The idle timer runs only while a prompt awaits its result and nothing else
+  # explains the silence: no permission request is pending, and no interrupt
+  # grace is already running. Recomputed, never paused: an answered permission
+  # request or a reattach starts a fresh `idle_timeout`.
+  defp sync_idle(%{control: %{idle_timeout: nil}} = state), do: state
+
+  defp sync_idle(%{control: control} = state) do
+    idle? =
+      state.prompt_seq > state.attributed_seq and not is_nil(state.backend_state) and
+        is_nil(control.grace_ref) and not Control.blocked?(control)
+
+    cond do
+      not idle? -> cancel_idle(state)
+      is_nil(control.idle_ref) -> arm_idle(state)
+      true -> state
+    end
+  end
+
+  # Output arrived: an armed timer starts over. An unarmed one stays unarmed
+  # until sync_idle/1 decides.
+  defp reset_idle(%{control: %{idle_ref: nil}} = state), do: state
+  defp reset_idle(state), do: state |> cancel_idle() |> arm_idle()
+
+  defp arm_idle(%{control: control} = state) do
+    ref = :erlang.start_timer(control.idle_timeout, self(), :idle_timeout)
+    put_control(state, %{control | idle_ref: ref})
+  end
+
+  defp cancel_idle(%{control: %{idle_ref: nil}} = state), do: state
+
+  defp cancel_idle(%{control: control} = state) do
+    cancel_timer(control.idle_ref)
+    put_control(state, %{control | idle_ref: nil})
+  end
+
   # An agent that can stop a turn gets the chance to: `interrupt` first, and
   # the destructive path only if no result follows within the grace period.
-  defp on_deadline(%{control: control} = state) do
-    state = put_control(state, %{control | turn_deadline_at: nil})
+  # The idle timer only runs with a prompt in flight, so it may interrupt even
+  # when an earlier result left the status `:completed`.
+  defp on_deadline(%{control: control} = state, reason) do
+    interruptible? =
+      control.interrupt_grace > 0 and is_nil(control.grace_ref) and
+        (state.status != :completed or reason == :idle_expired)
 
-    if control.interrupt_grace > 0 and state.status != :completed and is_nil(control.grace_ref) do
+    if interruptible? do
       {id, control} = Control.next_request_id(state.control)
+      control = %{control | deadline_reason: reason}
       state = put_control(state, control)
 
       frame =
@@ -2002,25 +2293,29 @@ defmodule CrowdControl.Session do
       case write_frame(state, frame) do
         :ok ->
           Logger.warning(
-            "Session turn exceeded #{state.timeout}ms; interrupting " <>
-              "(grace #{control.interrupt_grace}ms)"
+            "#{deadline_message(state, reason)}; interrupting (grace #{control.interrupt_grace}ms)"
           )
 
           grace = :erlang.start_timer(control.interrupt_grace, self(), :interrupt_grace)
-          {:noreply, put_control(state, %{control | grace_ref: grace})}
+          {:noreply, state |> put_control(%{control | grace_ref: grace}) |> cancel_idle()}
 
         {:error, _reason} ->
-          expire(state)
+          expire(state, reason)
       end
     else
-      expire(state)
+      expire(state, reason)
     end
   end
 
-  defp expire(state) do
-    Logger.warning("Session timed out after #{state.timeout}ms")
+  defp deadline_message(state, :idle_expired),
+    do: "Session produced no output for #{state.control.idle_timeout}ms"
+
+  defp deadline_message(state, _session_expired), do: "Session turn exceeded #{state.timeout}ms"
+
+  defp expire(state, reason) do
+    Logger.warning("#{deadline_message(state, reason)}; destroying it")
     state = destroy_backend(state)
-    broadcast(state, {:timeout, :session_expired})
+    broadcast(state, {:timeout, reason})
     {:stop, :normal, %{state | status: :error}}
   end
 
@@ -2036,9 +2331,10 @@ defmodule CrowdControl.Session do
   # Teardown: every callback is cancelled and every waiter answered, so nothing
   # outlives the CLI it was talking to.
   defp shutdown_control(%{control: control} = state) do
-    Enum.each(control.tasks, fn {_key, task} -> stop_task(task) end)
+    Enum.each(control.tasks, fn {_key, task} -> stop_callback_task(task) end)
     Enum.each(control.permission_timers, fn {_key, timer} -> cancel_timer(timer) end)
     cancel_timer(control.grace_ref)
+    cancel_timer(control.idle_ref)
 
     Enum.each(control.outbound, fn {_id, %{from: from, timer: timer}} ->
       cancel_timer(timer)
@@ -2052,6 +2348,7 @@ defmodule CrowdControl.Session do
         tasks: %{},
         permission_timers: %{},
         grace_ref: nil,
+        idle_ref: nil,
         reconciling: false
     })
   end
@@ -2106,9 +2403,10 @@ defmodule CrowdControl.Session do
       Map.put(meta(state), :turn, state.prompt_seq)
     )
 
-    if is_nil(state.turn_started_at),
-      do: %{state | turn_started_at: now},
-      else: %{state | queued_turns: state.queued_turns + 1}
+    case state.turn_span do
+      nil -> %{state | turn_span: {now, 0}}
+      {started, queued} -> %{state | turn_span: {started, queued + 1}}
+    end
   end
 
   # Claude Code's `total_cost_usd` is cumulative for the process, so a turn's
@@ -2123,11 +2421,11 @@ defmodule CrowdControl.Session do
 
     state = %{state | last_cost_usd: cost || state.last_cost_usd}
 
-    case state.turn_started_at do
+    case state.turn_span do
       nil ->
         state
 
-      started ->
+      {started, queued} ->
         now = System.monotonic_time()
 
         error_kind =
@@ -2136,26 +2434,29 @@ defmodule CrowdControl.Session do
             {:error, %{kind: kind}} -> kind
           end
 
+        # A result that answers several queued prompts closes all their spans.
+        turns = Map.get(map, "turns", [map["turn"]])
+
         Telemetry.execute(
           [:crowd_control, :turn, :stop],
           %{duration: now - started, monotonic_time: now},
           Map.merge(meta(state), %{
             turn: map["turn"],
+            turns: turns,
             cost_usd: cost,
             turn_cost_usd: turn_cost,
+            usage: Result.usage(map),
             subtype: subtype,
             error_kind: error_kind
           })
         )
 
-        next_turn(state, now)
+        %{state | turn_span: next_span(now, queued, length(turns))}
     end
   end
 
-  defp next_turn(%{queued_turns: 0} = state, _now), do: %{state | turn_started_at: nil}
-
-  defp next_turn(state, now),
-    do: %{state | turn_started_at: now, queued_turns: state.queued_turns - 1}
+  defp next_span(now, queued, closed) when queued >= closed, do: {now, queued - closed}
+  defp next_span(_now, _queued, _closed), do: nil
 
   # The audit trail for permission decisions: answers are written to stdin and
   # never reach the capture, so this event is the only record of them.

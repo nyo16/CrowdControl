@@ -93,6 +93,14 @@ The `:timeout` is a ceiling on a single **turn**, not on the conversation. It is
 re-armed by `send_prompt/2`, deliberately not by output, so a turn that streams for longer than the
 window is still killed mid-flight.
 
+`:idle_timeout` is the opposite measure: silence, not duration. Off by default, it runs only while a
+prompt is in flight (`prompt_seq > attributed_seq`), every chunk of output restarts it — `keep_alive`
+included, which is why the reset sits in `handle_cast({:stdout_data, _}, _)` before line decoding drops
+the heartbeat — and it stops while a permission request is pending, because a human deciding is not a
+hung CLI. It fires through the same path as the deadline (`interrupt`, `:interrupt_grace`, destroy)
+and broadcasts `{:timeout, :idle_expired}`. Its timer lives in `Session.Control` next to the grace
+timer and is never persisted: a reattach starts a fresh window.
+
 ### `CrowdControl.Agent` — which CLI, and how to speak to it
 
 Four callbacks: `build_command/1` produces `{executable, args, env}`, `init_frames/1` produces the
@@ -237,9 +245,20 @@ the same map update in `handle_cast({:stdout_data, _}, _)`, because reattach rea
 
 **`{:result, subtype, map}` is stamped with the turn.** `subscribe/1` replays accumulated history, so
 without the stamp a collector attaching during turn 2 would match turn 1's replayed result and return
-stale data instantly. `prompt_seq` is the number of prompts written, which is exactly the turn number,
-and `Session.current_turn/1` lets a collector read it *before* subscribing. See
-`CrowdControl.collect/2`.
+stale data instantly. `Session.current_turn/1` (`prompt_seq`, the prompts written) lets a collector
+read the turn *before* subscribing. See `CrowdControl.collect/3`.
+
+**The turn comes from the CLI's echo, not from a counter.** Every Claude Code user frame carries a `"uuid"`, and
+Claude Code echoes it on the result that answers it (`user_message_uuid`, or the list
+`user_message_uuids` when it coalesced queued prompts into one turn). The uuid is
+`Protocol.prompt_uuid(store_key, turn)` — a hash, not a random value — so attribution needs no uuid
+table: on a result the session hashes the turns written since the last attributed one
+(`attributed_seq + 1 .. prompt_seq`, usually one or two) and stamps the highest match as `"turn"`,
+all matches as `"turns"`. Stamping with `prompt_seq` instead, as before, gave a result that arrived
+after the next prompt was written the *newer* turn, so a collector waiting for turn 2 took turn 1's
+answer. Without an echo (omp, an older CLI, an interrupted turn) the stamp falls back to
+`prompt_seq`. Both counters ride in the persisted control map, so a reattached session resumes at the
+right turn, and `Session.rewind_files/3` can name any turn's prompt to the CLI.
 
 **A result ends a turn, not the process.** `omp --mode rpc` and `claude --input-format stream-json`
 both keep reading stdin after emitting a result, so `send_prompt/2` on a `:completed` session moves it
@@ -312,7 +331,7 @@ already-answered `request_id` through `Session.respond/3` is a no-op.
   `"permission timed out"`.
 * At the turn deadline an `:interrupt`-capable agent is sent `interrupt` first and destroyed only if
   no result arrives within `:interrupt_grace` (30 s with a control feature on, else 0). omp is
-  destroyed at the deadline as before.
+  destroyed at the deadline as before. `:idle_timeout` takes the same path.
 * A reattached session — any reattachable session, control features or not — re-arms its deadline
   from the persisted wall-clock time rather than starting a fresh one.
 

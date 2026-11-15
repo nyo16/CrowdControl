@@ -196,6 +196,50 @@ defmodule CrowdControl.SessionTest do
       assert match?({:result, _, _}, List.last(messages))
       TestHelpers.stop_session(pid)
     end
+
+    test "the CLI's echo of the prompt uuid attributes the result, rate limit and usage pass through" do
+      {:ok, pid} = start_fake_session(env: %{"FAKE_CLI_RATE_LIMIT" => "1"})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "x")
+
+      assert_receive {:crowd_control, ^pid, {:rate_limit, _} = event}, 3_000
+
+      assert {:ok, %CrowdControl.RateLimit{status: :rejected}} =
+               CrowdControl.RateLimit.from_event(event)
+
+      uuid = CrowdControl.Protocol.prompt_uuid(:sys.get_state(pid).store_key, 1)
+
+      assert_receive {:crowd_control, ^pid,
+                      {:result, _,
+                       %{"user_message_uuid" => ^uuid, "turn" => 1, "turns" => [1]} = map}},
+                     3_000
+
+      assert %{input: 3, output: 5} = CrowdControl.Result.usage(map)
+      TestHelpers.stop_session(pid)
+    end
+
+    test "without the echo the result falls back to the newest turn" do
+      {:ok, pid} = start_fake_session(env: %{"FAKE_CLI_UUID_ECHO" => "0"})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "x")
+
+      assert_receive {:crowd_control, ^pid, {:result, _, %{"turn" => 1} = map}}, 3_000
+      refute Map.has_key?(map, "turns")
+      TestHelpers.stop_session(pid)
+    end
+
+    # `hermetic: :full` sets an env var, so the CLI is launched through the
+    # env-file `sh -c` path, where an empty argv token is easy to lose.
+    test "hermetic: :full's empty --setting-sources value reaches the CLI as a token" do
+      {:ok, pid} = start_fake_session(hermetic: :full, env: %{"FAKE_CLI_ECHO_ARGV" => "1"})
+      Session.subscribe(pid)
+      :ok = Session.send_prompt(pid, "x")
+
+      assert_receive {:crowd_control, ^pid, {:result, _, %{"result" => argv}}}, 3_000
+      assert argv =~ "[--setting-sources][]["
+      assert argv =~ "[--strict-mcp-config]"
+      TestHelpers.stop_session(pid)
+    end
   end
 
   describe "timeout handling" do

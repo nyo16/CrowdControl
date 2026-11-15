@@ -60,6 +60,9 @@ defmodule CrowdControl.Session.Control do
           turn_deadline_at: integer() | nil,
           paused_remaining_ms: non_neg_integer() | nil,
           grace_ref: reference() | nil,
+          deadline_reason: :session_expired | :idle_expired | nil,
+          idle_timeout: pos_integer() | nil,
+          idle_ref: reference() | nil,
           reconciling: boolean(),
           seq: non_neg_integer()
         }
@@ -85,6 +88,11 @@ defmodule CrowdControl.Session.Control do
             turn_deadline_at: nil,
             paused_remaining_ms: nil,
             grace_ref: nil,
+            # What started the interrupt grace, broadcast if it runs out.
+            deadline_reason: nil,
+            # `:idle_timeout` and its timer, armed while a prompt is in flight.
+            idle_timeout: nil,
+            idle_ref: nil,
             reconciling: false,
             seq: 0
 
@@ -109,6 +117,7 @@ defmodule CrowdControl.Session.Control do
       sdk_servers: sdk_servers!(opts),
       permission_timeout: permission_timeout!(opts),
       interrupt_grace: interrupt_grace!(opts, features, Agent.capable?(agent, :interrupt)),
+      idle_timeout: idle_timeout!(opts),
       max_pending: max_pending!(opts),
       allowed_tools: allowed_tools(opts),
       permission_mode: permission_mode(opts)
@@ -229,6 +238,20 @@ defmodule CrowdControl.Session.Control do
       other ->
         raise ArgumentError,
               ":permission_timeout must be a positive integer or :infinity, got: #{inspect(other)}"
+    end
+  end
+
+  defp idle_timeout!(opts) do
+    case Keyword.get(opts, :idle_timeout) do
+      nil ->
+        nil
+
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      other ->
+        raise ArgumentError,
+              ":idle_timeout must be a positive integer (ms) or nil, got: #{inspect(other)}"
     end
   end
 
