@@ -16,6 +16,13 @@
 #                              never a result (exercises wait_for_result's
 #                              absolute deadline under a steady message stream)
 #   FAKE_CLI_ERROR_SUBTYPE=<s> emit an is_error result with subtype <s>
+#   FAKE_CLI_UUID_ECHO=0       leave the prompt's "uuid" off the result (by
+#                              default it is echoed as both "user_message_uuid"
+#                              and "user_message_uuids", as claude 2.1.292 does)
+#   FAKE_CLI_RATE_LIMIT=1      emit one rate_limit_event before the result
+#   FAKE_CLI_ECHO_ARGV=1       result.result is the argv, each token in [ ]
+#
+# Every result also carries a fixed "usage".
 
 # JSON-escape a string so the emitted line is always valid JSON: backslash and
 # double quote, the named control escapes (\b \t \n \f \r), and \u00NN for any
@@ -47,6 +54,8 @@ json_escape() {
 }
 
 SESSION_ID="${FAKE_CLI_SESSION_ID:-test-session-$$}"
+# Every argv token bracketed, so an empty one shows as [].
+ARGV=$(printf '[%s]' "$@")
 
 if [ "${FAKE_CLI_GARBAGE:-}" = "1" ]; then
   echo "not-json-but-newline-terminated"
@@ -65,6 +74,14 @@ while IFS= read -r line; do
   content_raw=$(printf '%s' "$line" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p')
   content=$(json_escape "$content_raw")
 
+  # Fields appended to every result: a fixed usage, and the prompt's uuid.
+  uuid=$(printf '%s' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+  extra=',"usage":{"input_tokens":3,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":7}'
+  if [ -n "$uuid" ] && [ "${FAKE_CLI_UUID_ECHO:-1}" != "0" ]; then
+    escaped_uuid=$(json_escape "$uuid")
+    extra="$extra,\"user_message_uuid\":\"$escaped_uuid\",\"user_message_uuids\":[\"$escaped_uuid\"]"
+  fi
+
   if [ -n "${FAKE_CLI_STREAM_NORESULT:-}" ]; then
     i=0
     while [ "$i" -lt "$FAKE_CLI_STREAM_NORESULT" ]; do
@@ -81,8 +98,12 @@ while IFS= read -r line; do
     sleep "$FAKE_CLI_SLEEP"
   fi
 
+  if [ "${FAKE_CLI_RATE_LIMIT:-}" = "1" ]; then
+    printf '{"type":"rate_limit_event","session_id":"%s","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":4102444800,"utilization":1.0}}\n' "$(json_escape "$SESSION_ID")"
+  fi
+
   if [ -n "${FAKE_CLI_ERROR_SUBTYPE:-}" ]; then
-    printf '{"type":"result","subtype":"%s","is_error":true,"num_turns":1,"session_id":"%s","total_cost_usd":0}\n' "$(json_escape "$FAKE_CLI_ERROR_SUBTYPE")" "$(json_escape "$SESSION_ID")"
+    printf '{"type":"result","subtype":"%s","is_error":true,"num_turns":1,"session_id":"%s","total_cost_usd":0%s}\n' "$(json_escape "$FAKE_CLI_ERROR_SUBTYPE")" "$(json_escape "$SESSION_ID")" "$extra"
   elif [ -n "${FAKE_CLI_ECHO_ENV:-}" ]; then
     # Read the env var named by FAKE_CLI_ECHO_ENV without evaluating anything.
     # NOT `${!FAKE_CLI_ECHO_ENV}`: bash evaluates array subscripts inside
@@ -92,9 +113,11 @@ while IFS= read -r line; do
     # bypassable. printenv performs a plain lookup.
     val=$(printenv "$FAKE_CLI_ECHO_ENV" || true)
     val_escaped=$(json_escape "$val")
-    printf '{"type":"result","subtype":"success","result":"%s=%s","total_cost_usd":0}\n' "$FAKE_CLI_ECHO_ENV" "$val_escaped"
+    printf '{"type":"result","subtype":"success","result":"%s=%s","total_cost_usd":0%s}\n' "$FAKE_CLI_ECHO_ENV" "$val_escaped" "$extra"
+  elif [ "${FAKE_CLI_ECHO_ARGV:-}" = "1" ]; then
+    printf '{"type":"result","subtype":"success","result":"%s","total_cost_usd":0%s}\n' "$(json_escape "$ARGV")" "$extra"
   else
-    printf '{"type":"result","subtype":"success","result":"done:%s","total_cost_usd":0}\n' "$content"
+    printf '{"type":"result","subtype":"success","result":"done:%s","total_cost_usd":0%s}\n' "$content" "$extra"
   fi
 
   if [ "${FAKE_CLI_FAIL:-}" = "1" ]; then

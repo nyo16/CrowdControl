@@ -54,6 +54,21 @@ defmodule CrowdControl.Agent.ClaudeCode do
   `"total_cost_usd"` on the result is then meaningless — the CLI prices the
   response against Anthropic's table for a model it does not know.
 
+  ## Hermetic sessions
+
+  `:hermetic` isolates a session from the host's Claude Code configuration, so
+  the same prompt behaves the same on a laptop and in CI:
+
+    * `hermetic: :full` - no settings files at all (`--setting-sources ""`);
+    * `hermetic: :project` - user settings only (`--setting-sources user`),
+      ignoring the project's and local settings.
+
+  Both add `--strict-mcp-config` (only `:mcp_config` servers),
+  `--exclude-dynamic-system-prompt-sections`, and
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the environment. An explicit
+  `:setting_sources`, or an `:env` entry for that variable, wins. `:hermetic`
+  never sets `:bare`, which would also drop hooks, plugins and OAuth.
+
   ## Control protocol
 
   These options switch on the stream-json control protocol (CLI 2.1.268+, see
@@ -85,11 +100,14 @@ defmodule CrowdControl.Agent.ClaudeCode do
 
   @token_envs [oauth_token: "CLAUDE_CODE_OAUTH_TOKEN", auth_token: "ANTHROPIC_AUTH_TOKEN"]
 
+  @auto_memory_env "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+
   @init_request_id "cc_init"
 
   @impl true
   def build_command(opts \\ []) do
     opts
+    |> put_hermetic()
     |> put_tokens()
     |> put_permission_prompt_tool()
     |> put_sdk_mcp_config()
@@ -135,12 +153,32 @@ defmodule CrowdControl.Agent.ClaudeCode do
           acc
 
         token when is_binary(token) ->
-          Keyword.update(acc, :env, %{var => token}, &Map.merge(%{var => token}, &1))
+          Keyword.update(acc, :env, %{var => token}, &Map.merge(%{var => token}, &1 || %{}))
 
         other ->
           raise ArgumentError, "#{inspect(key)} must be a binary, got: #{inspect(other)}"
       end
     end)
+  end
+
+  defp put_hermetic(opts) do
+    case Keyword.get(opts, :hermetic) do
+      off when off in [nil, false] ->
+        opts
+
+      scope when scope in [:full, :project] ->
+        sources = if scope == :full, do: [], else: ["user"]
+        env = %{@auto_memory_env => "1"}
+
+        opts
+        |> Keyword.update(:setting_sources, sources, &(&1 || sources))
+        |> Keyword.put(:strict_mcp_config, true)
+        |> Keyword.put(:exclude_dynamic_system_prompt_sections, true)
+        |> Keyword.update(:env, env, &Map.merge(env, &1 || %{}))
+
+      other ->
+        raise ArgumentError, ":hermetic must be :full or :project, got: #{inspect(other)}"
+    end
   end
 
   @impl true
@@ -318,7 +356,8 @@ defmodule CrowdControl.Agent.ClaudeCode do
   end
 
   @impl true
-  def encode_prompt(prompt, _seq, _opts), do: CrowdControl.Protocol.encode_user_message(prompt)
+  def encode_prompt(prompt, _seq, opts),
+    do: CrowdControl.Protocol.encode_user_message(prompt, opts[:prompt_uuid])
 
   @impl true
   defdelegate decode_line(line), to: CrowdControl.Protocol

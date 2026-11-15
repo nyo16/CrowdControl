@@ -64,6 +64,7 @@ output without losing or duplicating a byte — is a record written before the c
 | `:opts` | the session opts, replayed on reattach |
 | `:owner` | this node's owner id; scopes reaping |
 | `:updated_at` | `System.system_time(:millisecond)` |
+| `:control` | pending control requests, the turn deadline, the SDK tool gate, and `:turns` (`%{prompt_seq, attributed}`: prompts written and the newest one a result was attributed to); absent from older records, which reattach at turn 0 |
 
 The cursor halves are the point of the whole thing. `:byte_offset` says where to
 resume reading the sandbox's output file; `:buffer` carries the partial line that
@@ -80,7 +81,7 @@ Four things are deliberately **not** stored:
   and rebuildable by replaying the sandbox's output from offset 0 if a caller ever
   needs it;
 * `subscribers` — pids, meaningless after a restart; callers re-`subscribe/1`;
-* `timeout_ref`, `reader` — process-local, rebuilt on reattach.
+* `timeout_ref`, `reader`, the idle timer — process-local, rebuilt on reattach.
 
 ### Two different ids
 
@@ -492,6 +493,8 @@ The events, with their measurements and metadata, are listed in the
 ```
 [:crowd_control, :session, :start | :stop | :exception]
 [:crowd_control, :turn, :start | :stop]
+[:crowd_control, :rate_limit]
+[:crowd_control, :retry]
 [:crowd_control, :backend, :provision, :start | :stop | :exception]
 [:crowd_control, :control, :decision]
 [:crowd_control, :gce, :phase]
@@ -501,11 +504,15 @@ The events, with their measurements and metadata, are listed in the
 :telemetry.attach("gce", [:crowd_control, :gce, :phase], &handler/4, nil)
 ```
 
-Three are worth singling out:
+Four are worth singling out:
 
-* `[:crowd_control, :turn, :stop]` carries `turn_cost_usd` and `error_kind` (the
-  `CrowdControl.Error` kind, `nil` on success), which is enough for per-turn spend
-  and error-rate dashboards without parsing results.
+* `[:crowd_control, :turn, :stop]` carries `turn_cost_usd`, `usage` (token counts)
+  and `error_kind` (the `CrowdControl.Error` kind, `nil` on success), which is
+  enough for per-turn spend, token and error-rate dashboards without parsing
+  results.
+* `[:crowd_control, :rate_limit]` is Claude Code's own report of the account's
+  quota, typed as a `CrowdControl.RateLimit`; see
+  [What to alarm on](#what-to-alarm-on).
 * `[:crowd_control, :control, :decision]` is the **only** audit trail of permission
   answers: decisions are written to the CLI's stdin and never reach the output
   capture. `source` says who decided — `:callback`, `:respond`, `:timeout` or
@@ -541,6 +548,13 @@ It exits non-zero, listing every mismatch. CI runs it against a pinned release.
 Grounded in the specific failure modes the code actually reports.
 
 ### Page
+
+**`[:crowd_control, :rate_limit]` with `status: :rejected`.** The account is out of
+quota for the window in `rate_limit_type` until `resets_at` (Unix seconds); every
+session on that account fails its turns with `:api_error` `:rate_limit` until
+then, and `:retry` will not wait past `:max_delay_ms` for it. Alarm on the first
+one, not the rate: one is already an outage. `status: :allowed_warning` (with
+`utilization`) is the same alarm early — investigate, do not page.
 
 **`skipped > 0` from a sweep**, or the log line
 `Reaper: <Module> list_live failed (…); skipping this backend.` The reaper is blind
@@ -612,11 +626,18 @@ because rotation would invalidate every persisted byte offset and silently corru
 resume, which is the precise failure the offset cursor exists to prevent. A runaway
 CLI, or a cap set too low for the workload.
 
-**`Session timed out after Nms`.** The session's own `:timeout` fired; the sandbox
-was destroyed and subscribers got `{:timeout, :session_expired}`. Expected at some
+**`Session turn exceeded Nms; …`.** The session's own `:timeout` fired; the sandbox
+was destroyed (after an `interrupt` and `:interrupt_grace`, for a session that can
+be interrupted) and subscribers got `{:timeout, :session_expired}`. Expected at some
 rate; a step change means either a slower model or a cap that no longer fits. On
 `Provider.Gce`, note the coupling: `:timeout` feeds the default
 `:max_run_duration`.
+
+**`Session produced no output for Nms; …`.** `:idle_timeout` fired: the turn was
+silent, keep-alives included, for that long, and subscribers got
+`{:timeout, :idle_expired}`. A hung CLI or a dead connection to the model — or a
+tool that runs silent for longer than the setting (a build, a test suite), in
+which case raise it.
 
 **`Could not restrict permissions on <path>`** from `Store.DETS`. The store is
 running with a file it could not lock down to its owner. On a shared host, fix it.

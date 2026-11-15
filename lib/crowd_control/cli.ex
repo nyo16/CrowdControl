@@ -41,6 +41,12 @@ defmodule CrowdControl.CLI do
     %{flag: "--model", operand: true, hidden: false},
     %{flag: "--system-prompt", operand: true, hidden: false},
     %{flag: "--allowed-tools", operand: true, hidden: false},
+    %{flag: "--disallowed-tools", operand: true, hidden: false},
+    %{flag: "--append-system-prompt", operand: true, hidden: false},
+    %{flag: "--max-turns", operand: true, hidden: true},
+    %{flag: "--effort", operand: true, hidden: false},
+    %{flag: "--fallback-model", operand: true, hidden: false},
+    %{flag: "--json-schema", operand: true, hidden: false},
     %{flag: "--permission-mode", operand: true, hidden: false},
     %{flag: "--permission-prompt-tool", operand: true, hidden: true},
     %{flag: "--permission-prompts", operand: true, hidden: false},
@@ -54,6 +60,8 @@ defmodule CrowdControl.CLI do
     %{flag: "--agents", operand: true, hidden: false},
     %{flag: "--plugin-dir", operand: true, hidden: false},
     %{flag: "--continue", operand: false, hidden: false},
+    %{flag: "--fork-session", operand: false, hidden: false},
+    %{flag: "--exclude-dynamic-system-prompt-sections", operand: false, hidden: false},
     %{flag: "--include-partial-messages", operand: false, hidden: false},
     %{flag: "--no-session-persistence", operand: false, hidden: false},
     %{flag: "--strict-mcp-config", operand: false, hidden: false},
@@ -61,6 +69,8 @@ defmodule CrowdControl.CLI do
   ]
 
   @permission_prompts ["host", "none"]
+
+  @efforts ~w(low medium high xhigh max)
 
   @typedoc """
   One `--mcp-config` entry: a path to a JSON file, or an inline
@@ -74,6 +84,14 @@ defmodule CrowdControl.CLI do
           | {:model, String.t()}
           | {:system_prompt, String.t()}
           | {:allowed_tools, [String.t()]}
+          | {:disallowed_tools, [String.t()]}
+          | {:append_system_prompt, String.t()}
+          | {:max_turns, pos_integer()}
+          | {:effort, :low | :medium | :high | :xhigh | :max | String.t()}
+          | {:fallback_model, String.t()}
+          | {:json_schema, map() | String.t()}
+          | {:fork_session, boolean()}
+          | {:exclude_dynamic_system_prompt_sections, boolean()}
           | {:permission_mode, String.t()}
           | {:permission_prompt_tool, String.t()}
           | {:permission_prompts, String.t()}
@@ -116,6 +134,17 @@ defmodule CrowdControl.CLI do
     * `:model` - model to use (e.g. `"sonnet"`, `"opus"`)
     * `:system_prompt` - custom system prompt
     * `:allowed_tools` - list of allowed tool names
+    * `:disallowed_tools` - list of denied tool names or patterns (`"Bash(rm:*)"`),
+      sent as one comma-joined token like `:allowed_tools`
+    * `:append_system_prompt` - text appended to the default system prompt
+    * `:max_turns` - positive integer; the turn ends with `error_max_turns`
+      after that many agentic turns
+    * `:effort` - `:low`, `:medium`, `:high`, `:xhigh` or `:max` (atom or
+      binary). The CLI downgrades `:xhigh`/`:max` on models that lack them
+    * `:fallback_model` - model tried when `:model` is overloaded or unavailable
+    * `:json_schema` - JSON Schema the final answer must match, as a map or a
+      JSON object string. The result then carries `structured_output`; read it
+      with `CrowdControl.Result.decode_structured/1`
     * `:permission_mode` - permission mode string
     * `:permission_prompt_tool` - who answers permission prompts: `"stdio"` for
       the host over the control channel, or the name of an MCP tool.
@@ -127,6 +156,8 @@ defmodule CrowdControl.CLI do
     * `:session_id` - session ID for new sessions
     * `:resume` - session ID to resume
     * `:continue` - `true` to continue the most recent session
+    * `:fork_session` - `true` to resume into a new session id; needs `:resume`
+      or `:continue`
     * `:add_dir` - additional project directory (string or list of strings, sanitized + expanded)
     * `:include_partial_messages` - `true` to include streaming deltas
     * `:no_session_persistence` - `true` to skip saving to disk
@@ -144,6 +175,9 @@ defmodule CrowdControl.CLI do
     * `:agents` - JSON string or map defining custom agents
     * `:plugin_dir` - path to a plugin directory (sanitized + expanded)
     * `:bare` - `true` for minimal mode
+    * `:exclude_dynamic_system_prompt_sections` - `true` to leave the
+      per-machine sections (cwd, git status, memory paths) out of the system
+      prompt, which keeps the prompt cache warm across hosts
     * `:extra_args` - list of additional string arguments
     * `:env` - map of environment variables (keys must match `~r/\\A[A-Za-z_][A-Za-z0-9_]*\\z/`,
       values must be binaries with no C0 control characters, i.e. `[\\x00-\\x1f]`)
@@ -182,6 +216,12 @@ defmodule CrowdControl.CLI do
     |> maybe_add("--model", opts[:model])
     |> maybe_add("--system-prompt", opts[:system_prompt])
     |> maybe_add_list("--allowed-tools", opts[:allowed_tools])
+    |> maybe_add_list("--disallowed-tools", opts[:disallowed_tools])
+    |> maybe_add_text("--append-system-prompt", opts[:append_system_prompt])
+    |> maybe_add_max_turns(opts[:max_turns])
+    |> maybe_add_effort(opts[:effort])
+    |> maybe_add_text("--fallback-model", opts[:fallback_model])
+    |> maybe_add_json_schema(opts[:json_schema])
     |> maybe_add("--permission-mode", opts[:permission_mode])
     |> maybe_add_text("--permission-prompt-tool", opts[:permission_prompt_tool])
     |> maybe_add_permission_prompts(opts[:permission_prompts])
@@ -195,6 +235,11 @@ defmodule CrowdControl.CLI do
     |> maybe_add_agents(opts[:agents])
     |> maybe_add_path("--plugin-dir", opts[:plugin_dir])
     |> maybe_add_flag("--continue", opts[:continue])
+    |> maybe_add_fork_session(opts)
+    |> maybe_add_flag(
+      "--exclude-dynamic-system-prompt-sections",
+      opts[:exclude_dynamic_system_prompt_sections]
+    )
     |> maybe_add_flag("--include-partial-messages", opts[:include_partial_messages])
     |> maybe_add_flag("--no-session-persistence", opts[:no_session_persistence])
     |> maybe_add_flag("--strict-mcp-config", opts[:strict_mcp_config])
@@ -225,6 +270,68 @@ defmodule CrowdControl.CLI do
     raise ArgumentError,
           ":permission_prompts must be one of #{inspect(@permission_prompts)}, " <>
             "got: #{inspect(other)}"
+  end
+
+  defp maybe_add_max_turns(args, nil), do: args
+
+  defp maybe_add_max_turns(args, n) when is_integer(n) and n > 0,
+    do: [Integer.to_string(n), "--max-turns" | args]
+
+  defp maybe_add_max_turns(_args, other),
+    do: raise(ArgumentError, ":max_turns must be a positive integer, got: #{inspect(other)}")
+
+  defp maybe_add_effort(args, nil), do: args
+
+  defp maybe_add_effort(args, effort) when is_atom(effort),
+    do: maybe_add_effort(args, Atom.to_string(effort))
+
+  defp maybe_add_effort(args, effort) when effort in @efforts, do: [effort, "--effort" | args]
+
+  defp maybe_add_effort(_args, other) do
+    raise ArgumentError, ":effort must be one of #{inspect(@efforts)}, got: #{inspect(other)}"
+  end
+
+  # The CLI only checks --json-schema once a turn runs; checking here turns a
+  # typo into a start failure instead of a failed session.
+  defp maybe_add_json_schema(args, nil), do: args
+
+  defp maybe_add_json_schema(args, schema) when is_map(schema) and not is_struct(schema),
+    do: [JSON.encode!(schema), "--json-schema" | args]
+
+  defp maybe_add_json_schema(args, schema) when is_binary(schema) do
+    case JSON.decode(schema) do
+      {:ok, decoded} when is_map(decoded) ->
+        [schema, "--json-schema" | args]
+
+      _ ->
+        raise ArgumentError, ":json_schema must be a JSON object, got: #{inspect(schema)}"
+    end
+  end
+
+  defp maybe_add_json_schema(_args, other),
+    do:
+      raise(
+        ArgumentError,
+        ":json_schema must be a map or a JSON object string, got: #{inspect(other)}"
+      )
+
+  # Without a selector the CLI ignores --fork-session and starts a fresh
+  # session, which is never what a caller asking for a fork meant.
+  defp maybe_add_fork_session(args, opts) do
+    cond do
+      opts[:fork_session] in [nil, false] ->
+        args
+
+      opts[:fork_session] != true ->
+        raise ArgumentError,
+              ":fork_session must be a boolean, got: #{inspect(opts[:fork_session])}"
+
+      opts[:resume] != nil or opts[:continue] == true ->
+        ["--fork-session" | args]
+
+      true ->
+        raise ArgumentError, ":fork_session needs :resume or :continue"
+    end
   end
 
   defp maybe_add_list(args, _flag, nil), do: args

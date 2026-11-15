@@ -1295,6 +1295,141 @@ defmodule CrowdControl.SessionControlTest do
     end
   end
 
+  describe "typed control helpers" do
+    # Calls `fun` (which blocks on the CLI's reply), answers the request it
+    # wrote with `reply`, and returns what `fun` returned plus the request.
+    defp round_trip(ctl, subtype, reply, fun) do
+      task = Task.async(fun)
+      TestHelpers.wait_until(fn -> requests(ctl, subtype) != [] end)
+      %{"request_id" => id, "request" => request} = List.last(requests(ctl, subtype))
+
+      envelope =
+        case reply do
+          {:ok, response} -> %{"subtype" => "success", "request_id" => id, "response" => response}
+          {:error, message} -> %{"subtype" => "error", "request_id" => id, "error" => message}
+        end
+
+      push(ctl, %{"type" => "control_response", "response" => envelope})
+      {Task.await(task), request}
+    end
+
+    test "each sends its documented request and returns the reply" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 60_000)
+      server = %{"name" => "fs", "status" => "connected", "tools" => []}
+
+      assert {{:ok, [^server]}, %{"subtype" => "mcp_status"}} =
+               round_trip(ctl, "mcp_status", {:ok, %{"mcpServers" => [server]}}, fn ->
+                 Session.mcp_status(pid)
+               end)
+
+      assert {{:ok, %{}}, %{"serverName" => "fs", "enabled" => false}} =
+               round_trip(ctl, "mcp_toggle", {:ok, %{}}, fn ->
+                 Session.mcp_toggle(pid, "fs", false)
+               end)
+
+      assert {{:ok, %{}}, %{"serverName" => "fs"}} =
+               round_trip(ctl, "mcp_reconnect", {:ok, %{}}, fn ->
+                 Session.mcp_reconnect(pid, "fs")
+               end)
+
+      assert {{:ok, %{}}, %{"task_id" => "t-1"}} =
+               round_trip(ctl, "stop_task", {:ok, %{}}, fn -> Session.stop_task(pid, "t-1") end)
+
+      settings = %{"applied" => %{"model" => "opus"}, "effective" => %{}}
+
+      assert {{:ok, ^settings}, %{"subtype" => "get_settings"}} =
+               round_trip(ctl, "get_settings", {:ok, settings}, fn ->
+                 Session.get_settings(pid)
+               end)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "rewind_files addresses a turn by the uuid its prompt was written with" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 60_000, prompt: "one")
+      :ok = Session.send_prompt(pid, "two")
+
+      [_first, second] =
+        for %{"type" => "user", "uuid" => uuid} <- decoded_writes(ctl), do: uuid
+
+      reply = %{
+        "canRewind" => true,
+        "filesChanged" => ["a.ex"],
+        "insertions" => 1,
+        "deletions" => 2
+      }
+
+      assert {{:ok, ^reply}, request} =
+               round_trip(ctl, "rewind_files", {:ok, reply}, fn ->
+                 Session.rewind_files(pid, 2, dry_run: true)
+               end)
+
+      assert request == %{
+               "subtype" => "rewind_files",
+               "user_message_id" => second,
+               "dryRun" => true
+             }
+
+      for turn <- [0, 3] do
+        assert Session.rewind_files(pid, turn) == {:error, :unknown_turn}
+      end
+
+      assert length(requests(ctl, "rewind_files")) == 1
+      TestHelpers.stop_session(pid)
+    end
+
+    test "a CLI error reply is {:error, message}; an invalid mcp_status reply is flagged" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 60_000)
+
+      assert {{:error, "No such server"}, _} =
+               round_trip(ctl, "mcp_toggle", {:error, "No such server"}, fn ->
+                 Session.mcp_toggle(pid, "nope", true)
+               end)
+
+      assert {{:error, {:invalid_reply, %{}}}, _} =
+               round_trip(ctl, "mcp_status", {:ok, %{}}, fn -> Session.mcp_status(pid) end)
+
+      TestHelpers.stop_session(pid)
+    end
+
+    test "an SDK server cannot be reconnected; the CLI is not asked" do
+      ctl = start_supervised!({Mock, events: []})
+      {:ok, pid} = start(ctl, timeout: 60_000, sdk_mcp_servers: %{"app" => echo_server()})
+
+      assert Session.mcp_reconnect(pid, "app") == {:error, :sdk_server}
+      assert requests(ctl, "mcp_reconnect") == []
+      TestHelpers.stop_session(pid)
+    end
+
+    test "omp has no control channel: every helper is :unsupported" do
+      ctl = start_supervised!({Mock, events: []})
+
+      {:ok, pid} =
+        Session.start_link(
+          backend: {Mock, mock: ctl},
+          agent: :omp,
+          executable: "omp",
+          prompt: "x"
+        )
+
+      for call <- [
+            fn -> Session.mcp_status(pid) end,
+            fn -> Session.mcp_toggle(pid, "fs", true) end,
+            fn -> Session.mcp_reconnect(pid, "fs") end,
+            fn -> Session.rewind_files(pid, 1) end,
+            fn -> Session.stop_task(pid, "t") end,
+            fn -> Session.get_settings(pid) end
+          ] do
+        assert call.() == {:error, :unsupported}
+      end
+
+      TestHelpers.stop_session(pid)
+    end
+  end
+
   defp push(ctl, frame), do: Mock.push_events(ctl, [{:stdout_data, line(frame)}])
 
   defp echo_server,

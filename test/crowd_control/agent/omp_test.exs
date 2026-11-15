@@ -112,6 +112,30 @@ defmodule CrowdControl.Agent.OmpTest do
       end
     end
 
+    test "rejects the turn, schema and hermetic options with a pointer to omp's own" do
+      for {key, value, hint} <- [
+            {:hermetic, :full, ":profile"},
+            {:max_turns, 3, ":max_time"},
+            {:disallowed_tools, ["Bash"], ":allowed_tools"},
+            {:effort, :high, ":thinking"},
+            {:fallback_model, "haiku", "no fallback model"},
+            {:fork_session, true, ":resume"},
+            {:json_schema, %{"type" => "object"}, "structured-output"},
+            {:exclude_dynamic_system_prompt_sections, true, "dynamic system prompt"}
+          ] do
+        error = assert_raise ArgumentError, fn -> args([{key, value}]) end
+        assert error.message =~ "#{inspect(key)} is a Claude Code option with no omp equivalent"
+        assert error.message =~ hint
+      end
+    end
+
+    test ":append_system_prompt is omp's own flag, not rejected" do
+      args = args(append_system_prompt: "Be terse.")
+
+      assert "Be terse." ==
+               Enum.at(args, Enum.find_index(args, &(&1 == "--append-system-prompt")) + 1)
+    end
+
     test "an explicitly-false Claude-only flag is treated as absent, not rejected" do
       # `bare: false` asks for omp's default behaviour, so dropping it changes
       # nothing. Raising would break a shared option list driving a mixed

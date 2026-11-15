@@ -23,18 +23,25 @@ defmodule CrowdControl.Result do
   | subtype | condition | kind |
   |---|---|---|
   | `success` | `is_error` not `true` | `{:ok, map}` |
-  | `success` | `is_error: true` | `:auth`, `:api_error` or `:unknown`, from the text |
+  | `success` | `is_error: true` | `:auth`, `:api_error` or `:unknown`, see below |
   | `error_max_turns` | | `:max_turns_exceeded` |
   | `error_max_budget_usd` | | `:max_budget_exceeded` |
+  | `error_max_structured_output_retries` | | `:structured_output_failed` |
   | `error_during_execution` | `terminal_reason: "aborted_tools"` | `:aborted` |
-  | `error_during_execution` | API failure in the text | `:auth` or `:api_error` |
+  | `error_during_execution` | API failure, see below | `:auth` or `:api_error` |
   | `error_during_execution` | otherwise | `:execution_error` |
   | `error_prompt_failed` (omp) | | `:prompt_failed` |
   | anything else | | `:unknown` |
 
-  `:api_error` and `:auth` are read from the result's `"result"` text, its
-  `"errors"` list and `"terminal_reason"`: Claude Code reports an API failure
-  as an error result whose text is `"API Error: <status> <body>"`.
+  An API failure is read from fields first: Claude Code 2.1.292 marks it
+  `terminal_reason: "api_error"` with the HTTP status in `api_error_status`
+  (absent for a connection failure) and the API's error in `api_error`. 401 and
+  403 are `:auth`; any other status is `:api_error`. Without those fields (older
+  CLIs, omp) the status and category come from the result's `"result"` text and
+  its `"errors"` list, which Claude Code formats as `"API Error: <status> <body>"`.
+
+  `decode_structured/1` reads the `structured_output` a `:json_schema` session
+  returns; `usage/1` reads the turn's token counts.
   """
 
   alias CrowdControl.Error
@@ -60,6 +67,9 @@ defmodule CrowdControl.Result do
 
   defp do_classify("error_max_turns" = subtype, map),
     do: error({:max_turns_exceeded, %{num_turns: num_turns(map)}}, subtype, map)
+
+  defp do_classify("error_max_structured_output_retries" = subtype, map),
+    do: error({:structured_output_failed, text(map)}, subtype, map)
 
   defp do_classify("error_max_budget_usd" = subtype, map) do
     reason = %{cap: budget_cap(map), cost_usd: cost_usd(map), num_turns: num_turns(map)}
@@ -98,19 +108,27 @@ defmodule CrowdControl.Result do
   # `fallback` is the kind used when the text shows no API failure at all.
   defp api_or(fallback, map) do
     text = text(map)
-    status = status(text)
+    status = api_error_status(map) || status(text)
 
     cond do
       auth?(status, text) ->
         {:auth, text}
 
       api_failure?(map, status, text) ->
-        {:api_error, %{category: category(status, text), status: status}}
+        {:api_error,
+         %{category: category(status, text), status: status, api_error: map["api_error"]}}
 
       true ->
         {fallback, text}
     end
   end
+
+  # The CLI's own status field wins over anything parsed from the text.
+  defp api_error_status(%{"terminal_reason" => "api_error", "api_error_status" => status})
+       when is_integer(status),
+       do: status
+
+  defp api_error_status(_map), do: nil
 
   defp auth?(status, _text) when status in [401, 403], do: true
 
@@ -204,6 +222,86 @@ defmodule CrowdControl.Result do
       denials when is_list(denials) -> denials
       _ -> []
     end
+  end
+
+  @doc """
+  The turn's `structured_output` (a map or a list), or `nil` when absent.
+
+  Claude Code fills it when the session was started with `:json_schema`.
+  """
+  @spec structured_output(result_message() | map() | Error.t()) :: map() | list() | nil
+  def structured_output(result) do
+    case field(result, "structured_output") do
+      output when is_map(output) or is_list(output) -> output
+      _ -> nil
+    end
+  end
+
+  @doc """
+  Classify a result, then return its `structured_output`.
+
+  An error result stays its own kind (`:structured_output_failed` when the
+  model never produced valid output). A successful turn without a map or list
+  in `structured_output` is `:no_structured_output`.
+
+      {:ok, %{"answer" => answer}} = CrowdControl.Result.decode_structured(result)
+  """
+  @spec decode_structured(result_message() | term()) ::
+          {:ok, map() | list()} | {:error, Error.t()}
+  def decode_structured(result) do
+    with {:ok, map} <- classify(result) do
+      case structured_output(map) do
+        nil -> error({:no_structured_output, nil}, elem(result, 1), map)
+        output -> {:ok, output}
+      end
+    end
+  end
+
+  @typedoc "Token counts of one turn, from the result's `usage`."
+  @type usage :: %{
+          input: non_neg_integer(),
+          output: non_neg_integer(),
+          cache_creation: non_neg_integer(),
+          cache_read: non_neg_integer()
+        }
+
+  # Claude Code's snake_case keys, then omp's (`input`, `output`, `cacheWrite`,
+  # `cacheRead`), per count.
+  @usage_keys [
+    input: ["input_tokens", "input"],
+    output: ["output_tokens", "output"],
+    cache_creation: ["cache_creation_input_tokens", "cacheWrite"],
+    cache_read: ["cache_read_input_tokens", "cacheRead"]
+  ]
+
+  @doc """
+  The turn's token usage, or `nil` when the result has no `usage` map with
+  any count in it.
+
+  Reads Claude Code's `usage` (`input_tokens`, ...) and omp's (`input`,
+  `output`, `cacheWrite`, `cacheRead`; omp reports the turn's last model call).
+  A count absent from an otherwise known map is `0`. There is no total:
+  input, output, cache writes and cache reads are priced differently, so sum
+  what you need.
+  """
+  @spec usage(result_message() | map() | Error.t()) :: usage() | nil
+  def usage(result) do
+    with usage when is_map(usage) <- field(result, "usage"),
+         counts = Map.new(@usage_keys, fn {name, keys} -> {name, count(usage, keys)} end),
+         true <- Enum.any?(Map.values(counts), &is_integer/1) do
+      Map.new(counts, fn {name, n} -> {name, n || 0} end)
+    else
+      _ -> nil
+    end
+  end
+
+  defp count(usage, keys) do
+    Enum.find_value(keys, fn key ->
+      case Map.get(usage, key) do
+        n when is_integer(n) and n >= 0 -> n
+        _ -> nil
+      end
+    end)
   end
 
   defp number_field(result, key) do

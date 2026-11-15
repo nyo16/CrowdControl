@@ -180,6 +180,111 @@ defmodule CrowdControl.ResultTest do
       assert {:error, %Error{kind: :unknown, reason: "something odd", subtype: "success"}} =
                Result.classify(result(map))
     end
+
+    # 2.1.292 result frames: `terminal_reason: "api_error"` with the status in
+    # `api_error_status` and the API's error in `api_error`.
+    for {status, category} <- [
+          {429, :rate_limit},
+          {529, :overloaded},
+          {500, :server_error},
+          {400, :other}
+        ] do
+      test "api_error_status #{status} is :api_error #{category}, whatever the text says" do
+        map =
+          claude_error("success", %{
+            "result" => "API Error: something went wrong",
+            "terminal_reason" => "api_error",
+            "api_error_status" => unquote(status),
+            "api_error" => "upstream said no"
+          })
+
+        assert {:error,
+                %Error{
+                  kind: :api_error,
+                  reason: %{
+                    category: unquote(category),
+                    status: unquote(status),
+                    api_error: "upstream said no"
+                  }
+                }} = Result.classify(result(map))
+      end
+    end
+
+    test "the status field wins over a status in the text" do
+      map =
+        claude_error("success", %{
+          "result" => "API Error: 500 Internal server error",
+          "terminal_reason" => "api_error",
+          "api_error_status" => 529
+        })
+
+      assert {:error, %Error{reason: %{category: :overloaded, status: 529}}} =
+               Result.classify(result(map))
+    end
+
+    test "api_error_status 401 is :auth even when the text does not say so" do
+      map =
+        claude_error("success", %{
+          "result" => "API Error",
+          "terminal_reason" => "api_error",
+          "api_error_status" => 401
+        })
+
+      assert {:error, %Error{kind: :auth, reason: "API Error"}} = Result.classify(result(map))
+    end
+
+    test "an api_error without api_error_status is :connection" do
+      map =
+        claude_error("success", %{
+          "result" => "API Error: Connection error.",
+          "terminal_reason" => "api_error"
+        })
+
+      assert {:error,
+              %Error{
+                kind: :api_error,
+                reason: %{category: :connection, status: nil, api_error: nil}
+              }} =
+               Result.classify(result(map))
+    end
+
+    # Recorded from claude 2.1.292 against a closed port: the status and error
+    # fields are present but null.
+    test "a recorded 2.1.292 connection failure is :connection" do
+      map =
+        claude_error("success", %{
+          "result" =>
+            "API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)",
+          "terminal_reason" => "api_error",
+          "api_error_status" => nil,
+          "api_error" => nil,
+          "num_turns" => 1,
+          "total_cost_usd" => 0
+        })
+
+      assert {:error, %Error{kind: :api_error, reason: %{category: :connection, status: nil}}} =
+               Result.classify(result(map))
+    end
+
+    test "api_error_status is ignored unless terminal_reason is api_error" do
+      map =
+        claude_error("error_during_execution", %{
+          "errors" => ["tool crashed"],
+          "api_error_status" => 529
+        })
+
+      assert {:error, %Error{kind: :execution_error}} = Result.classify(result(map))
+    end
+
+    test "error_max_structured_output_retries is :structured_output_failed" do
+      text = "Failed to provide valid structured output after maximum retries"
+      map = claude_error("error_max_structured_output_retries", %{"errors" => [text]})
+
+      assert {:error, %Error{kind: :structured_output_failed, reason: ^text} = error} =
+               Result.classify(result(map))
+
+      assert Exception.message(error) =~ "maximum retries"
+    end
   end
 
   describe "classify/1, omp results" do
@@ -208,9 +313,9 @@ defmodule CrowdControl.ResultTest do
 
   describe "classify/1, unknown input" do
     test "an unknown subtype is :unknown and keeps the binary" do
-      map = claude_error("error_max_structured_output_retries", %{})
+      map = claude_error("error_from_a_future_cli", %{})
 
-      assert {:error, %Error{kind: :unknown, subtype: "error_max_structured_output_retries"}} =
+      assert {:error, %Error{kind: :unknown, subtype: "error_from_a_future_cli"}} =
                Result.classify(result(map))
     end
 
@@ -257,6 +362,68 @@ defmodule CrowdControl.ResultTest do
       denial = %{"tool_name" => "Bash", "tool_use_id" => "t1", "tool_input" => %{}}
       assert Result.permission_denials(%{"permission_denials" => [denial]}) == [denial]
     end
+
+    test "structured_output reads a map or a list, anything else is nil" do
+      assert Result.structured_output(%{"structured_output" => %{"a" => 1}}) == %{"a" => 1}
+      assert Result.structured_output(result(%{"structured_output" => [1, 2]})) == [1, 2]
+      assert Result.structured_output(%{"structured_output" => "text"}) == nil
+      assert Result.structured_output(%{"structured_output" => nil}) == nil
+      assert Result.structured_output(@success) == nil
+    end
+
+    test "usage normalises the snake_case counts, missing ones are 0" do
+      usage = %{
+        "input_tokens" => 12,
+        "output_tokens" => 34,
+        "cache_creation_input_tokens" => 5,
+        "cache_read_input_tokens" => 600,
+        "server_tool_use" => %{"web_search_requests" => 0}
+      }
+
+      assert Result.usage(result(Map.put(@success, "usage", usage))) ==
+               %{input: 12, output: 34, cache_creation: 5, cache_read: 600}
+
+      assert Result.usage(%{"usage" => %{"input_tokens" => 3, "output_tokens" => "x"}}) ==
+               %{input: 3, output: 0, cache_creation: 0, cache_read: 0}
+
+      assert Result.usage(@success) == nil
+      assert Result.usage(%{"usage" => "none"}) == nil
+    end
+
+    test "usage reads omp's keys, and a map with no known count is nil" do
+      omp = %{"input" => 1, "output" => 2, "cacheRead" => 9, "totalTokens" => 3, "cost" => %{}}
+
+      assert Result.usage(%{"usage" => omp}) ==
+               %{input: 1, output: 2, cache_creation: 0, cache_read: 9}
+
+      assert Result.usage(%{"usage" => %{"cost" => %{"total" => 0.25}}}) == nil
+    end
+  end
+
+  describe "decode_structured/1" do
+    test "a successful turn returns its structured_output" do
+      map = Map.put(@success, "structured_output", %{"answer" => 42})
+      assert Result.decode_structured(result(map)) == {:ok, %{"answer" => 42}}
+    end
+
+    test "a successful turn without structured_output is :no_structured_output" do
+      for map <- [@success, Map.put(@success, "structured_output", nil)] do
+        assert {:error, %Error{kind: :no_structured_output, subtype: "success"} = error} =
+                 Result.decode_structured(result(map))
+
+        assert Exception.message(error) =~ "no structured_output"
+      end
+    end
+
+    test "an error result keeps its own kind, even with output" do
+      map =
+        claude_error("error_max_structured_output_retries", %{"structured_output" => %{"a" => 1}})
+
+      assert {:error, %Error{kind: :structured_output_failed}} =
+               Result.decode_structured(result(map))
+
+      assert {:error, %Error{kind: :unknown}} = Result.decode_structured(:not_a_result)
+    end
   end
 
   describe "properties" do
@@ -265,7 +432,8 @@ defmodule CrowdControl.ResultTest do
       "error_max_turns",
       "error_max_budget_usd",
       "error_during_execution",
-      "error_prompt_failed"
+      "error_prompt_failed",
+      "error_max_structured_output_retries"
     ]
 
     @keys [
@@ -278,7 +446,11 @@ defmodule CrowdControl.ResultTest do
       "session_id",
       "permission_denials",
       "max_budget_usd",
-      "error_code"
+      "error_code",
+      "api_error_status",
+      "api_error",
+      "structured_output",
+      "usage"
     ]
 
     defp value do
@@ -322,6 +494,9 @@ defmodule CrowdControl.ResultTest do
         Result.session_id(message)
         Result.num_turns(message)
         assert is_list(Result.permission_denials(message))
+        Result.structured_output(message)
+        Result.usage(message)
+        assert {_, _} = Result.decode_structured(message)
       end
     end
 

@@ -471,6 +471,10 @@ CrowdControl.run("Check the code",
   add_dir: "/workspace"
 )
 
+# Hermetic: none of the host's settings, MCP servers or auto-memory, so the
+# same prompt behaves the same on a laptop and in CI (:project keeps user settings)
+CrowdControl.run("Check the code", hermetic: :full, add_dir: "/workspace")
+
 # Load plugins from a directory
 CrowdControl.run("Process this",
   plugin_dir: "/plugins/my-plugin",
@@ -481,12 +485,65 @@ CrowdControl.run("Process this",
 ### Budget control
 
 ```elixir
-# Cap spending per session
+# Cap spending per session (the CLI enforces it)
 CrowdControl.run_many("Refactor this module for clarity", [
   [add_dir: "/path/to/project", model: "sonnet", max_budget_usd: 0.50],
   [add_dir: "/path/to/project", model: "opus", max_budget_usd: 2.00]
 ])
+
+# Cap the whole fan-out: once the sessions together have spent $5, stop them
+# and return what has arrived as {:budget_exceeded, partial_results}
+CrowdControl.run_many("Refactor this module for clarity", opts_list, budget_usd: 5.0)
+
+# collect/3 does the same for sessions you own, and leaves them running
+CrowdControl.collect(sessions, 600_000, budget_usd: 5.0)
 ```
+
+The fleet budget sums each session's latest `total_cost_usd`, which the CLI
+counts for its whole process. Against a non-Anthropic endpoint the CLI prices
+tokens by a table that does not know the model, so the number means nothing
+there.
+
+### Retrying transient API failures
+
+```elixir
+# Re-send into the same session on a 429, 529, 5xx or connection failure,
+# but only from a turn that ran no tools: up to 3 times, 1 s, 2 s, 4 s
+# (full jitter, capped at 30 s), or until a rejected rate limit resets
+CrowdControl.run("Summarize this repo", retry: true)
+CrowdControl.run("Summarize this repo", retry: [max_retries: 5, max_delay_ms: 60_000])
+
+# In rounds: only the failed sessions are re-sent, after one shared delay
+CrowdControl.run_many("Summarize this repo", opts_list, retry: true)
+
+# Retrying a turn that ran tools is your call: an MFA, called with the result
+CrowdControl.run("Summarize this repo", retry: [retry_on: {MyApp.Retry, :read_only?, []}])
+```
+
+See `CrowdControl.Retry` for the rule and the delays; each re-send emits
+`[:crowd_control, :retry]`.
+
+### Structured output
+
+```elixir
+schema = %{
+  "type" => "object",
+  "properties" => %{"risk" => %{"type" => "string", "enum" => ["low", "medium", "high"]}},
+  "required" => ["risk"]
+}
+
+for {_pid, result} <- CrowdControl.run_many("Rate this diff's risk", opts_list) do
+  case CrowdControl.Result.decode_structured(result) do
+    {:ok, %{"risk" => risk}} -> risk
+    # :structured_output_failed, :no_structured_output, or the turn's own error
+    {:error, %CrowdControl.Error{kind: kind}} -> {:failed, kind}
+  end
+end
+```
+
+where every entry of `opts_list` carries `json_schema: schema` (a map, or a
+JSON object string). `CrowdControl.Result.usage/1` reads a result's token
+counts.
 
 ### Typed errors
 
@@ -576,6 +633,21 @@ the same turn or when the tool is pre-approved (`:allowed_tools`,
 `-32001`. `:max_pending_control` (default 64) bounds requests awaiting an
 answer. `SECURITY.md` has the details.
 
+Typed helpers over `control/3`, each `{:error, :unsupported}` on omp:
+
+```elixir
+{:ok, servers} = CrowdControl.Session.mcp_status(session)      # [%{"name" => _, "status" => _, ...}]
+{:ok, _} = CrowdControl.Session.mcp_toggle(session, "github", false)
+{:ok, _} = CrowdControl.Session.mcp_reconnect(session, "github")  # {:error, :sdk_server} for an SDK server
+{:ok, %{"canRewind" => _}} = CrowdControl.Session.rewind_files(session, 2, dry_run: true)
+{:ok, _} = CrowdControl.Session.stop_task(session, task_id)
+{:ok, %{"effective" => _}} = CrowdControl.Session.get_settings(session)
+```
+
+`rewind_files/3` takes a turn number (`current_turn/1` counts them): every
+prompt is sent with a uuid derived from the session and its turn, so the
+session can name it to the CLI.
+
 See `CrowdControl.Session` for `:hooks`, `:on_control_request`,
 `:interrupt_grace`, `set_model/2` and `set_permission_mode/2`.
 
@@ -590,6 +662,9 @@ CrowdControl.start_session(
   # not by output, so a turn that streams for longer is still killed
   # mid-flight. Size it against the slowest turn, not the conversation.
   timeout: 300_000,
+  # give up on a turn that produces no output at all for this long --
+  # keep_alive heartbeats count as output. Off by default; see Session timeouts
+  idle_timeout: 120_000,
   # reject prompts larger than this with {:error, :prompt_too_large}
   max_prompt_size: 1_000_000,
   # a single newline-free output line over this kills the subprocess and
@@ -1698,11 +1773,18 @@ options — see `CrowdControl.Agent.Omp`.
 | `:model` | Model to use (`"sonnet"`, `"opus"`, `"haiku"`) |
 | `:system_prompt` | Custom system prompt |
 | `:allowed_tools` | List of allowed tool names |
+| `:disallowed_tools` | List of denied tool names or patterns (`"Bash(rm:*)"`) |
+| `:append_system_prompt` | Text appended to the default system prompt |
+| `:max_turns` | Positive integer; the turn ends with `error_max_turns` after that many agentic turns |
+| `:effort` | `:low`, `:medium`, `:high`, `:xhigh` or `:max` |
+| `:fallback_model` | Model tried when `:model` is overloaded or unavailable |
+| `:json_schema` | JSON Schema (map or JSON object string) the answer must match; read it with `CrowdControl.Result.decode_structured/1` |
 | `:permission_mode` | Permission mode string |
 | `:max_budget_usd` | Spending ceiling |
 | `:session_id` | Session ID for new sessions |
 | `:resume` | Session ID to resume |
 | `:continue` | `true` to continue most recent session |
+| `:fork_session` | `true` to resume into a new session id (needs `:resume` or `:continue`) |
 | `:add_dir` | Additional project directory |
 | `:include_partial_messages` | `true` for streaming deltas |
 | `:no_session_persistence` | `true` to skip saving to disk |
@@ -1713,13 +1795,16 @@ options — see `CrowdControl.Agent.Omp`.
 | `:agents` | JSON string or map defining custom agents |
 | `:plugin_dir` | Path to a plugin directory |
 | `:bare` | `true` for minimal mode (skip hooks, LSP, plugins, auto-memory) |
+| `:hermetic` | `:full` (no settings files) or `:project` (user settings only); both add `--strict-mcp-config`, `--exclude-dynamic-system-prompt-sections` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, never `--bare` |
+| `:exclude_dynamic_system_prompt_sections` | `true` to leave per-machine sections out of the system prompt |
 | `:extra_args` | List of additional CLI arguments |
 | `:api_key` | Anthropic API key (sets `ANTHROPIC_API_KEY` for the subprocess) |
 | `:oauth_token` | Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN` for Claude Code, `ANTHROPIC_OAUTH_TOKEN` for omp) |
 | `:auth_token` | Bearer credential for a gateway or self-hosted endpoint (`ANTHROPIC_AUTH_TOKEN`; Claude Code only) |
 | `:api_url` | Custom API base URL (sets `ANTHROPIC_BASE_URL` for the subprocess) |
 | `:env` | Map of arbitrary environment variables for the subprocess |
-| `:timeout` | Session timeout in milliseconds (default: `nil` / no timeout) |
+| `:timeout` | Turn deadline in milliseconds (default `300_000`; `nil` / `:infinity` to disable) |
+| `:idle_timeout` | Milliseconds a turn may produce no output before it is interrupted, then expired with `{:timeout, :idle_expired}` (default: off) |
 | `:max_prompt_size` | Maximum prompt size in bytes (default: `nil` / no limit) |
 
 ## API Reference
@@ -1728,14 +1813,14 @@ options — see `CrowdControl.Agent.Omp`.
 
 | Function | Description |
 |----------|-------------|
-| `run(prompt, opts)` | Single-shot: start session, send prompt, collect result, stop |
+| `run(prompt, opts)` | Single-shot: start session, send prompt, collect result, stop; `retry:` re-sends transient API failures |
 | `run!(prompt, opts)` | As `run/2`, returning the result map or raising `CrowdControl.Error` |
 | `classify(result)` | `{:ok, map}` or `{:error, %CrowdControl.Error{}}` for a `{:result, subtype, map}` |
-| `run_many(prompt, opts_list)` | Same prompt across N sessions with different options |
+| `run_many(prompt, opts_list, opts)` | Same prompt across N sessions with different options; `retry:` and `budget_usd:` in `opts` |
 | `start_session(opts)` | Start one supervised session (returns `{:error, :max_sessions_reached}` at limit) |
 | `start_sessions(opts_list)` | Start N sessions in parallel |
 | `broadcast(sessions, prompt)` | Send the same prompt to all sessions |
-| `collect(sessions, timeout)` | Wait for result messages from all sessions |
+| `collect(sessions, timeout, opts)` | Wait for result messages from all sessions; `budget_usd:` stops waiting at a spend cap |
 | `stop_all(sessions)` | Gracefully stop all sessions |
 | `healthy?()` | Returns `true` if the session supervisor is alive |
 
@@ -1752,6 +1837,9 @@ options — see `CrowdControl.Agent.Omp`.
 | `respond(session, request_id, decision)` | Answer a deferred control request |
 | `interrupt(session)` | End the turn in progress without killing the CLI |
 | `set_model(session, model)` / `set_permission_mode(session, mode)` | Change them for later turns |
+| `mcp_status/1`, `mcp_toggle/3`, `mcp_reconnect/2` | List, enable/disable, reconnect the CLI's MCP servers |
+| `rewind_files(session, turn, dry_run: bool)` | Restore files changed since a turn's prompt |
+| `stop_task(session, task_id)` / `get_settings(session)` | Stop a background task / read the CLI's settings |
 | `control(session, request, timeout)` | Send any control request (default timeout 60 s) |
 | `pending_requests(session)` | Control requests still awaiting an answer |
 | `stop(session)` | Graceful shutdown |
@@ -1778,9 +1866,11 @@ the same shape for every agent adapter:
 | `{:system_init, map}` | CLI initialized, contains `session_id`, `tools`, `model` |
 | `{:assistant, map}` | Assistant response with `content` blocks |
 | `{:user, map}` | Tool execution results |
-| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"` (Claude Code), `"error_prompt_failed"` (omp). `map["turn"]` is the 1-based turn the result belongs to; omp adds `map["local_only"]` for slash commands answered without a model call |
+| `{:result, subtype, map}` | Turn complete. Subtype: `"success"`, `"error_max_turns"`, `"error_max_budget_usd"`, `"error_max_structured_output_retries"` (Claude Code), `"error_prompt_failed"` (omp). `map["turn"]` is the 1-based turn the result answers (Claude Code echoes each prompt's uuid, so a late result keeps its own turn); `map["turns"]` lists every prompt a result answered when Claude Code coalesced queued prompts; omp adds `map["local_only"]` for slash commands answered without a model call |
 | `{:stream_event, map}` | Partial message delta (Claude Code: requires `:include_partial_messages`; omp: always) |
-| `{:timeout, :session_expired}` | Session timed out (requires `:timeout` option) |
+| `{:rate_limit, map}` | Claude Code's `rate_limit_event`; `CrowdControl.RateLimit.from_event/1` types it |
+| `{:timeout, :session_expired}` | The turn deadline (`:timeout`) passed |
+| `{:timeout, :idle_expired}` | The turn produced no output for `:idle_timeout` |
 | `{:exit, status}` | CLI process exited with OS status code |
 | `{:control_request, id, subtype, request}` | A control callback deferred; answer with `respond/3` (re-sent on every `subscribe/1`) |
 | `{:control_cancelled, id}` | The CLI withdrew a pending control request |
@@ -2009,6 +2099,8 @@ CrowdControl.run("Analyze this code",
 ```
 
 The timer is armed at start and re-armed by each `send_prompt/2` call — it is **not** refreshed by output, so a single turn that streams for longer than the timeout is killed mid-flight. Size it against the slowest turn you expect rather than the length of the conversation; long autonomous tasks against a self-hosted model routinely need more than the default. On expiry, subscribers receive `{:timeout, :session_expired}` and the session shuts down.
+
+`:idle_timeout` is the complement: it catches a turn that has gone silent — a hung CLI, a dead connection — long before the turn deadline, and any output, `keep_alive` heartbeats included, restarts it. It runs only while a prompt awaits its result, stops while a permission request waits on an answer, and fires like the deadline (an `interrupt` first when `:interrupt_grace` allows one, then destroy), broadcasting `{:timeout, :idle_expired}`. A tool that legitimately runs silent for minutes (a build, a test suite) needs a value above its runtime.
 
 ### Input validation
 

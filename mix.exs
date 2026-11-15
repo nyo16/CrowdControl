@@ -117,6 +117,8 @@ defmodule CrowdControl.MixProject do
           CrowdControl.Session,
           CrowdControl.Result,
           CrowdControl.Error,
+          CrowdControl.RateLimit,
+          CrowdControl.Retry,
           CrowdControl.Telemetry
         ],
         Agents: [

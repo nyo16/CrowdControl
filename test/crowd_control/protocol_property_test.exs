@@ -70,6 +70,12 @@ defmodule CrowdControl.ProtocolPropertyTest do
 
   defp message?({:control_cancel, id}), do: is_binary(id)
   defp message?(:keep_alive), do: true
+  defp message?({:command_lifecycle, map}), do: is_map(map)
+
+  # Tagged only with a string status, which is all RateLimit.from_event/1 needs.
+  defp message?({:rate_limit, %{"rate_limit_info" => %{"status" => status}} = frame}),
+    do: is_binary(status) and match?({:ok, _}, CrowdControl.RateLimit.from_event(frame))
+
   defp message?({:unknown, map}), do: is_map(map)
   defp message?({:invalid_json, raw}), do: is_binary(raw)
   defp message?(_other), do: false
@@ -82,14 +88,29 @@ defmodule CrowdControl.ProtocolPropertyTest do
       some_keys(%{
         "type" =>
           StreamData.member_of(
-            ~w(control_request control_response control_cancel_request keep_alive system result user)
+            ~w(control_request control_response control_cancel_request keep_alive system result user rate_limit_event)
           ),
         "request_id" => id_or_junk(),
         "request" => StreamData.one_of([envelope_like(), json_value()]),
-        "response" => StreamData.one_of([envelope_like(), json_value()])
+        "response" => StreamData.one_of([envelope_like(), json_value()]),
+        "rate_limit_info" => StreamData.one_of([rate_limit_info_like(), json_value()])
       }),
       StreamData.map_of(StreamData.string(:alphanumeric), json_value(), max_length: 4)
     ])
+  end
+
+  defp rate_limit_info_like do
+    some_keys(%{
+      "status" =>
+        StreamData.one_of([
+          StreamData.member_of(~w(allowed allowed_warning rejected)),
+          json_value()
+        ]),
+      "resetsAt" => StreamData.one_of([StreamData.integer(), json_value()]),
+      "utilization" => StreamData.one_of([StreamData.float(), json_value()]),
+      "rateLimitType" => json_value(),
+      "unifiedWindows" => json_value()
+    })
   end
 
   defp envelope_like do

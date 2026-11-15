@@ -18,6 +18,14 @@ defmodule CrowdControl.Protocol do
   `{"type":"control_cancel_request","request_id":"…"}` (no reply), and emits
   `{"type":"keep_alive"}` heartbeats that receivers must ignore.
 
+  ## Prompt uuids
+
+  A user frame may carry a `"uuid"`; Claude Code echoes it on the result that
+  answers it, as `user_message_uuid`, or as the list `user_message_uuids` when
+  it answered several queued prompts in one turn. `prompt_uuid/2` derives that
+  uuid from the session's store key and the prompt's turn number, so a session
+  can recompute it after a reattach instead of storing it.
+
   Subtypes stay binaries: they arrive from a subprocess and are never turned
   into atoms.
   """
@@ -53,6 +61,8 @@ defmodule CrowdControl.Protocol do
           | {:control_response, request_id(), control_result(), envelope :: map()}
           | {:control_cancel, request_id()}
           | :keep_alive
+          | {:rate_limit, map()}
+          | {:command_lifecycle, map()}
           | {:unknown, map()}
           | {:invalid_json, String.t()}
 
@@ -105,6 +115,11 @@ defmodule CrowdControl.Protocol do
       `pending_permission_requests` (on an `initialize` reply) stay reachable
     - `{:control_cancel, request_id}`
     - `:keep_alive`
+    - `{:rate_limit, map}` for a `rate_limit_event` whose
+      `rate_limit_info.status` is a string; see `CrowdControl.RateLimit`
+    - `{:command_lifecycle, map}` for the per-prompt progress frames
+      (`queued`, `started`, ...) Claude Code emits for a prompt sent with a
+      `"uuid"`; `CrowdControl.Session` drops them, as it does `:keep_alive`
     - `{:unknown, map}` for anything else, including control frames whose ids
       or subtypes are not strings
 
@@ -143,6 +158,11 @@ defmodule CrowdControl.Protocol do
   def classify(%{"type" => "control_cancel_request", "request_id" => id}) when is_binary(id),
     do: {:control_cancel, id}
 
+  def classify(%{"type" => "rate_limit_event", "rate_limit_info" => %{"status" => status}} = map)
+      when is_binary(status),
+      do: {:rate_limit, map}
+
+  def classify(%{"type" => "command_lifecycle"} = map), do: {:command_lifecycle, map}
   def classify(%{"type" => "keep_alive"}), do: :keep_alive
   def classify(map) when is_map(map), do: {:unknown, map}
 
@@ -164,18 +184,42 @@ defmodule CrowdControl.Protocol do
   defp control_result(_env), do: :error
 
   @doc """
-  Encodes a user prompt as a stream-json stdin message.
+  Encodes a user prompt as a stream-json stdin message, with its `"uuid"` when
+  one is given (see `prompt_uuid/2`).
 
   Returns a newline-terminated JSON string.
   """
-  @spec encode_user_message(binary()) :: binary()
-  def encode_user_message(prompt) when is_binary(prompt) do
+  @spec encode_user_message(binary(), String.t() | nil) :: binary()
+  def encode_user_message(prompt, uuid \\ nil) when is_binary(prompt) do
     message = %{
       "type" => "user",
       "message" => %{"role" => "user", "content" => prompt}
     }
 
+    message = if is_binary(uuid), do: Map.put(message, "uuid", uuid), else: message
+
     JSON.encode!(message) <> "\n"
+  end
+
+  @doc """
+  The uuid of a session's `turn`-th prompt: the first 16 bytes of
+  `sha256("<store_key>:<turn>")`, laid out as an RFC 9562 version 8 UUID.
+
+  Deterministic, so a reattached session recomputes it, and a turn number is
+  enough to address a prompt (`CrowdControl.Session.rewind_files/3`).
+
+      iex> CrowdControl.Protocol.prompt_uuid("key", 1)
+      "bd24723a-b694-802d-aff9-8184b9285080"
+  """
+  @spec prompt_uuid(String.t(), pos_integer()) :: String.t()
+  def prompt_uuid(store_key, turn) when is_binary(store_key) and is_integer(turn) do
+    <<a::48, _version::4, b::12, _variant::2, c::62, _rest::binary>> =
+      :crypto.hash(:sha256, [store_key, ?:, Integer.to_string(turn)])
+
+    <<p1::binary-8, p2::binary-4, p3::binary-4, p4::binary-4, p5::binary-12>> =
+      Base.encode16(<<a::48, 8::4, b::12, 2::2, c::62>>, case: :lower)
+
+    "#{p1}-#{p2}-#{p3}-#{p4}-#{p5}"
   end
 
   @doc """

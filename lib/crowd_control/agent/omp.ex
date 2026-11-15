@@ -113,7 +113,10 @@ defmodule CrowdControl.Agent.Omp do
 
   Claude-Code-only options (`:mcp_config`, `:strict_mcp_config`, `:agents`,
   `:plugin_dir`, `:settings`, `:settings_file`, `:settings_json`,
-  `:setting_sources`, `:max_budget_usd`, `:session_id`, `:bare`, and the
+  `:setting_sources`, `:max_budget_usd`, `:session_id`, `:bare`, `:hermetic`,
+  `:max_turns`, `:disallowed_tools`, `:effort` (use `:thinking`),
+  `:fallback_model`, `:fork_session`, `:json_schema`,
+  `:exclude_dynamic_system_prompt_sections`, and the
   control-protocol options `:permission_prompt_tool`, `:permission_prompts`,
   `:can_use_tool`, `:sdk_mcp_servers` and a map-valued `:hooks`) have no omp
   equivalent and raise `ArgumentError` rather than being dropped silently.
@@ -261,7 +264,16 @@ defmodule CrowdControl.Agent.Omp do
     permission_prompts: "omp has no permission-prompt host; use :approval_mode",
     can_use_tool:
       "omp speaks no control protocol, so tool approval cannot be answered from the host",
-    sdk_mcp_servers: "omp speaks no control protocol, so it cannot reach an in-BEAM MCP server"
+    sdk_mcp_servers: "omp speaks no control protocol, so it cannot reach an in-BEAM MCP server",
+    hermetic:
+      "omp has no hermetic preset; use :profile with :no_rules, :no_skills and :no_extensions",
+    max_turns: "omp has no turn cap; use :max_time",
+    disallowed_tools: "omp has no tool denylist; list the tools to enable in :allowed_tools",
+    effort: "use :thinking (off, minimal, low, medium, high, xhigh, max or auto)",
+    fallback_model: "omp has no fallback model",
+    fork_session: "omp cannot fork a session; use :resume to rejoin one",
+    json_schema: "omp has no structured-output mode",
+    exclude_dynamic_system_prompt_sections: "omp has no switch for dynamic system prompt sections"
   ]
 
   @impl true

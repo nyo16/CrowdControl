@@ -356,6 +356,117 @@ defmodule CrowdControl.CLITest do
     end
   end
 
+  describe "turn and prompt options" do
+    test "emit one token per value" do
+      {_exec, args, _env} =
+        CLI.build_command(
+          disallowed_tools: ["Bash(rm:*)", "WebFetch"],
+          append_system_prompt: "Be terse.",
+          max_turns: 4,
+          effort: "xhigh",
+          fallback_model: "sonnet",
+          resume: "sess-1",
+          fork_session: true,
+          exclude_dynamic_system_prompt_sections: true
+        )
+
+      assert args_contain_pair?(args, "--disallowed-tools", "Bash(rm:*),WebFetch")
+      assert args_contain_pair?(args, "--append-system-prompt", "Be terse.")
+      assert args_contain_pair?(args, "--max-turns", "4")
+      assert args_contain_pair?(args, "--effort", "xhigh")
+      assert args_contain_pair?(args, "--fallback-model", "sonnet")
+      assert "--fork-session" in args
+      assert "--exclude-dynamic-system-prompt-sections" in args
+    end
+
+    test ":effort accepts each level as an atom and rejects anything else" do
+      for level <- [:low, :medium, :high, :xhigh, :max] do
+        {_exec, args, _env} = CLI.build_command(effort: level)
+        assert args_contain_pair?(args, "--effort", Atom.to_string(level))
+      end
+
+      for bad <- ["extreme", :ultra, 3] do
+        assert_raise ArgumentError, ~r/:effort must be one of/, fn ->
+          CLI.build_command(effort: bad)
+        end
+      end
+    end
+
+    test ":max_turns must be a positive integer" do
+      for bad <- [0, -1, 1.5, "3"] do
+        assert_raise ArgumentError, ~r/:max_turns/, fn -> CLI.build_command(max_turns: bad) end
+      end
+    end
+
+    test ":fork_session needs :resume or :continue" do
+      assert_raise ArgumentError, ~r/needs :resume or :continue/, fn ->
+        CLI.build_command(fork_session: true)
+      end
+
+      {_exec, args, _env} = CLI.build_command(continue: true, fork_session: true)
+      assert "--fork-session" in args
+
+      {_exec, args, _env} = CLI.build_command(fork_session: false)
+      refute "--fork-session" in args
+    end
+
+    test ":json_schema takes a map or a JSON object string" do
+      schema = %{"type" => "object", "properties" => %{"n" => %{"type" => "integer"}}}
+
+      {_exec, args, _env} = CLI.build_command(json_schema: schema)
+      assert JSON.decode!(value_after(args, "--json-schema")) == schema
+
+      text = ~s({"type": "object"})
+      {_exec, args, _env} = CLI.build_command(json_schema: text)
+      assert args_contain_pair?(args, "--json-schema", text)
+
+      for bad <- ["not json", "[1, 2]", ~s("object"), 42] do
+        assert_raise ArgumentError, ~r/:json_schema must be/, fn ->
+          CLI.build_command(json_schema: bad)
+        end
+      end
+    end
+  end
+
+  describe "ClaudeCode :hermetic" do
+    test ":full drops every settings source, strict MCP, no dynamic sections, no auto-memory" do
+      {_exec, args, env} = ClaudeCode.build_command(hermetic: :full)
+
+      # An empty argv token, not a missing one: the CLI reads the next flag
+      # as the value otherwise.
+      assert args_contain_pair?(args, "--setting-sources", "")
+      assert "--strict-mcp-config" in args
+      assert "--exclude-dynamic-system-prompt-sections" in args
+      refute "--bare" in args
+      assert env == %{"CLAUDE_CODE_DISABLE_AUTO_MEMORY" => "1"}
+    end
+
+    test ":project keeps user settings only" do
+      {_exec, args, _env} = ClaudeCode.build_command(hermetic: :project)
+      assert args_contain_pair?(args, "--setting-sources", "user")
+    end
+
+    test "the caller's :setting_sources and :env win" do
+      {_exec, args, env} =
+        ClaudeCode.build_command(
+          hermetic: :full,
+          setting_sources: ["user", "project"],
+          env: %{"CLAUDE_CODE_DISABLE_AUTO_MEMORY" => "0", "OTHER" => "x"}
+        )
+
+      assert args_contain_pair?(args, "--setting-sources", "user,project")
+      assert env == %{"CLAUDE_CODE_DISABLE_AUTO_MEMORY" => "0", "OTHER" => "x"}
+    end
+
+    test "false is off and an unknown scope raises" do
+      assert ClaudeCode.build_command(hermetic: false) == ClaudeCode.build_command([])
+
+      assert_raise ArgumentError, ~r/:hermetic must be :full or :project/, fn ->
+        ClaudeCode.build_command(hermetic: true)
+      end
+    end
+  end
+
   describe "contract_flags/0" do
     test "covers every flag build_command/1 can emit" do
       {_exec, args, _env} =
@@ -363,6 +474,14 @@ defmodule CrowdControl.CLITest do
           model: "m",
           system_prompt: "s",
           allowed_tools: ["Read"],
+          disallowed_tools: ["Bash(rm:*)"],
+          append_system_prompt: "a",
+          max_turns: 3,
+          effort: :high,
+          fallback_model: "haiku",
+          json_schema: %{"type" => "object"},
+          fork_session: true,
+          exclude_dynamic_system_prompt_sections: true,
           permission_mode: "plan",
           permission_prompts: "none",
           can_use_tool: {M, :f, []},
@@ -506,6 +625,8 @@ defmodule CrowdControl.CLITest do
       assert_raise ArgumentError, fn -> CLI.sanitize_path!(:atom) end
     end
   end
+
+  defp value_after(args, flag), do: Enum.at(args, Enum.find_index(args, &(&1 == flag)) + 1)
 
   defp args_contain_pair?(args, flag, value) do
     case Enum.find_index(args, &(&1 == flag)) do
