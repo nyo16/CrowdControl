@@ -6,7 +6,7 @@ defmodule CrowdControl.MixProject do
   # is what Hex sees — but git and path dependencies read the literal, and a
   # local `mix hex.publish --dry-run` reports it. Left stale at 0.1.0 after
   # 0.1.1 shipped, both of those lied.
-  @version "0.1.1"
+  @version "0.5.0"
   @source_url "https://github.com/nyo16/CrowdControl"
 
   def project do
